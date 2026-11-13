@@ -745,6 +745,230 @@ This qualifies the tested N mod 4 = 3 bias increments only, not all tail classes
 ISAs or full small-N operator counts. Logical bias remains MN. No estimator formula was changed.
 Next finish full small-column GEMM arithmetic and partial-K/odd-block accounting.
 
+### Follow-up audit: small-N multi-row FP32 accounting (November 13)
+
+The M=8,K=128,N=3/4/5 no-bias cases use the AVX2 reconstruction helper and FMA3 GEMM.
+The existing N=3 capture was reused; N=4/5 were sampled sequentially with 300,000 workload repetitions,
+100 warm-up runs and one thread, collecting 5,062 and 5,064 cycle samples. Their GEMM annotations show the
+same masked-output code family. Numerical comparisons reuse saved three-trial FP counters.
+
+The [FMA3 column-loop source](../../../../onnxruntime/core/mlas/lib/amd64/FgemmKernelFma3Common.inc)
+executes full eight-lane accumulation for its final column vector. ZeroMode=true selects full-width alpha
+multiplication before `vmaskmovps` stores only valid output columns. The arithmetic is not masked merely because
+the store is masked. Thus the GEMM arithmetic width is Nc=8*ceil(N/8) for the audited FP32 column paths,
+while the reconstruction helper scales the N real weight columns only.
+
+For the audited M=8, full-K-block, INT4/block-32, FP32-input, no-bias path:
+
+```text
+Nc = 8 * ceil(N / 8)
+Core FP accumulation = 2M*Nc*K
+Weight FP scaling    = N*K
+Output FP scaling    = M*Nc
+Candidate total      = 2M*Nc*K + N*K + M*Nc
+```
+
+Nc denotes executed arithmetic lanes, not output shape or logical N. The output remains [M,N].
+The rounding is specific to the identified FMA3 FP32 implementation, not a universal MatMulNBits rule.
+
+| M | K | N | Nc | Candidate no-bias total | Measured process mean | Residual |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 128 | 3 | 8 | 16,832 | 16,834.018 | +2.018 |
+| 8 | 128 | 4 | 8 | 16,960 | 16,962.018 | +2.018 |
+| 8 | 128 | 5 | 8 | 17,088 | 17,089.982 | +1.982 |
+| 8 | 128 | 31 | 32 | 69,760 | 69,762.000 | +2.000 |
+| 8 | 128 | 32 | 32 | 69,888 | 69,890.006 | +2.006 |
+| 8 | 128 | 33 | 40 | 86,464 | 86,466.012 | +2.012 |
+
+The formula was also compared retrospectively with no-bias observations from the earlier bias-tail held-out
+bundle at K=256: N=7 gives 34,624 versus 34,626.030; N=15 gives 69,504 versus 69,505.994;
+N=19 gives 103,360 versus 103,362.006. Those shapes were reserved for bias-increment validation, not an
+untouched full-operator reference holdout; their total-count agreement is supporting evidence rather than
+independent final qualification of the new Nc model.
+
+For N=3, the originally aligned formula used only three compute columns and predicted 6,552, versus
+16,834.018 measured. Using eight arithmetic lanes explains the dominant discrepancy without changing logical
+dimensions. Bias work must be added according to the separately audited compiled bias helper, not by rounding
+its N to Nc or assuming masked stores suppress arithmetic.
+
+The approximately two-operation residual remains negligible and unattributed. Source/assembly and process
+counts corroborate the bounded ledger, not independently isolated phase counts or universal counter semantics.
+Partial K blocks, other row/ISA/dtype/block-size paths and differing compiler transformations remain separate.
+No estimator formula was modified.
+
+New evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-fp32-small-n-audit-gys4vvu4/`
+(`n4/`, `n5/` case snapshots, sampling commands, captures, symbols and GEMM annotations).
+N=3 evidence is in `/datadisks/disk10/tommasoadani/tmp/matmul-fp32-n3-bias-audit-VWSmwP/bias-off/`.
+Counter comparisons come from the boundary and bias-tail held-out bundles cited above.
+Next audit partial-K and odd-block paths; preserve exact logical core/bias baselines.
+
+### Follow-up audit: partial-K and odd-block paths (November 13)
+
+This completes the next bounded audit using the existing block-32 K sweep and sixteen new held-out
+configurations. All preserve INT4 weights, FP32 inputs, implicit midpoint zero points, no bias, N=32 and
+single-thread execution. M=1/8 and accuracy requests 0/4 select the audited FP32/INT8 families.
+Production estimates remain unchanged.
+
+#### FP32 processed geometry
+
+Let B=32, G=ceil(K/B), and Kp=B*G. The single-row helper masks activation loads but executes full vector
+scaling/accumulation for each processed block, so its bounded candidate is `3N*Kp + 7N`, not `3NK + 7N`.
+The multi-row reconstruction helper scales the full packed blocks, while GEMM consumes logical K.
+For aligned N=32 its candidate is `2MNK + N*Kp + MN`.
+
+Thus K=33 and K=64 have the same M=1 arithmetic count, but not the same multi-row GEMM count.
+Masked loads/stores must not be assumed to suppress FP arithmetic in their vector lanes.
+
+#### INT8 odd-block remainder and activation tails
+
+Define P=floor(G/2), R=G mod 2, and Ka=8*ceil(K/8). In the observed nonzero-block quantizer path,
+activation scaling executes full eight-lane multiplies even for partial loads, giving the candidate
+`Q=M*(Ka+3G)`. The three-per-block allowance retains the earlier scale/inverse-scale/scaled-sum convention.
+All-zero blocks and hardware treatment of rounding/max instructions remain separately unqualified.
+
+The block-32 two-block helper performs 24 FP operations per output/pair.
+Its odd final block uses a scalar combined-scale multiplication (one FP operation) and an eight-lane
+FMA (16 FP operations): 17 per output/remainder block, rather than half of the paired allowance.
+The source dispatches to these explicit remainder helpers; compiled annotations contain the scalar `vmulss`
+scale products and vector FMAs. Instruction presence alone is not an execution-frequency measurement.
+
+For N divisible by four, no row tails and the observed branches:
+
+```text
+INT8 M=1: Q + N*(24P + 17R) + 7N
+INT8 even multi-row: Q + MN*(24P + 17R) + 7MN + 2MNG + 2MN
+```
+
+The multi-row formula retains the separate block-sum correction GEMM and epilogue. M=1 bypasses that GEMM.
+These candidates cover odd G for this block-32 family; they do not qualify odd-row/column tails or B=64/128.
+
+#### Existing sweep reconciliation
+
+Both FP32/INT8 candidates explain the 32 no-bias N=32 observations at M=1/8 and K=31/32/33/63/64/65/96/128.
+All residuals versus the saved process means are approximately +2 (range +1.970 to +2.024).
+These original shapes informed the boundary candidates, so this agreement is calibration, not held-out evidence.
+
+#### New held-out validation
+
+K=47/79/95/129 was selected before collecting counts, crossing partial vector/block loads and even/odd G.
+All sixteen cases passed capture/reporting/output-equivalence checks. Three R/2R pairs per case with R=1000
+and 100 warm-up runs completed (96 hardware measurements); native library hashes matched the baseline.
+
+| Mode | M | K | G | Kp | Candidate total | Measured process mean | Sample stddev | Residual |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FP32 | 1 | 47 | 2 | 64 | 6,368 | 6,369.988 | 0.027 | +1.988 |
+| FP32 | 1 | 79 | 3 | 96 | 9,440 | 9,442.000 | 0.036 | +2.000 |
+| FP32 | 1 | 95 | 3 | 96 | 9,440 | 9,442.018 | 0.018 | +2.018 |
+| FP32 | 1 | 129 | 5 | 160 | 15,584 | 15,585.988 | 0.010 | +1.988 |
+| FP32 | 8 | 47 | 2 | 64 | 26,368 | 26,369.988 | 0.010 | +1.988 |
+| FP32 | 8 | 79 | 3 | 96 | 43,776 | 43,778.000 | 0.018 | +2.000 |
+| FP32 | 8 | 95 | 3 | 96 | 51,968 | 51,970.000 | 0.031 | +2.000 |
+| FP32 | 8 | 129 | 5 | 160 | 71,424 | 71,426.012 | 0.021 | +2.012 |
+| INT8 | 1 | 47 | 2 | 64 | 1,046 | 1,048.006 | 0.027 | +2.006 |
+| INT8 | 1 | 79 | 3 | 96 | 1,625 | 1,627.036 | 0.000 | +2.036 |
+| INT8 | 1 | 95 | 3 | 96 | 1,641 | 1,643.000 | 0.018 | +2.000 |
+| INT8 | 1 | 129 | 5 | 160 | 2,455 | 2,457.000 | 0.000 | +2.000 |
+| INT8 | 8 | 47 | 2 | 64 | 9,904 | 9,906.018 | 0.018 | +2.018 |
+| INT8 | 8 | 79 | 3 | 96 | 15,048 | 15,050.024 | 0.021 | +2.024 |
+| INT8 | 8 | 95 | 3 | 96 | 15,176 | 15,178.006 | 0.021 | +2.006 |
+| INT8 | 8 | 129 | 5 | 160 | 22,712 | 22,714.000 | 0.018 | +2.000 |
+
+Four representative K=79 cases (both M and mode values) were cycle-sampled sequentially with 200,000 repetitions
+and annotated. Sampling identified the single-row FP32 kernel, multi-row AVX2 reconstruction/FMA3 family,
+and INT8 wrapper/quantizer, with correction GEMM observed for multi-row INT8.
+Their captures contained 4,657/4,683/4,589/4,770 samples respectively. Other held-out shapes were counter-tested,
+not independently sampled. This strongly corroborates the bounded totals, not isolated component counts.
+
+Evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-k-tail-odd-block-heldout-1wp5qy7k/`:
+configuration, generated cases, estimator reports, collector logs, `hardware/` counters/statistics,
+`comparison.csv`, and representative `samples/` commands, symbols and assembly annotations.
+The approximately +2 residual remains unattributed and negligible for ballpark estimates.
+
+#### Scope remaining after these audits
+
+The original bias increments, small-N FP32 arithmetic, and block-32 partial-K/odd-block totals now have
+bounded explanations and supporting tests. This does not complete the wider CPU/CUDA campaign.
+INT8 small-column/odd-row combinations, mixed tails, explicit zero points, zero activation blocks, other
+bit widths/dtypes/ISAs, multi-thread reuse and CUDA remain distinct coverage/attribution gaps.
+Combined K/column/row/bias variants should not inherit these formulas without checking their branch interactions.
+No production formula, scope or availability behavior was changed.
+
+### Follow-up audit: INT8 column, odd-row and mixed tails (November 13)
+
+The next block-32 audit covers multi-row FP32-input effective INT8 with implicit midpoint zero points,
+including small N, odd M and a combined K/row/column tail. No production estimator changes were made.
+The source dispatch in
+[sqnbitgemm_kernel_avx2_int8_blklen32.h](../../../../onnxruntime/core/mlas/lib/sqnbitgemm_kernel_avx2_int8_blklen32.h)
+separates two-row/four-column tiles, leftover columns, a final single row and combined remainders.
+Unlike an invocation with M=1, an odd-row remainder within M>1 still belongs to the block-sum wrapper's
+multi-row correction-GEMM invocation.
+
+#### Component ledger
+
+For B=32, positive M>1, define G=ceil(K/32), P=floor(G/2), R=G mod 2, T=N mod 4,
+Ka=8*ceil(K/8) and Nc=8*ceil(N/8).
+
+| Component | Candidate FP work |
+|---|---|
+| Activation quantization/scaled block sums | M*(Ka + 3G) |
+| Quantized-kernel vector scaling/accumulation | MN*(24P + 17R) |
+| Four-column and scalar-column reductions | M*(7N + 2T) |
+| Correction GEMM and output epilogue | 2M*Nc*G + 2M*Nc |
+| Optional bias | MN when present |
+
+Four-column groups reduce four accumulators using `FoldAccumulators`, costing seven FP operations per output.
+Leftover columns use `hsum_float_8`: two four-lane additions and one scalar addition, or nine per output.
+This explains the additional 2MT reduction term without rounding the quantized kernel's logical output columns.
+The sampled compiled wrapper retains these `vaddps`/`vaddss` reduction sequences.
+The final single-row helper within M>1 uses the same per-output paired/remainder-block FP allowance for
+the tested branch; row-tail handling does not change invocation M to one or remove the correction phase.
+
+The separate FMA3 correction GEMM performs arithmetic on full eight-lane vectors and masks stores, producing
+Nc rather than N arithmetic columns. Bias in the tested INT8 remainder helpers is conditional scalar/vector
+addition to real outputs; it does not inherit the FP32 helper's extra two bias lanes or unconditional zero add.
+The quantizer's nonzero-block and hardware-event conventions remain the same as earlier candidate ledgers.
+
+The combined candidate explains all 38 existing M>1 INT8 bias-off/on matrix observations to an approximately
++2 process residual (range +1.970 to +2.024). These observations informed this model and are calibration evidence.
+
+#### New tail probes and repeat control
+
+Twelve cases paired bias off/on across six geometries at B=32, INT4/FP32, accuracy request 4, one thread.
+All passed capture/output checks and three R/2R pairs completed (72 hardware measurements).
+M=3,K=128,N=32 already existed in the original matrix: its two bias variants are repeat controls despite
+their generated `held_out` labels. The other ten configurations are new validation probes.
+
+| M | K | N | Bias | Candidate total | Measured process mean | Residual |
+|---:|---:|---:|---|---:|---:|---:|
+| 8 | 128 | 7 | Off | 4,888 | 4,890.000 | +2.000 |
+| 8 | 128 | 7 | On | 4,944 | 4,945.994 | +1.994 |
+| 8 | 128 | 19 | Off | 11,448 | 11,450.000 | +2.000 |
+| 8 | 128 | 19 | On | 11,600 | 11,602.012 | +2.012 |
+| 3 | 128 | 32 | Off | 6,660 | 6,662.006 | +2.006 |
+| 3 | 128 | 32 | On | 6,756 | 6,757.994 | +1.994 |
+| 5 | 128 | 32 | Off | 11,100 | 11,101.994 | +1.994 |
+| 5 | 128 | 32 | On | 11,260 | 11,262.000 | +2.000 |
+| 3 | 79 | 7 | Off | 1,485 | 1,486.976 | +1.976 |
+| 3 | 79 | 7 | On | 1,506 | 1,507.970 | +1.970 |
+| 5 | 129 | 19 | Off | 9,065 | 9,067.000 | +2.000 |
+| 5 | 129 | 19 | On | 9,160 | 9,162.000 | +2.000 |
+
+Native library hashes matched the baseline. Three representative no-bias configurations
+(8,128,7), (5,128,32) and (5,129,19) were sampled sequentially for 200,000 repetitions and their wrapper/
+correction kernels annotated; captures contained 4,703, 4,648 and 4,774 samples.
+Other geometries and bias-on variants were counter-tested, not separately sampled in this pass.
+Source/assembly, branch geometry and count agreement jointly corroborate the bounded ledger; instruction
+presence in a shared wrapper alone is not a measurement of branch frequency or phase counts.
+
+Evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-int8-row-column-tail-heldout-d5syees4/`:
+configuration, runtime provenance, generated cases, estimator/collector logs, raw counters/statistics,
+`comparison.csv`, and representative sampling commands, symbols and kernel/correction annotations.
+Residuals +1.970 to +2.012 are negligible for a ballpark model and remain unattributed.
+
+This advances the tested block-32 INT8 row/column/mixed-tail accounting, not a universal formula.
+M=1 invocations, B=64/128 tails, explicit zero points, all-zero activation blocks, other bit widths/dtypes/ISAs,
+threading and CUDA still require their separate qualification. No estimator formula or logical convention changed.
+
 ## Results (original aligned matrix)
 
 | Mode | Input dtype | Accuracy request | M | K | N | Estimated FP ops | Measured mean | Sample stddev | Min | Max | Difference |
