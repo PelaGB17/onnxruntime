@@ -1076,6 +1076,49 @@ The deltas are small absolute workloads but non-negligible relative FP-work chan
 percentage is established by these counts. Formula refinement remains deferred. Odd blocks, tails, other
 block sizes/ISAs and zero activation blocks require separate qualification.
 
+### Follow-up audit: zero activation blocks (November 13)
+
+Six matched activation controls use M=1/8, K=128,N=32, FP32 input, accuracy request 4,
+INT4/block size 32, no bias and implicit midpoint zero points. Nonzero controls retain generated inputs;
+all-zero controls zero every activation; mixed controls zero K blocks 0 and 2 on every row.
+Models/packed weights/scales were verified identical across variants, and native library hashes matched the baseline.
+All six passed reporting-on/off output/capture checks and three R/2R trial pairs completed (36 measurements).
+The all-zero, no-bias outputs were verified exactly zero.
+
+| M | Activation variant | Zero row-blocks Z | Current estimate | Measured process mean | Sample stddev | Delta from nonzero |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | Nonzero | 0 | 640 | 1,902.018 | 0.018 | 0 |
+| 1 | All-zero | 4 | 640 | 1,898.006 | 0.021 | -4.012 |
+| 1 | Mixed-zero | 2 | 640 | 1,900.000 | 0.018 | -2.018 |
+| 8 | Nonzero | 0 | 5,120 | 17,762.000 | 0.000 | 0 |
+| 8 | All-zero | 32 | 5,120 | 17,730.000 | 0.000 | -32.000 |
+| 8 | Mixed-zero | 16 | 5,120 | 17,745.994 | 0.027 | -16.006 |
+
+The AVX2 quantizer source defines inverse scale as `127/maxScalar` only when maxScalar is nonzero.
+The compiled quantizer performs the scale division at `13e44c9`, then compares against zero at `13e44cd`.
+Its zero branch at `13e44d3` jumps to `13e4668`, initializes inverse scale with zero registers and rejoins
+the quantization loop, skipping the inverse-scale `vdivss` at `13e44d9`.
+Activation vector multiplies, scaled block-sum multiplication and subsequent GEMM work are not skipped merely
+because their operands are zero.
+
+This predicts one fewer FP division per all-zero row/block, giving
+`Q = M*(Ka + 3G) - Z` for the previously audited quantizer candidate,
+where Ka=8*ceil(K/8) and Z counts zero row-blocks. Here G=4 and Ka=128.
+Subtracting Z from the corresponding nonzero operator candidate gives totals 1,896/1,898 for M=1
+all-zero/mixed and 17,728/17,744 for M=8 all-zero/mixed. Process-count residuals remain approximately +2.
+These data-dependent totals are experiment references, not a requirement to inspect tensors in the production estimator.
+
+Representative M=8 nonzero/all-zero controls were sampled sequentially for 200,000 repetitions and the
+quantizer annotated (4,778/4,789 samples). M=1 and mixed variants were counter-tested, not separately sampled.
+The named zero branch and observed -Z deltas corroborate the bounded explanation; other dtypes, partial-block
+patterns and different quantizers remain unqualified. Counter classification of other instruction types and
+independently isolated phase counts retain their earlier limitations.
+
+Evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-zero-activation-audit-fy0d32o4/`:
+configuration manifests identifying activation replacement, runtime provenance, fixed model/input bundles,
+estimator/collector logs, raw counters/statistics, `comparison.csv` and representative `samples/` commands,
+symbols and quantizer annotations. No estimator formula or inference behavior was changed.
+
 ## Results (original aligned matrix)
 
 | Mode | Input dtype | Accuracy request | M | K | N | Estimated FP ops | Measured mean | Sample stddev | Min | Max | Difference |
