@@ -969,6 +969,65 @@ This advances the tested block-32 INT8 row/column/mixed-tail accounting, not a u
 M=1 invocations, B=64/128 tails, explicit zero points, all-zero activation blocks, other bit widths/dtypes/ISAs,
 threading and CUDA still require their separate qualification. No estimator formula or logical convention changed.
 
+### Follow-up audit: explicit zero-point input presence (November 13)
+
+Three matched variants use implicit midpoint, explicit midpoint=8, and explicit asymmetric zero point=3.
+All have INT4/block size 32, FP32 input, K=128,N=32, no bias and one thread; M=1/8 and accuracy requests
+0/4 give twelve cases. A, packed B and scales were verified identical across variants, separating input-presence
+effects from zero-point values. Each four-case bundle passed capture/output checks and completed three
+R/2R pairs (72 total counter measurements). Asymmetric reconstructed weights intentionally differ numerically;
+no output-equivalence claim is made between midpoint and asymmetric variants.
+
+| M | Effective mode | Implicit process mean | Explicit midpoint mean | Explicit asymmetric mean |
+|---:|---|---:|---:|---:|
+| 1 | FP32 | 12,514.018 | 12,513.982 | 12,514.012 |
+| 8 | FP32 | 69,890.006 | 69,889.982 | 69,889.994 |
+| 1 | INT8 | 1,902.018 | 2,541.994 | 2,541.988 |
+| 8 | INT8 | 17,762.000 | 17,761.994 | 17,761.970 |
+
+All variants retain their coarse `packed_qnbit` route and FP32/INT8 mode, and current estimator subtotals
+are unchanged by zero-point input presence. Only the M=1 INT8 case changes materially: approximately +640 FP
+operations, including when explicit values equal the implicit midpoint.
+This is modest absolute work but approximately 34% of the tiny implicit case's measured FP work.
+The other tested modes/geometries show no meaningful change at the experiment's variability.
+
+The [single-row block-32 helper](../../../../onnxruntime/core/mlas/lib/sqnbitgemm_m1_sym_kernel_avx2_int8_blklen32.h)
+selects `accumulate_blklen32_r1c1blk2_zp_avx2<false>` for explicit zero points.
+It separately subtracts each block's zero point in integer arithmetic, computes one scalar scale product,
+and executes one eight-lane FP FMA per output/block: 1+16=17 operations.
+The implicit-midpoint helper combines two blocks' integer partial sums before FP scaling, using one
+eight-lane multiply plus one eight-lane FMA per pair: 24 per pair, or 12 per output/block for even G.
+The explicit path does not test whether all supplied values happen to equal 8 before selecting this structure.
+
+For the audited M=1,N-divisible-by-four, full-block case with G=K/32:
+
+| Component | Implicit candidate | Explicit candidate |
+|---|---:|---:|
+| Activation quantization, K+3G | 140 | 140 |
+| Scaling/accumulation | 12NG = 1,536 | 17NG = 2,176 |
+| Final reductions, 7N | 224 | 224 |
+| Total | **1,900** | **2,540** |
+| Candidate explicit-minus-implicit delta | | **640** |
+
+Measured deltas are 639.976 (explicit midpoint) and 639.970 (asymmetric).
+The approximately +2 residual of measured process work versus each candidate remains unattributed and negligible
+for a ballpark estimate. These totals are candidate operator-work ledgers, not the unchanged estimator subtotal
+of 640 for this M=1 INT8 case. Do not add them on top of that overlapping nominal scaling allowance.
+
+All three M=1 INT8 variants were sampled sequentially for 200,000 repetitions with baseline native hashes verified.
+Captures contained 2,639/2,548/4,593 samples. The active explicit branch in the shared wrapper annotation contains
+scalar `vmulss` products at `13db1e9`/`13db236` and separate vector FMAs at `13db222`/`13db286` for the first
+column's two blocks; implicit samples attribute execution to the paired-block region instead.
+Addresses apply only to this binary. Shared annotations contain multiple branches; sample presence is not a
+per-instruction execution count.
+
+Evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-zero-point-audit-mFkDF3/`:
+`zero-point-comparison.csv`, matched case bundles, estimator reports, raw counters/statistics and
+`audit-samples/` runtime hashes, commands, symbols and kernel annotations.
+This explains the original controlled input-presence difference. New shapes, odd G, column/K tails, other
+explicit values/layouts, B=64/128 and zero activation blocks require further qualification.
+No estimator formula was modified.
+
 ## Results (original aligned matrix)
 
 | Mode | Input dtype | Accuracy request | M | K | N | Estimated FP ops | Measured mean | Sample stddev | Min | Max | Difference |
