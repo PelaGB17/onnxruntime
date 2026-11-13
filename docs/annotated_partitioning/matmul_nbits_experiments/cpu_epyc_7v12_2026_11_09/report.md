@@ -1028,6 +1028,54 @@ This explains the original controlled input-presence difference. New shapes, odd
 explicit values/layouts, B=64/128 and zero activation blocks require further qualification.
 No estimator formula was modified.
 
+### Held-out explicit-zero-point M=1 INT8 checks (November 13)
+
+Six new cases use M=1, (K,N)=(256,128)/(512,256), FP32 input, INT4/block size 32, accuracy request 4,
+no bias and matched implicit-midpoint, explicit-midpoint=8 and explicit-asymmetric=3 variants.
+Native library hashes matched the baseline; A/B/scales were verified identical across variants.
+All six passed their individual reporting-on/off capture/output checks and completed three R/2R pairs
+(36 hardware measurements).
+
+For full even block counts and N divisible by four, the prior candidates are:
+
+```text
+G = K/32
+Implicit total = K + 3G + 12NG + 7N
+Explicit total = K + 3G + 17NG + 7N
+Explicit-minus-implicit FP work = 5NG
+```
+
+| K | N | Variant | Candidate total | Measured process mean | Residual | Measured delta from implicit |
+|---:|---:|---|---:|---:|---:|---:|
+| 256 | 128 | Implicit | 13,464 | 13,466.000 | +2.000 | 0 |
+| 256 | 128 | Explicit midpoint | 18,584 | 18,586.000 | +2.000 | 5,120.000 |
+| 256 | 128 | Explicit asymmetric | 18,584 | 18,586.018 | +2.018 | 5,120.018 |
+| 512 | 256 | Implicit | 51,504 | 51,505.982 | +1.982 | 0 |
+| 512 | 256 | Explicit midpoint | 71,984 | 71,986.006 | +2.006 | 20,480.024 |
+| 512 | 256 | Explicit asymmetric | 71,984 | 71,986.012 | +2.012 | 20,480.030 |
+
+Predicted deltas are 5,120 and 20,480. These measurements strongly corroborate the bounded input-presence
+accounting. Four implicit/explicit-midpoint executions were sampled sequentially with 200,000 repetitions
+and their shared AVX2 block-sum wrapper annotated (4,706/5,121/4,791/5,344 samples).
+Asymmetric variants were counter-tested, not separately sampled in this held-out pass.
+The approximately two-operation process residual remains negligible and unattributed.
+
+Cross-variant numerical checking produced an additional finding: implicit and explicit-midpoint outputs were
+not bitwise identical despite identical mathematical weight semantics. Maximum absolute differences were
+9.5367431640625e-7 at K=256,N=128 and 1.9073486328125e-6 at K=512,N=256.
+Different FP accumulation ordering is consistent with the separately processed explicit blocks.
+The exact cross-variant equality assertion failed; it was not silently relaxed.
+Individual reporting-on/off equality checks passed. No cross-route numerical acceptance is claimed because
+a tolerance was not predeclared; retain this as an open numerical qualification item, not a capture failure.
+Asymmetric outputs intentionally have different weight semantics and are not expected to equal midpoint outputs.
+
+Evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-zero-point-heldout-3by41ybj/`:
+matched manifests/models, runtime provenance, estimator/collector logs, raw counters, `comparison.csv`,
+`midpoint-output-comparison.json` and `samples/` commands, captures, symbols and annotations.
+The deltas are small absolute workloads but non-negligible relative FP-work changes; no latency impact
+percentage is established by these counts. Formula refinement remains deferred. Odd blocks, tails, other
+block sizes/ISAs and zero activation blocks require separate qualification.
+
 ## Results (original aligned matrix)
 
 | Mode | Input dtype | Accuracy request | M | K | N | Estimated FP ops | Measured mean | Sample stddev | Min | Max | Difference |
