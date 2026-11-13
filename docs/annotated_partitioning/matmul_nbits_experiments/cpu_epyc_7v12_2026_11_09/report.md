@@ -1119,6 +1119,74 @@ configuration manifests identifying activation replacement, runtime provenance, 
 estimator/collector logs, raw counters/statistics, `comparison.csv` and representative `samples/` commands,
 symbols and quantizer annotations. No estimator formula or inference behavior was changed.
 
+### Follow-up audit: matched FP16 and widened FP32 inputs (November 13)
+
+Eight controls pair FP16 inputs with FP32 inputs obtained by exact widening of those same FP16 values.
+They use M=1/8, K=128,N=32, INT4/block size 32, accuracy requests 0/4, no bias and implicit midpoint zero points.
+Packed weights are identical; scales share exactly representable power-of-two values across dtypes.
+Input widening was checked exactly. Native hashes matched the baseline, all eight reporting/capture/output checks
+passed and three R/2R pairs completed per case (48 hardware measurements).
+
+| M | Request | Observed mode | FP32 process mean | FP16 process mean | FP16-minus-FP32 |
+|---:|---:|---|---:|---:|---:|
+| 1 | 0 | sqnbit_fp32 | 12,514.000 | 12,514.000 | 0.000 |
+| 1 | 4 | sqnbit_int8 | 1,902.000 | 1,902.018 | +0.018 |
+| 8 | 0 | sqnbit_fp32 | 69,890.030 | 69,890.024 | -0.006 |
+| 8 | 4 | sqnbit_int8 | 17,761.994 | 17,762.006 | +0.012 |
+
+FP16 outputs exactly equal casting the matched FP32 outputs to FP16 for all four request/geometry pairs.
+This is a matched finite-input observation, not universal bitwise equivalence across dtypes or algorithms.
+It must not be confused with the earlier implicit/explicit-zero-point comparison that failed exact equality.
+
+The FP16 request-0 path selected FP32 computation rather than a native FP16 GEMM on this host.
+Cycle sampling found `MlasConvertHalfToFloatBufferInParallel`/`MlasConvertHalfToFloatBuffer` along with the
+AVX2 single-row FP32 or FMA3 multi-row family.
+For request 4, sampling identified `QuantizeARow_CompInt8_Fp16_avx2` and the AVX2 INT8 block-sum kernel,
+plus the FMA3 correction GEMM for M=8. The FP16 quantizer widens values before the same scale/block-sum
+arithmetic. No native `hqnbit_fp16` compute mode was observed.
+
+Pure FP16/FP32 conversions are not counted as FP add/multiply arithmetic in these conventions.
+The nearly identical counts corroborate reuse of the qualified arithmetic ledgers for these matched configurations;
+they do not establish zero conversion instructions, bytes or runtime overhead. Conversion performance cost
+cannot be inferred from FP counts. Exceptional inputs, tails, bias/scales/zero-point variants, other ISAs and
+native FP16 kernels require additional qualification.
+
+Four FP16 cases were sampled sequentially with 100,000 workload repetitions and 100 warm-up runs,
+collecting 2,930/2,965/3,328/3,144 samples. FP32 controls were counter-tested, not resampled here.
+Individual and cross-dtype output checks, actual mode identity and process-count comparisons jointly support
+the bounded conclusion; phase counts remain model-based rather than independently isolated.
+
+Evidence is at `/datadisks/disk10/tommasoadani/tmp/matmul-fp16-input-audit-fl9hlx0t/`:
+runtime provenance, matched dtype-control manifests/models/inputs, estimator/collector logs and counters,
+`comparison.csv`, `numerical-comparison.json`, and representative `samples/` commands/symbol reports.
+No estimator formula or compute dispatch was changed.
+
+## CPU checkpoint and transition to CUDA (November 13)
+
+The CPU experiments support bounded arithmetic candidates for the audited AVX2/FMA3 families, including
+aligned and selected tail cases, bias, explicit zero-point input presence, zero activation blocks and matched
+FP16 inputs. This is not universal CPU qualification. The next campaign proceeds to CUDA capture and route
+discovery while the following CPU items remain explicitly open:
+
+- Weight widths 2/8 bits, other block sizes and other ISA/kernel families, including native FP16/BF16/LUT.
+- Block-64/128 tails, broader combined row/column/K/bias/zero-point variants and data-dependent edge cases.
+- Multi-thread reconstruction/reuse, packing/preparation lifetime, first-use costs and reporting overhead.
+- Independently isolated phase counts and complete scalar/SIMD/FMA/rounding/conversion counter semantics.
+- Predeclared numerical tolerance and formal acceptance for implicit versus explicit-midpoint route outputs,
+  which were not bitwise equal in the larger matched zero-point cases.
+- Any whole-operator completeness claim beyond the explicitly modeled/reference components.
+
+These are deferred qualification items, not silently passed or explained by the approximately two-operation
+process residual. Historical open-item statements above describe the state at each audit date; later follow-ups
+provide the additional bounded evidence. Raw artifacts and baseline binaries remain outside the repository.
+
+CUDA work should use a separate environment/build, actual CUDA assignment with CPU fallback disabled,
+independent device-completion checks and Nsight evidence interpreted for the selected GPU architecture.
+CPU coefficients must not be transferred to CUDA merely because logical shapes or quantized weights match.
+See the [testing strategy](../testing_strategy.md) for the campaign gates and commands.
+Production formula refinements remain deferred until the agreed campaign is reviewed and explicitly authorized;
+beginning CUDA does not declare all CPU gaps closed.
+
 ## Results (original aligned matrix)
 
 | Mode | Input dtype | Accuracy request | M | K | N | Estimated FP ops | Measured mean | Sample stddev | Min | Max | Difference |
