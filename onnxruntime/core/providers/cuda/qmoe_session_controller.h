@@ -1583,11 +1583,30 @@ class QMoESessionController {
       }
     }
 
-    const bool use_bounded_file_cache =
+    bool use_bounded_file_cache =
         partial_layers > 0 &&
         !policy.host_expert_bytes.is_auto &&
         policy.host_expert_bytes.bytes < total_cold_bytes &&
         policy.allow_file_backing;
+    bool bounded_cache_replaced_by_mapping = false;
+#if defined(_WIN32)
+    // A private bounded cache that takes more than half of physical RAM can neither be pinned (page-locking it starves
+    // the other pinned allocations of the process) nor kept resident pageable (it is written to the page file). On such a
+    // host the experts are read through the direct file mapping instead, which commits no private memory and whose pages
+    // the memory manager can drop at any time. ORT_QMOE_FORCE_BOUNDED_HOST_CACHE=1 keeps the bounded cache.
+    if (use_bounded_file_cache) {
+      MEMORYSTATUSEX ram_stat{};
+      ram_stat.dwLength = sizeof(ram_stat);
+      char force_buf[8]{};
+      const DWORD force_len = GetEnvironmentVariableA("ORT_QMOE_FORCE_BOUNDED_HOST_CACHE", force_buf, sizeof(force_buf));
+      const bool force_bounded = (force_len > 0 && force_len < sizeof(force_buf) && force_buf[0] == '1');
+      if (!force_bounded && GlobalMemoryStatusEx(&ram_stat) &&
+          policy.host_expert_bytes.bytes > ram_stat.ullTotalPhys / 2) {
+        use_bounded_file_cache = false;
+        bounded_cache_replaced_by_mapping = true;
+      }
+    }
+#endif
 
     std::vector<int32_t> host_cache_counts(num_layers, 0);
     if (use_bounded_file_cache && partial_layers > 0) {
@@ -1735,7 +1754,10 @@ class QMoESessionController {
                      " layers: total_resident_slots=" + std::to_string(total_resident_slots) +
                      ", total_spare_slots=" + std::to_string(total_spare_slots) +
                      ", admitted_gpu_expert_mib=" + std::to_string(total_admitted_gpu_bytes >> 20) +
-                     ", bounded_file_cache=" + (use_bounded_file_cache ? "1" : "0");
+                     ", bounded_file_cache=" + (use_bounded_file_cache ? "1" : "0") +
+                     (bounded_cache_replaced_by_mapping
+                          ? " (host_expert_bytes exceeds half of physical RAM: direct file mapping)"
+                          : "");
 
     plan_committed = true;
     return common::Status::OK();
