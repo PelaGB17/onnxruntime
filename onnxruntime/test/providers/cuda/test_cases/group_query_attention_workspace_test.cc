@@ -761,13 +761,13 @@ TEST(GroupQueryAttentionWorkspaceTest, XqaGeometryPredicatesCoverSupportedDomain
     EXPECT_FALSE(IsSupportedGQAXqaHeadSize(head_size));
   }
 
-  for (int64_t group_size : {1, 2, 4, 5, 8, 16, 32}) {
+  for (int64_t group_size : {1, 2, 3, 4, 5, 8, 16, 32}) {
     EXPECT_TRUE(IsSupportedGQAXqaGroupSize(group_size, false));
   }
   for (int64_t group_size : {4, 8, 16, 32}) {
     EXPECT_TRUE(IsSupportedGQAXqaGroupSize(group_size, true));
   }
-  for (int64_t group_size : {3, 6, 64}) {
+  for (int64_t group_size : {6, 64}) {
     EXPECT_FALSE(IsSupportedGQAXqaGroupSize(group_size, false));
   }
   for (int64_t group_size : {1, 2, 3, 5, 64}) {

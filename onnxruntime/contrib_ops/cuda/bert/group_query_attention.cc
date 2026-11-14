@@ -142,6 +142,14 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
   constexpr bool kIsFp16OrBf16 = std::is_same_v<T, MLFloat16> || std::is_same_v<T, BFloat16>;
   // XQA defaults on for fp16/bf16; ORT_ENABLE_XQA=0 disables it explicitly.
   enable_xqa_ = kIsFp16OrBf16 && (ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", 1) != 0);
+  // Group-3 XQA is measured faster only for fp16 on SM 8.0 and 9.0; ORT_ENABLE_XQA_GROUP3=0/1 overrides.
+  if (enable_xqa_ && num_heads_ == 3 * kv_num_heads_) {
+    const cudaDeviceProp& device_prop = GetDeviceProp();
+    const bool measured_sm = (device_prop.major == 8 && device_prop.minor == 0) ||
+                             (device_prop.major == 9 && device_prop.minor == 0);
+    const bool group3_default = std::is_same_v<T, MLFloat16> && measured_sm;
+    enable_xqa_ = ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA_GROUP3", group3_default ? 1 : 0) != 0;
+  }
 
   kernel_options_ = this->GetAttentionKernelOptions();
 

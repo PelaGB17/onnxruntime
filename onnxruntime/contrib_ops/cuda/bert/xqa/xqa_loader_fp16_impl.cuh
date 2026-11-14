@@ -69,6 +69,14 @@ namespace HEAD_DIM_NAMESPACE {
 #undef GRP_SIZE
 #undef M_TILESIZE
 
+#define NAMESPACE_NAME grp3_fp16
+#define GRP_SIZE 3
+#define M_TILESIZE 8
+#include "xqa_impl_gen.cuh"
+#undef NAMESPACE_NAME
+#undef GRP_SIZE
+#undef M_TILESIZE
+
 #define NAMESPACE_NAME grp4_fp16
 #define GRP_SIZE 4
 #define M_TILESIZE 8
@@ -217,6 +225,8 @@ Status LaunchXQAKernelImpl(
       return grp1_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     case 2:
       return grp2_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
+    case 3:
+      return grp3_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     case 4:
       return grp4_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     case 5:
@@ -228,7 +238,7 @@ Status LaunchXQAKernelImpl(
     case 32:
       return grp32_fp16::Launch<T>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     default:
-      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 4, 5, 8, 16, 32. Input has ", group_size);
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 3, 4, 5, 8, 16, 32. Input has ", group_size);
   }
 }
 
@@ -247,6 +257,8 @@ size_t GetXQAKernelSmemBytes(int group_size) {
       return grp1_fp16::GetSmemSize();
     case 2:
       return grp2_fp16::GetSmemSize();
+    case 3:
+      return grp3_fp16::GetSmemSize();
     case 4:
       return grp4_fp16::GetSmemSize();
     case 5:

@@ -3866,6 +3866,67 @@ class TestXQAHeadSinkParity(unittest.TestCase):
         )
 
 
+def gqa_xqa_group3_test_cases():
+    # Group size 3 (e.g. 24 query / 8 KV heads in Phi-3 / Phi-4) through the non-quantized XQA decode kernel.
+    for torch_type, ort_type in [(torch.float16, TensorProto.FLOAT16), (torch.bfloat16, TensorProto.BFLOAT16)]:
+        for head_size in [64, 128, 256]:
+            for past_kv_sequence_length in [4, 1000]:
+                for rotary in [False, True]:
+                    config = GQAConfig(
+                        batch_size=2,
+                        q_sequence_length=1,
+                        kv_sequence_length=1,
+                        num_heads=24,
+                        kv_num_heads=8,
+                        head_size=head_size,
+                        past_kv_sequence_length=past_kv_sequence_length,
+                        buffer_sequence_length=past_kv_sequence_length + 128,
+                        rotary=rotary,
+                        packed=False,
+                        share_buffer=True,
+                    )
+                    type_str = "bf16" if torch_type == torch.bfloat16 else "fp16"
+                    rot_str = "rot" if rotary else "norot"
+                    name = f"{type_str}_h{head_size}_past{past_kv_sequence_length}_{rot_str}"
+                    yield name, config, torch_type, ort_type
+
+
+@unittest.skipIf(not has_xqa(), "XQA is not available, skipping tests.")
+@unittest.skipIf(not has_flash_attention(), "Flash Attention is not available, skipping tests.")
+class TestXQAGroup3Parity(unittest.TestCase):
+    """Verify group-size-3 XQA decode against the reference on every GPU and type (forced on)."""
+
+    def setUp(self):
+        # The device default enables group-3 XQA only for fp16 on SM 8.0 and 9.0.
+        self._prev_env = {name: os.environ.pop(name, None) for name in ("ORT_ENABLE_XQA", "ORT_ENABLE_XQA_GROUP3")}
+        os.environ["ORT_ENABLE_XQA_GROUP3"] = "1"
+
+    def tearDown(self):
+        for name, value in self._prev_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    @parameterized.expand(gqa_xqa_group3_test_cases())
+    def test_xqa_group3_parity(self, name, config, torch_type, ort_type):
+        parity_check_gqa_past(
+            config=config,
+            ep="CUDAExecutionProvider",
+            device="cuda",
+            torch_type=torch_type,
+            ort_type=ort_type,
+            causal=True,
+            rtol=rtol["bf16"] if torch_type == torch.bfloat16 else rtol["fp16"],
+            atol=atol["bf16"] if torch_type == torch.bfloat16 else atol["fp16"],
+            std=0.1,
+        )
+
+
 def gqa_xqa_sliding_window_test_cases():
     # Non-quantized sliding-window (local attention) decode through the XQA kernel.
     #

@@ -69,6 +69,14 @@ namespace HEAD_DIM_NAMESPACE {
 #undef GRP_SIZE
 #undef M_TILESIZE
 
+#define NAMESPACE_NAME grp3_bf16
+#define GRP_SIZE 3
+#define M_TILESIZE 8
+#include "xqa_impl_gen.cuh"
+#undef NAMESPACE_NAME
+#undef GRP_SIZE
+#undef M_TILESIZE
+
 #define NAMESPACE_NAME grp4_bf16
 #define GRP_SIZE 4
 #define M_TILESIZE 8
@@ -237,6 +245,8 @@ Status LaunchXQAKernelImpl<__nv_bfloat16>(
       return grp1_bf16::Launch<__nv_bfloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     case 2:
       return grp2_bf16::Launch<__nv_bfloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
+    case 3:
+      return grp3_bf16::Launch<__nv_bfloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     case 4:
       return grp4_bf16::Launch<__nv_bfloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     case 5:
@@ -248,7 +258,7 @@ Status LaunchXQAKernelImpl<__nv_bfloat16>(
     case 32:
       return grp32_bf16::Launch<__nv_bfloat16>(device_prop, stream, query, key_cache, value_cache, output, batch_size, num_heads, kv_num_heads, head_size, max_seq_len, scale, is_bsnh, past_seq_lens, attention_sinks, k_cache_scale, v_cache_scale, workspace, workspace_size, local_window_size);
     default:
-      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 4, 5, 8, 16, 32. Input has ", group_size);
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "XQA supports group_size 1, 2, 3, 4, 5, 8, 16, 32. Input has ", group_size);
   }
 }
 
