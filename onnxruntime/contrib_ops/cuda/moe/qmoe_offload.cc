@@ -17,9 +17,11 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -310,6 +312,121 @@ inline void MaybeTrimPostWarmupWorkingSet(const void* session_scope) noexcept {
   }
 #endif
 }
+
+// Windows: pages a thread faults in carry the thread's memory priority, and low-priority standby pages are repurposed
+// first. Prefill streams every cold expert of a long prompt through the file mapping once; faulting those pages at a low
+// priority lets the memory manager keep the cold experts that decode reuses. ORT_QMOE_WIN_PREFILL_MEMPRIO selects the
+// priority (1 = very low, the default .. 5 = normal); 0 leaves the thread priority unchanged.
+inline int PrefillMemoryPriority() noexcept {
+  static const int priority = ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFILL_MEMPRIO", 1);
+  return (priority >= 1 && priority <= 5) ? priority : 0;
+}
+
+class ScopedPrefillMemoryPriority final {
+ public:
+  ScopedPrefillMemoryPriority() noexcept {
+#if defined(_WIN32)
+    const int priority = PrefillMemoryPriority();
+    if (priority == 0) return;
+    if (GetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &orig_, sizeof(orig_)) == FALSE) return;
+    MEMORY_PRIORITY_INFORMATION low{};
+    low.MemoryPriority = static_cast<ULONG>(priority);
+    active_ = SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &low, sizeof(low)) != FALSE;
+#endif
+  }
+  ~ScopedPrefillMemoryPriority() {
+#if defined(_WIN32)
+    if (active_) {
+      static_cast<void>(SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &orig_, sizeof(orig_)));
+    }
+#endif
+  }
+  ScopedPrefillMemoryPriority(const ScopedPrefillMemoryPriority&) = delete;
+  ScopedPrefillMemoryPriority& operator=(const ScopedPrefillMemoryPriority&) = delete;
+
+ private:
+#if defined(_WIN32)
+  MEMORY_PRIORITY_INFORMATION orig_{};
+  bool active_ = false;
+#endif
+};
+
+#if defined(_WIN32)
+using MappedPrefetchRanges = InlinedVector<WIN32_MEMORY_RANGE_ENTRY, 64>;
+
+// Issues PrefetchVirtualMemory for file-mapped expert ranges on a helper thread, so the caller's work starts at once and
+// only waits for pages whose reads are still in flight. Each request carries the memory priority its pages are read at
+// (0 = normal). Requests are a best-effort hint: when the worker falls behind, the oldest queued request is dropped.
+// Provider teardown joins the worker (Shutdown) before the library unloads, like the doorbell service.
+class MappedPrefetchService final {
+ public:
+  static MappedPrefetchService& Instance() {
+    static MappedPrefetchService instance;
+    return instance;
+  }
+
+  void Post(MappedPrefetchRanges&& ranges, int memory_priority) {
+    if (ranges.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!worker_.joinable()) {
+      stop_ = false;
+      worker_ = std::thread([this] { Loop(); });
+    }
+    constexpr size_t kMaxQueued = 4;
+    if (queue_.size() >= kMaxQueued) queue_.pop_front();
+    queue_.push_back(Request{std::move(ranges), memory_priority});
+    cv_.notify_one();
+  }
+
+  void Shutdown() noexcept {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!worker_.joinable()) return;
+      stop_ = true;
+      cv_.notify_one();
+    }
+    worker_.join();
+    std::lock_guard<std::mutex> lock(mutex_);
+    queue_.clear();
+    stop_ = false;
+  }
+
+ private:
+  struct Request {
+    MappedPrefetchRanges ranges;
+    int memory_priority;
+  };
+
+  void Loop() {
+    int current_priority = -1;
+    for (;;) {
+      Request request;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        if (stop_) return;
+        request = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      const int priority = request.memory_priority > 0 ? request.memory_priority : MEMORY_PRIORITY_NORMAL;
+      if (priority != current_priority) {
+        MEMORY_PRIORITY_INFORMATION info{};
+        info.MemoryPriority = static_cast<ULONG>(priority);
+        static_cast<void>(SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &info, sizeof(info)));
+        current_priority = priority;
+      }
+      static_cast<void>(PrefetchVirtualMemory(GetCurrentProcess(), static_cast<ULONG_PTR>(request.ranges.size()),
+                                              request.ranges.data(), 0));
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<Request> queue_;
+  std::thread worker_;
+  bool stop_ = false;
+};
+#endif
 
 inline int QMoEPrefillTotalTokens(const void* session_scope, int default_value) noexcept {
   const auto* controls = RunControlsOf(session_scope);
@@ -2632,8 +2749,49 @@ QMoEOffload::LiveBackendCount::~LiveBackendCount() {
   g_live_offload_backends.fetch_sub(1, std::memory_order_acq_rel);
 }
 
+namespace {
+// Direct file-mapped QMoE backends by (session controller, layer index), so a layer can queue the read-ahead of the next
+// layer's streamed experts. Entries are added on a backend's first large prefill and removed by its destructor; lookups
+// hold the mutex while they use the backend, so it cannot be destroyed in between.
+std::mutex g_mapped_layers_mutex;
+std::map<std::pair<const void*, int64_t>, const QMoEOffload*> g_mapped_layers;
+}  // namespace
+
+bool QMoEOffload::IsDirectMappedIntBank() const noexcept {
+  return (int4_bank_mode_ || int2_bank_mode_ || (int3_bank_mode_ && !expert_blocks_)) &&
+         !(host_cache_bytes_ > 0 && file_expert_store_.IsInitialized()) && !host_complement_mode_ &&
+         nvfp4_fc1_w_ && nvfp4_fc2_w_ && nvfp4_fc1_s_ && nvfp4_fc2_s_;
+}
+
+bool QMoEOffload::PostMappedNonResidentPrefetch() const {
+#if defined(_WIN32)
+  if (!IsDirectMappedIntBank()) return false;
+  const uint8_t* bank_base[4] = {static_cast<const uint8_t*>(nvfp4_fc1_w_->DataRaw()),
+                                 static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw()),
+                                 static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw()),
+                                 static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw())};
+  MappedPrefetchRanges ranges;
+  ranges.reserve(static_cast<size_t>(num_experts_) * 4);
+  for (int expert = 0; expert < num_experts_; ++expert) {
+    // A hint only: the slot table of this (idle) layer is read without its lock.
+    if (static_cast<size_t>(expert) < expert_slot_.size() && expert_slot_[expert] >= 0) continue;
+    for (int b = 0; b < 4; ++b) {
+      ranges.push_back({const_cast<uint8_t*>(bank_base[b] + static_cast<size_t>(expert) * resident_bank_bytes_[b]),
+                        resident_bank_bytes_[b]});
+    }
+  }
+  MappedPrefetchService::Instance().Post(std::move(ranges), PrefillMemoryPriority());
+  return true;
+#else
+  return false;
+#endif
+}
+
 void QMoEOffload::ShutdownBackgroundServices() noexcept {
   if (g_live_offload_backends.load(std::memory_order_acquire) != 0) return;
+#if defined(_WIN32)
+  MappedPrefetchService::Instance().Shutdown();
+#endif
   // The doorbell worker can still create a shared pool while it starts, so it stops first.
   if (DoorbellService::Instance().Shutdown()) {
     ShutdownSharedSpinPools();
@@ -3075,6 +3233,12 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info)
 }
 
 QMoEOffload::~QMoEOffload() {
+  {
+    std::lock_guard<std::mutex> lock(g_mapped_layers_mutex);
+    for (auto it = g_mapped_layers.begin(); it != g_mapped_layers.end();) {
+      it = (it->second == this) ? g_mapped_layers.erase(it) : std::next(it);
+    }
+  }
   int prev_dev = -1;
   const bool restore_dev = (device_id_ >= 0 && cudaGetDevice(&prev_dev) == cudaSuccess && prev_dev != device_id_);
   if (restore_dev) {
@@ -7266,6 +7430,37 @@ int QMoEOffload::RunColdExperts(CpuWork& work, int group_count, const ActT* host
   if (work.result.size() < need_result) work.result.resize(need_result);
   cpu_expert_invocations_.fetch_add(calls.size(), std::memory_order_relaxed);
   const bool use_ssd = !host_complement_mode_ && file_expert_store_.IsInitialized();
+#if defined(_WIN32)
+  // Direct file-mapped banks: one batched prefetch of every cold expert of this call turns the demand faults of the
+  // compute threads (small synchronous reads) into large queued reads, so experts not in RAM arrive in one round trip.
+  if (!use_ssd && !expert_blocks_ && IsDirectMappedIntBank()) {
+    // 0 = off, 1 = prefetch on the calling thread before compute, 2 (default) = prefetch on a helper thread overlapped
+    // with compute.
+    static const int decode_prefetch_mode =
+        ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_DECODE_PREFETCH", 2);
+    if (decode_prefetch_mode == 1 || decode_prefetch_mode == 2) {
+      const uint8_t* bank_base[4] = {static_cast<const uint8_t*>(nvfp4_fc1_w_->DataRaw()),
+                                     static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw()),
+                                     static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw()),
+                                     static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw())};
+      MappedPrefetchRanges ranges;
+      int last_expert = -1;
+      for (const auto& call : calls) {
+        if (call.expert == last_expert) continue;
+        last_expert = call.expert;
+        for (int b = 0; b < 4; ++b) {
+          ranges.push_back({const_cast<uint8_t*>(bank_base[b] + static_cast<size_t>(call.expert) * resident_bank_bytes_[b]),
+                            resident_bank_bytes_[b]});
+        }
+      }
+      if (decode_prefetch_mode == 2) {
+        MappedPrefetchService::Instance().Post(std::move(ranges), 0);
+      } else {
+        static_cast<void>(PrefetchVirtualMemory(GetCurrentProcess(), static_cast<ULONG_PTR>(ranges.size()), ranges.data(), 0));
+      }
+    }
+  }
+#endif
   const int fc1_tasks = (2 * inter_size_ + fc1_cols_ - 1) / fc1_cols_;
   const int fc2_tasks = (hidden_size_ + fc2_cols_ - 1) / fc2_cols_;
   const bool timed = cpu_timing_ && tile_rows <= std::max(4, async_max_tokens_);
@@ -8728,8 +8923,22 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
             ranges.push_back({const_cast<uint8_t*>(s2_b + static_cast<size_t>(exp_id) * resident_bank_bytes_[3]), resident_bank_bytes_[3]});
           }
           if (!ranges.empty()) {
+            ScopedPrefillMemoryPriority low_memory_priority;
             static_cast<void>(PrefetchVirtualMemory(GetCurrentProcess(), static_cast<ULONG_PTR>(ranges.size()), ranges.data(), 0));
           }
+        }
+      }
+      // Read the next layer's streamed experts while this layer prefills. Small prompts route to a fraction of the
+      // experts, so only large tiles, which route to nearly all of them, look ahead.
+      static const int lookahead_min_rows =
+          ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFILL_LOOKAHEAD_MIN_ROWS", 1024);
+      if (start == 0 && lookahead_min_rows > 0 && tile_rows >= lookahead_min_rows && IsDirectMappedIntBank()) {
+        const void* scope = session_controller_.get();
+        std::lock_guard<std::mutex> lock(g_mapped_layers_mutex);
+        g_mapped_layers[{scope, layer_index_}] = this;
+        const auto next = g_mapped_layers.find({scope, layer_index_ + 1});
+        if (!in_warmup && next != g_mapped_layers.end()) {
+          static_cast<void>(next->second->PostMappedNonResidentPrefetch());
         }
       }
 #endif
@@ -8952,6 +9161,7 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
             const size_t s1_bytes = resident_bank_bytes_[2];
             const size_t s2_bytes = resident_bank_bytes_[3];
             auto stage_wave_fn = [&](ptrdiff_t task_idx) noexcept {
+              ScopedPrefillMemoryPriority low_memory_priority;
               const int r = static_cast<int>(task_idx >> 2);
               const int part = static_cast<int>(task_idx & 3);
               const int exp_id = stream_list[first + r];
