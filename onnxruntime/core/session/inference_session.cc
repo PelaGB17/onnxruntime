@@ -221,9 +221,31 @@ inline std::basic_string<T> GetCurrentTimeString() {
 
 #if !defined(ORT_MINIMAL_BUILD)
 
+// An If whose branches only return constant initializers runs no kernels: it copies the selected
+// branch's constants. A captured graph replays the branch taken at capture time, which is sound when
+// the condition comes from CPU shape nodes (checked by the CPU-for-shapes policy, which rejects Memcpy).
+static bool IsConstantBranchIf(const Node& node) {
+  if (node.OpType() != "If" || !(node.Domain().empty() || node.Domain() == kOnnxDomain)) {
+    return false;
+  }
+
+  for (const auto& [name, subgraph] : node.GetAttributeNameToSubgraphMap()) {
+    if (subgraph->NumberOfNodes() != 0) {
+      return false;
+    }
+    for (const auto* output : subgraph->GetOutputs()) {
+      if (subgraph->GetConstantInitializer(output->Name(), false) == nullptr) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 static bool HasControlflowNodes(const Graph& graph) {
   for (const auto& node : graph.Nodes()) {
-    if (node.ContainsSubgraph()) {
+    if (node.ContainsSubgraph() && !IsConstantBranchIf(node)) {
       return true;
     }
   }

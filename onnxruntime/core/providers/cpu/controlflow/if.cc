@@ -5,6 +5,7 @@
 #include "core/providers/cpu/controlflow/utils.h"
 
 #include "core/framework/framework_common.h"
+#include "core/framework/data_transfer_manager.h"
 #include "core/framework/op_kernel_context_internal.h"
 #include "core/framework/session_state.h"
 #include "core/framework/tensorprotoutils.h"
@@ -284,6 +285,53 @@ common::Status If::SetupSubgraphExecutionInfo(const SessionState& session_state,
   return Status::OK();
 }
 
+Status If::PrepareConstantBranches(OpKernelContextInternal& ctx) const {
+  std::lock_guard<std::mutex> lock(constant_branch_mutex_);
+  if (constant_branches_prepared_) {
+    return Status::OK();
+  }
+
+  // Both branches are staged on the first run, which precedes any CUDA graph capture.
+  AllocatorPtr allocator = OpKernel::Info().GetAllocator(OrtMemTypeDefault);
+  for (const bool then_branch : {true, false}) {
+    ConstantBranch& branch = then_branch ? then_constant_ : else_constant_;
+    const auto* subgraph_state = ctx.SubgraphSessionState(then_branch ? "then_branch" : "else_branch");
+    ORT_RETURN_IF_NOT(subgraph_state != nullptr, "Subgraph SessionState was not found for 'If' branch.");
+    const auto& viewer = subgraph_state->GetGraphViewer();
+    if (allocator == nullptr || viewer.NumberOfNodes() != 0) {
+      continue;
+    }
+
+    const auto& name_to_idx = subgraph_state->GetOrtValueNameIdxMap();
+    const auto& constants = subgraph_state->GetConstantInitializedTensors();
+    std::vector<OrtValue> outputs;
+    for (const auto* output : viewer.GetOutputs()) {
+      int idx = -1;
+      auto entry = name_to_idx.GetIdx(output->Name(), idx).IsOK() ? constants.find(idx) : constants.end();
+      if (entry == constants.end() || !entry->second.IsTensor()) {
+        outputs.clear();
+        break;
+      }
+
+      const Tensor& source = entry->second.Get<Tensor>();
+      if (source.Location().device == allocator->Info().device) {
+        outputs.push_back(entry->second);
+        continue;
+      }
+      OrtValue staged;
+      Tensor::InitOrtValue(source.DataType(), source.Shape(), allocator, staged);
+      ORT_RETURN_IF_ERROR(subgraph_state->GetDataTransferMgr().CopyTensor(source, *staged.GetMutable<Tensor>()));
+      outputs.push_back(std::move(staged));
+    }
+
+    branch.is_constant = !outputs.empty() && outputs.size() == viewer.GetOutputs().size();
+    branch.outputs = std::move(outputs);
+  }
+
+  constant_branches_prepared_ = true;
+  return Status::OK();
+}
+
 Status If::Compute(OpKernelContext* ctx) const {
   ORT_ENFORCE(then_feeds_fetches_manager_ && else_feeds_fetches_manager_,
               "CreateFeedsFetchesManager must be called prior to execution of graph.");
@@ -296,6 +344,21 @@ Status If::Compute(OpKernelContext* ctx) const {
                     "If nodes condition input must have exactly one element");
 
   auto condition = *condition_tensor.Data<bool>();
+
+  ORT_RETURN_IF_ERROR(PrepareConstantBranches(*ctx_internal));
+  const ConstantBranch& constant_branch = condition ? then_constant_ : else_constant_;
+  if (constant_branch.is_constant) {
+    const auto& data_transfer = OpKernel::Info().GetDataTransferManager();
+    Stream* stream = ctx->GetComputeStream();
+    for (size_t i = 0; i < constant_branch.outputs.size(); ++i) {
+      const Tensor& source = constant_branch.outputs[i].Get<Tensor>();
+      Tensor* output = ctx->Output(static_cast<int>(i), source.Shape());
+      ORT_RETURN_IF_NOT(output != nullptr, "Failed to create output tensor for 'If' output ", i);
+      ORT_RETURN_IF_ERROR(stream != nullptr ? data_transfer.CopyTensorAsync(source, *output, *stream)
+                                            : data_transfer.CopyTensor(source, *output));
+    }
+    return Status::OK();
+  }
 
   auto attribute = condition ? "then_branch" : "else_branch";
   auto* session_state = ctx_internal->SubgraphSessionState(attribute);

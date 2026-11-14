@@ -519,6 +519,62 @@ class TestInferenceSessionWithCudaGraph(unittest.TestCase):
 
             np.testing.assert_allclose(output, expected_output, rtol=1e-02, atol=1e-02)
 
+    def _create_if_cuda_graph_session(self, length: int, branch_nodes: bool = False):
+        if "CUDAExecutionProvider" not in onnxrt.get_available_providers():
+            self.skipTest("CUDAExecutionProvider is not available")
+
+        def branch(name: str, value: float):
+            if branch_nodes:
+                # A branch reading an outer-scope value cannot be folded into a constant.
+                nodes = [helper.make_node("Neg", ["X"], [f"{name}_out"])]
+            else:
+                constant = numpy_helper.from_array(np.array([value], dtype=np.float32))
+                nodes = [helper.make_node("Constant", [], [f"{name}_out"], value=constant)]
+            output = helper.make_tensor_value_info(f"{name}_out", TensorProto.FLOAT, None)
+            return helper.make_graph(nodes, name, [], [output])
+
+        # The condition comes from CPU shape nodes, like LongRoPE exports that select rotary caches by length.
+        # The symbolic dimension keeps constant folding from resolving the condition and inlining the If.
+        graph = helper.make_graph(
+            [
+                helper.make_node("Shape", ["X"], ["shape"]),
+                helper.make_node("Gather", ["shape", "zero"], ["length"], axis=0),
+                helper.make_node("Greater", ["length", "threshold"], ["cond"]),
+                helper.make_node(
+                    "If", ["cond"], ["offset"], then_branch=branch("then", 10.0), else_branch=branch("else", 1000.0)
+                ),
+                helper.make_node("Add", ["X", "offset"], ["Y"]),
+            ],
+            "constant_branch_if_cuda_graph",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, ["n"])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["n"])],
+            [
+                numpy_helper.from_array(np.array(0, dtype=np.int64), name="zero"),
+                numpy_helper.from_array(np.array(4, dtype=np.int64), name="threshold"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 7
+        providers = [("CUDAExecutionProvider", {"enable_cuda_graph": True})]
+        session = onnxrt.InferenceSession(model.SerializeToString(), providers=providers)
+        return session, CudaGraphHelper(session, {"X": [length], "Y": [length]})
+
+    def test_constant_branch_if_cuda_graph_replay(self):
+        for length, offset in ((4, 1000.0), (6, 10.0)):
+            session, cuda_graph_helper = self._create_if_cuda_graph_session(length)
+            for scale in (1.0, -2.0, 0.5):
+                data = np.arange(length, dtype=np.float32) * scale
+                cuda_graph_helper.update_inputs({"X": data})
+                cuda_graph_helper.io_binding.synchronize_inputs()
+                for _ in range(3):
+                    session.run_with_iobinding(cuda_graph_helper.io_binding)
+                    cuda_graph_helper.io_binding.synchronize_outputs()
+                    np.testing.assert_array_equal(cuda_graph_helper.get_output("Y"), data + offset)
+
+    def test_if_with_branch_nodes_rejects_cuda_graph_capture(self):
+        with self.assertRaisesRegex(Exception, "control flow nodes"):
+            self._create_if_cuda_graph_session(4, branch_nodes=True)
+
 
 if __name__ == "__main__":
     unittest.main()
