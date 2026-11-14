@@ -111,6 +111,11 @@ class QMoEOffload final : public onnxruntime::cuda::CudaKernel, public MoEBase {
   void RestoreAndSeedResidentSlab(const int* prompt_hist, int total_prompt_routes,
                                   bool enable_seeding, cudaStream_t stream) const;
   void StageExperts(const int* experts, int count) const;
+  // Windows, direct file-mapped integer banks: queues an asynchronous read of every expert not resident on the GPU, at
+  // the prefill memory priority. The layer before this one calls it while it prefills, so this layer's streamed experts
+  // are read ahead of its own prefill. Returns false when this backend does not stream from a file mapping.
+  bool PostMappedNonResidentPrefetch() const;
+  bool IsDirectMappedIntBank() const noexcept;
   void InitializeShared(const OpKernelInfo& info);
   void InitializeNvfp4Offload(const OpKernelInfo& info);
   Status ComputeShared(OpKernelContext* context) const;
