@@ -154,6 +154,11 @@ class QMoE final : public CudaKernel, public MoEBase, public onnxruntime::moe_of
   bool enable_int2_gemv_ = false;
   bool enable_int2_prefill_ = false;
   int64_t row_tile_size_ = qmoe::kDisabledRowTileSize;
+  // ep.cuda.qmoe_row_tile_size or ORT_QMOE_ROW_TILE_SIZE was set (0 = tiling off). When neither is set, grouped INT
+  // calls tile with a row count derived from qmoe::kDefaultRowTileScratchBudgetBytes.
+  bool row_tile_size_configured_ = false;
+  // Budget-derived row tile of this node; resolved on first use under mGemmProfilerMutex (0 = not resolved yet).
+  mutable int64_t default_row_tile_size_ = 0;
   int64_t int_dequant_max_scratch_bytes_ = int64_t{1} << 30;
   // Static prefill options resolved once in the constructor so they cannot change between runs of a session.
   // The automatic expert-compaction cap is derived from the offload policy only for planned offload nodes.

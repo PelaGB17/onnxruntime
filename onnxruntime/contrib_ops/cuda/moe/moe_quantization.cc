@@ -361,10 +361,12 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
     const auto parse_result = std::from_chars(value.data(), value.data() + value.size(), row_tile_size_);
     ORT_ENFORCE(parse_result.ec == std::errc{} && parse_result.ptr == value.data() + value.size(),
                 kQMoERowTileSizeConfig, " must be an integer, got '", value, "'.");
+    row_tile_size_configured_ = true;
   } else {
     row_tile_size_source = kQMoERowTileSize;
-    row_tile_size_ = onnxruntime::ParseEnvironmentVariableWithDefault<int64_t>(
-        kQMoERowTileSize, qmoe::kDisabledRowTileSize);
+    const auto env_row_tile_size = onnxruntime::ParseEnvironmentVariable<int64_t>(kQMoERowTileSize);
+    row_tile_size_configured_ = env_row_tile_size.has_value();
+    row_tile_size_ = env_row_tile_size.value_or(qmoe::kDisabledRowTileSize);
   }
   ORT_ENFORCE(row_tile_size_ == qmoe::kDisabledRowTileSize || qmoe::IsValidRowTileSize(row_tile_size_),
               row_tile_size_source, " must be 0 (disabled) or an integer in [1, ",
@@ -2104,6 +2106,25 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
                       " bytes of dequantized weight scratch, exceeding the configured limit of ",
                       int_dequant_max_scratch_bytes_, " bytes. Increase ",
                       kQMoEIntDequantMaxScratchBytesConfig, " only for bounded correctness workloads.");
+  }
+
+  // No row tile configured: the dense INT grouped runner takes its whole per-call scratch in one contiguous request,
+  // so pick the tile from a byte budget. Calls with at most kMinDefaultRowTileSize rows (decode, short prompts) never
+  // reach the budget-derived tile and keep the untiled plan.
+  if (!row_tile_size_configured_ && quant_type_ == "int" && !use_packed_int && !use_fp8_fused && !use_fp4_gemv &&
+      !offload_node_registered_ && moe_params.num_rows > qmoe::kMinDefaultRowTileSize) {
+    std::lock_guard<std::mutex> profiler_lock(mGemmProfilerMutex);
+    if (default_row_tile_size_ == 0) {
+      const int runner_experts = narrow<int>(moe_params.num_experts);
+      default_row_tile_size_ = qmoe::RowTileSizeForScratchBudget(
+          qmoe::kDefaultRowTileScratchBudgetBytes, [&](int64_t rows) {
+            const size_t runner_workspace_bytes = active_runner->getWorkspaceSize(
+                rows, moe_params.hidden_size, moe_params.inter_size, runner_experts, k_, kernel_activation_type,
+                parallelism_config, use_awq, swiglu_fusion);
+            return qmoe::MakeScratchLayout(runner_workspace_bytes, qmoe::RowTilePlan{rows, rows}, k_).total_bytes;
+          });
+    }
+    effective_row_tile_size = default_row_tile_size_;
   }
 
   const qmoe::RowTilePlan row_tile_plan =

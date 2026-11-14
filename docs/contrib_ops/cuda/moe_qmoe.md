@@ -354,6 +354,25 @@ The decoded buffers are owned by the QMoE op for the lifetime of the session.
 
 RTX 3090 (SM86), RTX 4090 (SM89), H200 (SM90), GB200/B200 (SM100), RTX 5090 (SM120).
 
+### 4.5 Prefill row tiling and the default scratch budget
+
+The grouped runner takes its whole per-call scratch (runner workspace plus routing buffers) as one
+contiguous allocation, so without tiling the request grows with the prompt (about 78.5 KB per token for
+Qwen3-30B-A3B, 9.6 GiB at 131,072 tokens). The session option `ep.cuda.qmoe_row_tile_size` (environment
+fallback `ORT_QMOE_ROW_TILE_SIZE`) splits a call into row tiles and sizes the scratch for one tile:
+
+- unset: dense INT (`quant_type="int"`) grouped calls with more than 4,096 rows use the largest tile, in
+  multiples of 1,024 rows and at least 4,096, whose scratch fits `qmoe::kDefaultRowTileScratchBudgetBytes`
+  (1.25 GiB). The tile is computed once per node from the runner's workspace size. Calls at or below the
+  tile, including every decode step, keep the untiled plan. Other quant types stay untiled by default.
+- a positive value: that tile size, for every quant type that supports tiling.
+- `0`: tiling off.
+
+Each extra tile costs a fixed amount of expert-GEMM row padding: about 20-25 ms per extra tile over the 48
+layers of Qwen3-30B-A3B on A100, where tiled logits were bitwise identical to the untiled call (same GEMM
+tactic). Other models were not measured end to end; a tile that lands in a different tactic M bucket may
+pick a different tactic.
+
 ---
 
 ## 5. PrePack Transformations

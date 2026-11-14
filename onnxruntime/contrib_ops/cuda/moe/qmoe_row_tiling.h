@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 
 #include "core/common/common.h"
 #include "core/common/safeint.h"
@@ -17,8 +18,49 @@ namespace qmoe {
 
 constexpr int64_t kDisabledRowTileSize = 0;
 
+// When no row tile is configured, the grouped runner's per-call scratch (runner workspace plus routing buffers, one
+// contiguous request) is bounded by this budget instead of growing with the prompt. Row tiles chosen from it are
+// multiples of kDefaultRowTileGranularity rows in [kMinDefaultRowTileSize, kMaxDefaultRowTileSize].
+constexpr size_t kDefaultRowTileScratchBudgetBytes = size_t{1280} << 20;  // 1.25 GiB
+constexpr int64_t kDefaultRowTileGranularity = 1024;
+constexpr int64_t kMinDefaultRowTileSize = 4096;
+constexpr int64_t kMaxDefaultRowTileSize = int64_t{1} << 20;
+
 constexpr bool IsValidRowTileSize(int64_t row_tile_size) {
   return row_tile_size > 0 && row_tile_size <= std::numeric_limits<int>::max();
+}
+
+// An explicitly configured row tile (kDisabledRowTileSize turns tiling off) wins over the budget-derived default.
+inline int64_t ResolveRowTileSize(const std::optional<int64_t>& configured_row_tile_size,
+                                  int64_t default_row_tile_size) {
+  return configured_row_tile_size.has_value() ? *configured_row_tile_size : default_row_tile_size;
+}
+
+// Largest row count that is a multiple of `granularity`, within [min_rows, max_rows], whose scratch fits
+// `budget_bytes`; `min_rows` when even that does not fit. `scratch_bytes(rows)` must not decrease as rows grow.
+template <typename ScratchBytesFn>
+int64_t RowTileSizeForScratchBudget(size_t budget_bytes, const ScratchBytesFn& scratch_bytes,
+                                    int64_t granularity = kDefaultRowTileGranularity,
+                                    int64_t min_rows = kMinDefaultRowTileSize,
+                                    int64_t max_rows = kMaxDefaultRowTileSize) {
+  ORT_ENFORCE(granularity > 0 && min_rows >= granularity && min_rows % granularity == 0 && max_rows >= min_rows &&
+                  IsValidRowTileSize(max_rows),
+              "Invalid QMoE row tile search range: granularity ", granularity, ", rows [", min_rows, ", ", max_rows,
+              "].");
+  int64_t lo = min_rows / granularity;
+  int64_t hi = max_rows / granularity;
+  if (static_cast<size_t>(scratch_bytes(lo * granularity)) > budget_bytes) {
+    return min_rows;
+  }
+  while (lo < hi) {
+    const int64_t mid = lo + (hi - lo + 1) / 2;
+    if (static_cast<size_t>(scratch_bytes(mid * granularity)) <= budget_bytes) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return lo * granularity;
 }
 
 struct RowTilePlan {
