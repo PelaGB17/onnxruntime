@@ -479,19 +479,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params& params, cons
   if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
   // CUDA graph replay keeps the split count and workspace sizes fixed, but varlen sequence lengths
-  // remain live device values. Partition the live tiles so a loose replay upper bound does not
-  // concentrate all useful work in the first split. Fixed-length callers retain the original extent.
-  const int n_blocks_to_split =
-      cute::ceil_div(Is_even_MN ? params.seqlen_k : binfo.actual_seqlen_k, kBlockN);
-  const int n_blocks_per_split = cute::ceil_div(n_blocks_to_split, num_n_splits);
-  const int n_block_min = !Is_local
-                              ? n_split_idx * n_blocks_per_split
-                              : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
-  int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
+  // remain live device values. Partition the live tiles (bounded by any sliding window) so a loose
+  // replay upper bound or a long history past window_size_left does not leave splits empty.
+  const int window_block_min =
+      !Is_local
+          ? 0
+          : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+  int window_block_max = cute::ceil_div(Is_even_MN ? params.seqlen_k : binfo.actual_seqlen_k, kBlockN);
   if (Is_causal || Is_local) {
-    n_block_max = std::min(n_block_max,
-                           cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+    window_block_max = std::min(
+        window_block_max,
+        cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
   }
+  const int n_blocks_to_split = std::max(0, window_block_max - window_block_min);
+  const int n_blocks_per_split = cute::ceil_div(n_blocks_to_split, num_n_splits);
+  const int n_block_min = window_block_min + n_split_idx * n_blocks_per_split;
+  const int n_block_max = std::min(window_block_max, window_block_min + (n_split_idx + 1) * n_blocks_per_split);
   if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
     // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
     // Otherwise we might read OOB elements from gK and gV,
@@ -1107,12 +1110,17 @@ inline __device__ void combine_attn_seqk_parallel(const Params& params) {
   const index_t lse_size = params.b * params.h * params.seqlen_q;
 
   const index_t row_offset_lse = bidx * kBlockM;
+  const bool has_variable_q = params.seqused_q != nullptr || params.cu_seqlens_q != nullptr;
   const auto valid_row = [&](index_t idx) {
     if (idx >= lse_size) return false;
-    return params.seqused_q == nullptr ||
-           idx % params.seqlen_q < params.seqused_q[idx / (params.h * params.seqlen_q)];
+    const index_t batch_idx = idx / (params.h * params.seqlen_q);
+    const index_t row = idx % params.seqlen_q;
+    if (params.cu_seqlens_q != nullptr) {
+      return row < (params.cu_seqlens_q[batch_idx + 1] - params.cu_seqlens_q[batch_idx]);
+    }
+    return params.seqused_q == nullptr || row < params.seqused_q[batch_idx];
   };
-  if (params.seqused_q != nullptr) {
+  if (has_variable_q) {
     bool has_queries = valid_row(row_offset_lse);
     const index_t last_row = std::min(row_offset_lse + kBlockM, lse_size) - 1;
     if (!has_queries && row_offset_lse / params.seqlen_q != last_row / params.seqlen_q) {
@@ -1199,7 +1207,15 @@ inline __device__ void combine_attn_seqk_parallel(const Params& params) {
     if (params.unpadded_lse) {
       const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
       if (valid_row(lse_offset)) {
-        gLSE_unpadded(lse_offset) = lse_logsum;
+        if (params.cu_seqlens_q != nullptr) {
+          const index_t batch_idx = lse_offset / (params.h * params.seqlen_q);
+          const index_t head_idx = (lse_offset - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
+          const index_t row = lse_offset % params.seqlen_q;
+          reinterpret_cast<ElementAccum*>(
+              params.softmax_lse_ptr)[head_idx * params.total_q + params.cu_seqlens_q[batch_idx] + row] = lse_logsum;
+        } else {
+          gLSE_unpadded(lse_offset) = lse_logsum;
+        }
       }
     } else {
       if (valid_row(row_offset_lse + tidx / kRowsPerLoadTranspose)) {
@@ -1247,7 +1263,7 @@ inline __device__ void combine_attn_seqk_parallel(const Params& params) {
   }
   // Load Oaccum in then scale and accumulate to O
   for (int split = 0; split < params.num_splits; ++split) {
-    if (params.seqused_q == nullptr) {
+    if (!has_variable_q) {
       FLASH_NAMESPACE::copy</*Is_even_MN=*/false, Is_even_K>(
           gmem_tiled_copy_Oaccum, tOgOaccum, tOrOaccum, tOcOaccum, tOpOaccum, params.b * params.h * params.seqlen_q - bidx * kBlockM);
     } else {
@@ -1292,7 +1308,11 @@ inline __device__ void combine_attn_seqk_parallel(const Params& params) {
       const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
       // The index to the rows of Q
       const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
-      auto o_ptr = reinterpret_cast<Element*>(params.o_ptr) + batch_idx * params.o_batch_stride + head_idx * params.o_head_stride + row * params.o_row_stride;
+      const index_t batch_row_offset =
+          params.cu_seqlens_q != nullptr
+              ? static_cast<index_t>(params.cu_seqlens_q[batch_idx]) * params.o_row_stride
+              : static_cast<index_t>(batch_idx) * params.o_batch_stride;
+      auto o_ptr = reinterpret_cast<Element*>(params.o_ptr) + batch_row_offset + head_idx * params.o_head_stride + row * params.o_row_stride;
 #pragma unroll
       for (int k = 0; k < size<2>(rO); ++k) {
         if (Is_even_K || tOpOaccum(k)) {

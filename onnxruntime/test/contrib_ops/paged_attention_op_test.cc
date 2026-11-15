@@ -2505,7 +2505,7 @@ TEST(PagedAttention, Cuda_FlashSplitKvSkipsShortReplayRange) {
 #endif
 }
 
-TEST(PagedAttention, Cuda_FlashMultiTokenLongContextDoesNotUseVarlenSplitKv) {
+TEST(PagedAttention, Cuda_FlashMultiTokenLongContextUsesVarlenSplitKvAndGuardsOver64) {
 #if defined(USE_FLASH_ATTENTION)
   ScopedEnvironmentVariables scoped_env_vars{
       EnvVarMap{
@@ -2523,24 +2523,55 @@ TEST(PagedAttention, Cuda_FlashMultiTokenLongContextDoesNotUseVarlenSplitKv) {
     GTEST_SKIP() << "Flash Attention requires compute capability 8.0 or later.";
   }
 
-  IoBindingCase c;
-  c.batch_size = 1;
-  c.token_count = 4;
-  c.num_heads = 2;
-  c.kv_num_heads = 1;
-  c.head_size = 128;
-  c.num_blocks = 8;
-  c.max_num_blocks_per_seq = 8;
-  c.past_seqlen = 1020;
-  c.cumulative_seqlens_q = {0, 4};
-  c.attention_metadata = {4, 1024, 1024};
+  // Multi-token block drafting (q_len <= 64) with causal sliding-window uses varlen split-KV and matches CPU ref.
+  {
+    IoBindingCase c;
+    c.batch_size = 2;
+    c.token_count = 28;
+    c.num_heads = 4;
+    c.kv_num_heads = 2;
+    c.head_size = 128;
+    c.num_blocks = 18;
+    c.max_num_blocks_per_seq = 9;
+    c.past_seqlens = {1004, 880};
+    c.cumulative_seqlens_q = {0, 12, 28};
+    c.local_window_size = 768;
+    c.is_causal = true;
+    c.discriminating_attention = true;
+    c.attention_metadata = {16, 1024, 896};
 
-  testing::internal::CaptureStdout();
-  RunIoBindingCase(DefaultCudaExecutionProvider(), kCudaExecutionProvider, true, false, c);
-  const std::string debug_output = testing::internal::GetCapturedStdout();
+    testing::internal::CaptureStdout();
+    RunIoBindingCase(DefaultCudaExecutionProvider(), kCudaExecutionProvider, true, false, c);
+    const std::string debug_output = testing::internal::GetCapturedStdout();
 
-  EXPECT_NE(debug_output.find("SdpaKernel=FLASH_ATTENTION"), std::string::npos) << debug_output;
-  EXPECT_NE(debug_output.find("NumSplits=1"), std::string::npos) << debug_output;
+    EXPECT_NE(debug_output.find("SdpaKernel=FLASH_ATTENTION"), std::string::npos) << debug_output;
+    const std::string split_prefix = "NumSplits=";
+    const size_t split_pos = debug_output.find(split_prefix);
+    ASSERT_NE(split_pos, std::string::npos) << debug_output;
+    EXPECT_GT(std::stoi(debug_output.substr(split_pos + split_prefix.size())), 1) << debug_output;
+  }
+
+  // Queries wider than one kBlockM=64 tile keep NumSplits=1.
+  {
+    IoBindingCase c;
+    c.batch_size = 1;
+    c.token_count = 80;
+    c.num_heads = 2;
+    c.kv_num_heads = 1;
+    c.head_size = 128;
+    c.num_blocks = 9;
+    c.max_num_blocks_per_seq = 9;
+    c.past_seqlen = 960;
+    c.cumulative_seqlens_q = {0, 80};
+    c.attention_metadata = {80, 1040, 1040};
+
+    testing::internal::CaptureStdout();
+    RunIoBindingCase(DefaultCudaExecutionProvider(), kCudaExecutionProvider, true, false, c);
+    const std::string debug_output = testing::internal::GetCapturedStdout();
+
+    EXPECT_NE(debug_output.find("SdpaKernel=FLASH_ATTENTION"), std::string::npos) << debug_output;
+    EXPECT_NE(debug_output.find("NumSplits=1"), std::string::npos) << debug_output;
+  }
 #else
   GTEST_SKIP() << "Flash Attention is not enabled in this build.";
 #endif

@@ -902,19 +902,28 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
 #if USE_FLASH_ATTENTION
   const bool use_flash_split_kv =
       use_flash_attention &&
-      parameters.token_count == parameters.batch_size &&
-      max_query_len == 1 &&
-      !parameters.use_smooth_softmax &&
-      parameters.local_window_size <= 0;
+      max_query_len > 0 &&
+      max_query_len <= 64 &&
+      !parameters.use_smooth_softmax;
   if (use_flash_split_kv) {
     // The combine kernel costs more than it saves for short decode contexts, even when a high
-    // query-head count makes the occupancy heuristic select two splits. The upper bound sizes the
-    // workspaces, while the replay-wide lower bound proves splitting is worthwhile on every replay.
+    // query-head count makes the occupancy heuristic select two splits. The upper bound (clamped to
+    // the active sliding window when present) sizes the workspaces, while the replay-wide lower
+    // bound proves splitting is worthwhile on every replay. On Hopper (228 KB shared memory/SM),
+    // head_size <= 128 split-KV kernels co-schedule 2 CTAs per SM, so target 2x SMs at >=1k KV.
     if (max_kv_len_lower_bound > kFlashSplitKvMinSequenceLength) {
+      const int effective_max_kv =
+          parameters.local_window_size > 0
+              ? std::min(max_kv_len, parameters.local_window_size + max_query_len)
+              : max_kv_len;
+      const size_t target_cta_slots =
+          (device_prop.major == 9 && parameters.head_size <= 128 && max_kv_len_lower_bound >= 1024)
+              ? static_cast<size_t>(2 * device_prop.multiProcessorCount)
+              : static_cast<size_t>(device_prop.multiProcessorCount);
       const auto [num_splits, softmax_lse_accum_bytes, out_accum_bytes] =
           onnxruntime::flash::get_num_splits_and_buffer_sizes(
-              parameters.batch_size, 1, max_kv_len, parameters.num_heads,
-              parameters.head_size, device_prop.multiProcessorCount);
+              parameters.batch_size, max_query_len, effective_max_kv, parameters.num_heads,
+              parameters.head_size, target_cta_slots);
       flash_num_splits = static_cast<int>(num_splits);
       flash_softmax_lse_accum_buffer =
           GetScratchBuffer<void>(softmax_lse_accum_bytes, GetComputeStream(context));
