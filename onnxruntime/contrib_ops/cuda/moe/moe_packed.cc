@@ -4,11 +4,14 @@
 #include "contrib_ops/cuda/moe/moe_packed.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -22,6 +25,11 @@
 
 #if ORT_MOE_PACKED_CPU_X86_64
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+#include <cpuid.h>
+#endif
 #endif
 
 #include "contrib_ops/cpu/moe/qmoe_shared_layout.h"
@@ -37,6 +45,56 @@
 namespace onnxruntime {
 namespace contrib {
 namespace cuda {
+
+#if ORT_MOE_PACKED_CPU_X86_64
+namespace moe_packed_cpu {
+bool CpuHasAvx512Vnni() noexcept {
+  static const bool supported = []() noexcept -> bool {
+#if defined(_MSC_VER)
+    int info0[4]{};
+    __cpuid(info0, 0);
+    if (info0[0] < 7) return false;
+    int info1[4]{};
+    __cpuid(info1, 1);
+    constexpr int kReqLeaf1C = (1 << 12) | (1 << 27) | (1 << 28) | (1 << 29);  // FMA, OSXSAVE, AVX, F16C
+    if ((info1[2] & kReqLeaf1C) != kReqLeaf1C) return false;
+    const unsigned __int64 xcr0 = _xgetbv(0);
+    if ((xcr0 & 0xE6ULL) != 0xE6ULL) return false;
+    int info7[4]{};
+    __cpuidex(info7, 7, 0);
+    const uint32_t ebx7 = static_cast<uint32_t>(info7[1]);
+    const uint32_t ecx7 = static_cast<uint32_t>(info7[2]);
+    constexpr uint32_t kReqEbx7 =
+        (1u << 5) | (1u << 8) | (1u << 16) | (1u << 17) | (1u << 30) | (1u << 31);  // AVX2, BMI2, F, DQ, BW, VL
+    if ((ebx7 & kReqEbx7) != kReqEbx7) return false;
+    return (ecx7 & (1u << 11)) != 0u;  // AVX512VNNI
+#elif defined(__GNUC__) || defined(__clang__)
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return false;
+    constexpr unsigned int kReqLeaf1C = (1u << 12) | (1u << 27) | (1u << 28) | (1u << 29);
+    if ((ecx & kReqLeaf1C) != kReqLeaf1C) return false;
+    unsigned int xcr0_lo = 0, xcr0_hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    if ((xcr0_lo & 0xE6u) != 0xE6u) return false;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+    constexpr unsigned int kReqEbx7 =
+        (1u << 5) | (1u << 8) | (1u << 16) | (1u << 17) | (1u << 30) | (1u << 31);
+    if ((ebx & kReqEbx7) != kReqEbx7) return false;
+    return (ecx & (1u << 11)) != 0u;
+#else
+    return false;
+#endif
+  }();
+  if (!supported) return false;
+  static const int env_override = []() noexcept -> int {
+    const std::string raw = GetEnvironmentVar("ORT_MOE_PACKED_CPU_AVX512");
+    if (raw == "0" || raw == "false" || raw == "off") return 0;
+    return 1;
+  }();
+  return env_override != 0;
+}
+}  // namespace moe_packed_cpu
+#endif
 
 namespace {
 bool PackedTensorBytesFit(int64_t rows, int64_t columns, size_t element_bytes) {
@@ -118,6 +176,119 @@ bool UseAvx2CpuKernels() {
   static const bool use_avx2 = qmoe_shared::CpuHasAvx2FmaF16c();
   return use_avx2;
 }
+
+bool UseAvx512VnniCpuKernels() {
+  return moe_packed_cpu::CpuHasAvx512Vnni();
+}
+#endif
+
+#if defined(_WIN32)
+inline int MoEPackedPrefillMemPriority() noexcept {
+  static const int prio = []() noexcept -> int {
+    int v = 1;
+    const std::string raw = GetEnvironmentVar("ORT_QMOE_WIN_PREFILL_MEMPRIO");
+    if (!raw.empty()) {
+      static_cast<void>(TryParseStringWithClassicLocale(raw, v));
+    }
+    return (v >= 1 && v <= 5) ? v : 0;
+  }();
+  return prio;
+}
+
+class ScopedMoEPackedPrefillMemPriority final {
+ public:
+  ScopedMoEPackedPrefillMemPriority() noexcept {
+    const int prio = MoEPackedPrefillMemPriority();
+    if (prio == 0) return;
+    if (GetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &orig_, sizeof(orig_)) == FALSE) return;
+    MEMORY_PRIORITY_INFORMATION low{};
+    low.MemoryPriority = static_cast<ULONG>(prio);
+    active_ = SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &low, sizeof(low)) != FALSE;
+  }
+  ~ScopedMoEPackedPrefillMemPriority() {
+    if (active_) {
+      static_cast<void>(SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &orig_, sizeof(orig_)));
+    }
+  }
+  ScopedMoEPackedPrefillMemPriority(const ScopedMoEPackedPrefillMemPriority&) = delete;
+  ScopedMoEPackedPrefillMemPriority& operator=(const ScopedMoEPackedPrefillMemPriority&) = delete;
+
+ private:
+  MEMORY_PRIORITY_INFORMATION orig_{};
+  bool active_{false};
+};
+
+class MoEPackedMappedPrefetchService final {
+ public:
+  static MoEPackedMappedPrefetchService& Instance() {
+    static MoEPackedMappedPrefetchService svc;
+    return svc;
+  }
+
+  void Post(std::vector<WIN32_MEMORY_RANGE_ENTRY>&& ranges, int memory_priority) {
+    if (ranges.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!worker_.joinable()) {
+      stop_ = false;
+      worker_ = std::thread([this]() { Loop(); });
+    }
+    constexpr size_t kMaxQueued = 4;
+    if (queue_.size() >= kMaxQueued) {
+      queue_.pop_front();
+    }
+    queue_.push_back(Request{std::move(ranges), memory_priority});
+    cv_.notify_one();
+  }
+
+  void Shutdown() noexcept {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!worker_.joinable()) return;
+      stop_ = true;
+      cv_.notify_one();
+    }
+    worker_.join();
+    std::lock_guard<std::mutex> lk(mu_);
+    queue_.clear();
+    stop_ = false;
+  }
+
+ private:
+  struct Request {
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    int memory_priority{0};
+  };
+
+  void Loop() {
+    qmoe::NameCurrentThread("moepacked-pf");
+    int cur_prio = -1;
+    for (;;) {
+      Request req;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this]() { return stop_ || !queue_.empty(); });
+        if (stop_) return;
+        req = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      const int target_prio = req.memory_priority > 0 ? req.memory_priority : MEMORY_PRIORITY_NORMAL;
+      if (target_prio != cur_prio) {
+        MEMORY_PRIORITY_INFORMATION info{};
+        info.MemoryPriority = static_cast<ULONG>(target_prio);
+        static_cast<void>(SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &info, sizeof(info)));
+        cur_prio = target_prio;
+      }
+      static_cast<void>(PrefetchVirtualMemory(
+          GetCurrentProcess(), static_cast<ULONG_PTR>(req.ranges.size()), req.ranges.data(), 0));
+    }
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<Request> queue_;
+  std::thread worker_;
+  bool stop_{false};
+};
 #endif
 
 // Dot product of one GGUF quantized row against R activation vectors x_rows[0..R-1].
@@ -214,7 +385,8 @@ class MoEPackedParallelPool {
       return static_cast<int>(policy_threads);
     }
     const unsigned int hw = std::thread::hardware_concurrency();
-    const int def_t = static_cast<int>(std::clamp<unsigned int>(hw > 0 ? (hw * 3) / 4 : 16, 4u, 40u));
+    const unsigned int auto_t = (hw >= 20u && hw <= 32u) ? (hw - 4u) : (hw > 0 ? (hw * 3) / 4 : 16u);
+    const int def_t = static_cast<int>(std::clamp<unsigned int>(auto_t, 4u, 40u));
     const std::string env_s = GetEnvironmentVar("ORT_QMOE_SHARED_CPU_THREADS");
     int t = def_t;
     if (!env_s.empty()) {
@@ -772,9 +944,40 @@ struct MoEPackedOffloadState {
 
   ~MoEPackedOffloadState();
   void RunColdDecodeStep();
+
+  bool IsDirectFileMapped() const noexcept {
+    const auto& gb = source_desc.banks[static_cast<size_t>(onnxruntime::moe_offload::ExpertBankKind::kFc1Weights)];
+    const auto& ub = source_desc.banks[static_cast<size_t>(onnxruntime::moe_offload::ExpertBankKind::kFc1Scales)];
+    const auto& db = source_desc.banks[static_cast<size_t>(onnxruntime::moe_offload::ExpertBankKind::kFc2Weights)];
+    return gb.has_value() && gb->is_file_mapped &&
+           ub.has_value() && ub->is_file_mapped &&
+           db.has_value() && db->is_file_mapped &&
+           host_gate_w != nullptr && host_up_w != nullptr && host_down_w != nullptr;
+  }
+
+  void PostMappedNonResidentPrefetch() const {
+#if defined(_WIN32)
+    if (!IsDirectFileMapped()) return;
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    ranges.reserve(static_cast<size_t>(num_experts) * 3);
+    for (int e = 0; e < num_experts; ++e) {
+      if (static_cast<size_t>(e) < host_expert_to_slot.size() &&
+          host_expert_to_slot[static_cast<size_t>(e)] >= 0) {
+        continue;
+      }
+      ranges.push_back({const_cast<uint8_t*>(host_gate_w + static_cast<size_t>(e) * gate_exp_bytes), gate_exp_bytes});
+      ranges.push_back({const_cast<uint8_t*>(host_up_w + static_cast<size_t>(e) * up_exp_bytes), up_exp_bytes});
+      ranges.push_back({const_cast<uint8_t*>(host_down_w + static_cast<size_t>(e) * down_exp_bytes), down_exp_bytes});
+    }
+    MoEPackedMappedPrefetchService::Instance().Post(std::move(ranges), MoEPackedPrefillMemPriority());
+#endif
+  }
 };
 
 namespace {
+
+std::mutex g_moepacked_mapped_layers_mu;
+std::map<std::pair<const void*, int32_t>, const MoEPackedOffloadState*> g_moepacked_mapped_layers;
 
 class MoEPackedDoorbellService {
  public:
@@ -823,6 +1026,9 @@ class MoEPackedDoorbellService {
       to_join.join();
     }
     if (release_shared) {
+#if defined(_WIN32)
+      MoEPackedMappedPrefetchService::Instance().Shutdown();
+#endif
       MoEPackedSharedPrefillWaveStaging::ReleaseAllDevices();
       MoEPackedParallelPool::Instance().Shutdown();
     }
@@ -845,6 +1051,9 @@ class MoEPackedDoorbellService {
       if (to_join.joinable()) {
         to_join.join();
       }
+#if defined(_WIN32)
+      MoEPackedMappedPrefetchService::Instance().Shutdown();
+#endif
       MoEPackedSharedPrefillWaveStaging::ReleaseAllDevices();
       MoEPackedParallelPool::Instance().Shutdown();
     } catch (...) {
@@ -962,6 +1171,12 @@ void ShutdownMoEPackedBackgroundServices() noexcept {
 }
 
 MoEPackedOffloadState::~MoEPackedOffloadState() {
+  {
+    std::lock_guard<std::mutex> lk(g_moepacked_mapped_layers_mu);
+    for (auto it = g_moepacked_mapped_layers.begin(); it != g_moepacked_mapped_layers.end();) {
+      it = (it->second == this) ? g_moepacked_mapped_layers.erase(it) : std::next(it);
+    }
+  }
   MoEPackedDoorbellService::Instance().Unregister(this);
   const std::string res_env = GetEnvironmentVar("ORT_QMOE_SHARED_RESIDENT_LOG");
   const std::string cpu_env = GetEnvironmentVar("ORT_QMOE_SHARED_CPU_TIMING");
@@ -1090,6 +1305,35 @@ void MoEPackedOffloadState::RunColdDecodeStep() {
     }
   }
 
+#if defined(_WIN32)
+  if (IsDirectFileMapped()) {
+    static const int decode_prefetch_mode = []() noexcept -> int {
+      int v = 2;
+      const std::string raw = GetEnvironmentVar("ORT_QMOE_WIN_DECODE_PREFETCH");
+      if (!raw.empty()) {
+        static_cast<void>(TryParseStringWithClassicLocale(raw, v));
+      }
+      return v;
+    }();
+    if (decode_prefetch_mode == 1 || decode_prefetch_mode == 2) {
+      std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+      ranges.reserve(static_cast<size_t>(num_groups) * 3);
+      for (int g = 0; g < num_groups; ++g) {
+        const size_t exp = static_cast<size_t>(groups[g].expert);
+        ranges.push_back({const_cast<uint8_t*>(host_gate_w + exp * gate_exp_bytes), gate_exp_bytes});
+        ranges.push_back({const_cast<uint8_t*>(host_up_w + exp * up_exp_bytes), up_exp_bytes});
+        ranges.push_back({const_cast<uint8_t*>(host_down_w + exp * down_exp_bytes), down_exp_bytes});
+      }
+      if (decode_prefetch_mode == 2) {
+        MoEPackedMappedPrefetchService::Instance().Post(std::move(ranges), 0);
+      } else {
+        static_cast<void>(PrefetchVirtualMemory(
+            GetCurrentProcess(), static_cast<ULONG_PTR>(ranges.size()), ranges.data(), 0));
+      }
+    }
+  }
+#endif
+
   const int env_q8_mode = ParseOptionalQ8Mode(GetEnvironmentVar("ORT_MOE_PACKED_CPU_Q8_DOT"));
   const int eff_q8_mode = (cpu_q8_dot_mode >= 0) ? cpu_q8_dot_mode : env_q8_mode;
   const bool all_quantized_weights =
@@ -1104,16 +1348,36 @@ void MoEPackedOffloadState::RunColdDecodeStep() {
       all_quantized_weights &&
       ((hidden_size % 32) == 0) && ((inter_size % 32) == 0);
 
+#if ORT_MOE_PACKED_CPU_X86_64
+  const bool use_avx2 = UseAvx2CpuKernels();
+  const bool use_avx512_vnni = use_avx2 && UseAvx512VnniCpuKernels();
+#endif
+
   const int q8_blocks_per_hidden = hidden_size / 32;
   const int q8_blocks_per_inter = inter_size / 32;
   if (use_q8_dot && x_q8_buf.size() < static_cast<size_t>(nrows * q8_blocks_per_hidden)) {
     x_q8_buf.resize(static_cast<size_t>(kMoEPackedMaxDecodeRows * (kMoEPackedMaxHiddenSize / 32)));
   }
 
-  // 2. Convert input rows from BF16/FP16 to FP32 using pre-allocated x_f32_buf
+  // 2. Convert input rows from BF16/FP16 to FP32 (and Q8 when enabled)
   for (int r = 0; r < nrows; ++r) {
     const uint16_t* src = h_decode_pinned->host_input + static_cast<size_t>(r) * hidden_size;
     float* dst = x_f32_buf.data() + static_cast<size_t>(r) * kMoEPackedMaxHiddenSize;
+#if ORT_MOE_PACKED_CPU_X86_64
+    if (use_avx512_vnni) {
+      moe_packed_cpu::ConvertAndQuantizeRowQ8Avx512(
+          src, is_bf16, use_q8_dot ? nullptr : dst, hidden_size,
+          use_q8_dot ? (x_q8_buf.data() + static_cast<size_t>(r) * q8_blocks_per_hidden) : nullptr);
+      continue;
+    }
+    if (use_avx2) {
+      moe_packed_cpu::ConvertHalfRowAvx2(src, is_bf16, dst, hidden_size);
+      if (use_q8_dot) {
+        moe_packed_cpu::QuantizeRowQ8Avx2(dst, hidden_size, x_q8_buf.data() + static_cast<size_t>(r) * q8_blocks_per_hidden);
+      }
+      continue;
+    }
+#endif
     if (is_bf16) {
       for (int c = 0; c < hidden_size; ++c) {
         dst[c] = gguf_quant::Bf16BitsToFloatCpu(src[c]);
@@ -1160,6 +1424,62 @@ void MoEPackedOffloadState::RunColdDecodeStep() {
       for (int r = 0; r < R; ++r) {
         x_q8_ptrs[r] = x_q8_buf.data() + static_cast<size_t>(groups[g].token_rows[r]) * q8_blocks_per_hidden;
       }
+#if ORT_MOE_PACKED_CPU_X86_64
+      if (gate_type == up_type && (ch_end - ch_start) == 32 &&
+          (use_avx512_vnni || use_avx2)) {
+        gguf_quant::GgufQ8Block* group_inter_q8 =
+            inter_q8_buf.data() + static_cast<size_t>(group_route_base[g]) * q8_blocks_per_inter;
+        if (use_avx512_vnni) {
+          const size_t row_idx0 = static_cast<size_t>(exp) * inter_size + ch_start;
+          if (moe_packed_cpu::GgufFc1Tile32SwiGLUQ8Avx512Vnni(
+                  gate_type,
+                  host_gate_w + row_idx0 * gate_row_bytes, gate_row_bytes,
+                  host_up_w + row_idx0 * up_row_bytes, up_row_bytes,
+                  x_q8_ptrs, R, hidden_size, is_bf16,
+                  group_inter_q8 + tile_idx, static_cast<size_t>(q8_blocks_per_inter))) {
+            return;
+          }
+        }
+        alignas(32) float g_tile[kMoEPackedMaxDecodeRows][32];
+        alignas(32) float u_tile[kMoEPackedMaxDecodeRows][32];
+        bool handled = true;
+        for (int j_rel = 0; j_rel < 32; j_rel += 2) {
+          const size_t row_idx0 = static_cast<size_t>(exp) * inter_size + ch_start + j_rel;
+          const uint8_t* g_row0 = host_gate_w + row_idx0 * gate_row_bytes;
+          const uint8_t* u_row0 = host_up_w + row_idx0 * up_row_bytes;
+          const uint8_t* g_row1 = g_row0 + gate_row_bytes;
+          const uint8_t* u_row1 = u_row0 + up_row_bytes;
+          float gd0[kMoEPackedMaxDecodeRows], ud0[kMoEPackedMaxDecodeRows];
+          float gd1[kMoEPackedMaxDecodeRows], ud1[kMoEPackedMaxDecodeRows];
+          const bool ok = moe_packed_cpu::GgufDualDot2ChQ8Avx2(
+              gate_type, g_row0, g_row1, u_row0, u_row1, x_q8_ptrs, R, hidden_size,
+              gd0, ud0, gd1, ud1);
+          if (!ok) {
+            handled = false;
+            break;
+          }
+          for (int r = 0; r < R; ++r) {
+            g_tile[r][j_rel + 0] = gd0[r];
+            g_tile[r][j_rel + 1] = gd1[r];
+            u_tile[r][j_rel + 0] = ud0[r];
+            u_tile[r][j_rel + 1] = ud1[r];
+          }
+        }
+        if (handled) {
+          for (int r = 0; r < R; ++r) {
+            float* inter_r = group_inter + static_cast<size_t>(r) * inter_size + ch_start;
+            for (int k_ch = 0; k_ch < 32; ++k_ch) {
+              const float gv = RoundToActivationType(g_tile[r][k_ch], is_bf16);
+              const float uv = RoundToActivationType(u_tile[r][k_ch], is_bf16);
+              inter_r[k_ch] = RoundToActivationType(uv * (gv / (1.0f + std::exp(-gv))), is_bf16);
+            }
+            moe_packed_cpu::QuantizeRowQ8Avx2(
+                inter_r, 32, group_inter_q8 + static_cast<size_t>(r) * q8_blocks_per_inter + tile_idx);
+          }
+          return;
+        }
+      }
+#endif
       int j = ch_start;
       for (; j + 2 <= ch_end; j += 2) {
         const size_t row_idx0 = static_cast<size_t>(exp) * inter_size + j;
@@ -1270,12 +1590,9 @@ void MoEPackedOffloadState::RunColdDecodeStep() {
   });
   const auto t_fc1 = std::chrono::steady_clock::now();
 
-  // 4. Pass 2: Parallel FC2 partitioned by 64-column output slices across all cold groups (lock-free, L1-resident inter_buf)
-  constexpr int kFc2TileCols = 64;
+  // 4. Pass 2: Parallel FC2 partitioned by 32-column output slices across all cold groups (lock-free, L1-resident inter_buf)
+  constexpr int kFc2TileCols = 32;
   const int total_fc2_tasks = (hidden_size + kFc2TileCols - 1) / kFc2TileCols;
-#if ORT_MOE_PACKED_CPU_X86_64
-  const bool use_avx2 = UseAvx2CpuKernels();
-#endif
   MoEPackedParallelPool::Instance().ParallelFor(cpu_threads, total_fc2_tasks, [&](int task_idx) {
     const int col_start = task_idx * kFc2TileCols;
     const int col_end = std::min(hidden_size, col_start + kFc2TileCols);
@@ -1294,6 +1611,25 @@ void MoEPackedOffloadState::RunColdDecodeStep() {
         const gguf_quant::GgufQ8Block* group_inter_q8 =
             inter_q8_buf.data() + static_cast<size_t>(group_route_base[g]) * q8_blocks_per_inter;
         int c = 0;
+#if ORT_MOE_PACKED_CPU_X86_64
+        if (use_avx512_vnni || use_avx2) {
+          const uint8_t* dr0 = host_down_w + (static_cast<size_t>(exp) * hidden_size + col_start) * down_row_bytes;
+          c = use_avx512_vnni
+                  ? moe_packed_cpu::GgufDotRowsBy4Q8Avx512Vnni(
+                        down_type, dr0, down_row_bytes, col_cnt, group_inter_q8,
+                        static_cast<size_t>(q8_blocks_per_inter), R, inter_size, &avx2_dots[0][0], kFc2TileCols)
+                  : moe_packed_cpu::GgufDotRowsBy4Q8Avx2(
+                        down_type, dr0, down_row_bytes, col_cnt, group_inter_q8,
+                        static_cast<size_t>(q8_blocks_per_inter), R, inter_size, &avx2_dots[0][0], kFc2TileCols);
+          for (int r = 0; r < R; ++r) {
+            const int trow = groups[g].token_rows[r];
+            const float sc = groups[g].scales[r];
+            for (int j = 0; j < c; ++j) {
+              acc_out[trow][j] += sc * RoundToActivationType(avx2_dots[r][j], is_bf16);
+            }
+          }
+        }
+#endif
         for (; c + 4 <= col_cnt; c += 4) {
           const size_t base_idx = static_cast<size_t>(exp) * hidden_size + col_start + c;
           const uint8_t* r0 = host_down_w + (base_idx + 0) * down_row_bytes;
@@ -2231,19 +2567,33 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
       }
       ORT_RETURN_IF_ERROR(CUDA_CALL(cudaStreamSynchronize(stream)));
 
-      // 2b. Bucket routes by expert on CPU
-      std::vector<std::vector<int>> exp_routes(static_cast<size_t>(num_experts));
+      // 2b. Bucket routes by expert on CPU via flat counting sort (zero per-expert heap allocations)
+      std::array<int, 513> exp_counts{};
       bool any_pruned = false;
       for (int r = 0; r < total_routes; ++r) {
         const int e = h_topk_idx[r];
         if (min_expert_weight > 0.0f && (r % static_cast<int>(k_)) > 0 &&
             h_topk_scales[r] < min_expert_weight) {
           h_topk_scales[r] = 0.0f;
+          h_topk_idx[r] = -1;
           any_pruned = true;
           continue;
         }
         if (e >= 0 && e < num_experts) {
-          exp_routes[static_cast<size_t>(e)].push_back(r);
+          ++exp_counts[static_cast<size_t>(e)];
+        }
+      }
+      std::array<int, 513> exp_offsets{};
+      for (int e = 0; e < num_experts; ++e) {
+        exp_offsets[static_cast<size_t>(e + 1)] =
+            exp_offsets[static_cast<size_t>(e)] + exp_counts[static_cast<size_t>(e)];
+      }
+      std::array<int, 513> exp_write = exp_offsets;
+      std::vector<int> flat_routes(static_cast<size_t>(exp_offsets[static_cast<size_t>(num_experts)]));
+      for (int r = 0; r < total_routes; ++r) {
+        const int e = h_topk_idx[r];
+        if (e >= 0 && e < num_experts) {
+          flat_routes[static_cast<size_t>(exp_write[static_cast<size_t>(e)]++)] = r;
         }
       }
 
@@ -2253,25 +2603,24 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
         for (int e = 0; e < num_experts; ++e) {
           st.expert_ema[static_cast<size_t>(e)] =
               0.85f * st.expert_ema[static_cast<size_t>(e)] +
-              static_cast<float>(exp_routes[static_cast<size_t>(e)].size());
+              static_cast<float>(exp_counts[static_cast<size_t>(e)]);
         }
       }
 
-      // 2c. Build & launch GPU-resident expert tiles first
+      // 2c. Build & launch GPU-resident expert tiles first so GPU starts working immediately
       int res_route_cnt = 0;
       int res_tile_cnt = 0;
       std::vector<int> cold_experts;
       cold_experts.reserve(static_cast<size_t>(num_experts));
       for (int e = 0; e < num_experts; ++e) {
-        const auto& rvec = exp_routes[static_cast<size_t>(e)];
-        if (rvec.empty()) continue;
+        const int c = exp_counts[static_cast<size_t>(e)];
+        if (c <= 0) continue;
         const int slot = st.host_expert_to_slot[static_cast<size_t>(e)];
         if (slot >= 0 && slot < st.resident_slots) {
           const int start_r = res_route_cnt;
-          for (int r : rvec) {
-            h_res_sorted_routes[res_route_cnt++] = r;
-          }
-          const int c = static_cast<int>(rvec.size());
+          const int* rptr = flat_routes.data() + exp_offsets[static_cast<size_t>(e)];
+          std::memcpy(h_res_sorted_routes + res_route_cnt, rptr, static_cast<size_t>(c) * sizeof(int));
+          res_route_cnt += c;
           const int n_t = (c + tile_cap - 1) / tile_cap;
           for (int t = 0; t < n_t; ++t) {
             MoEPackedTile tile{};
@@ -2291,22 +2640,6 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
         std::sort(cold_experts.begin(), cold_experts.end(), [&](int a, int b) {
           return st.expert_ema[static_cast<size_t>(a)] > st.expert_ema[static_cast<size_t>(b)];
         });
-#if defined(_WIN32)
-        if (r0 == 0 && !cold_experts.empty()) {
-          MEMORYSTATUSEX mem_stat{};
-          mem_stat.dwLength = sizeof(mem_stat);
-          if (GlobalMemoryStatusEx(&mem_stat) && mem_stat.ullAvailPhys >= (2ULL << 30)) {
-            std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
-            ranges.reserve(cold_experts.size() * 3);
-            for (int ce : cold_experts) {
-              ranges.push_back({const_cast<uint8_t*>(st.host_gate_w + static_cast<size_t>(ce) * st.gate_exp_bytes), st.gate_exp_bytes});
-              ranges.push_back({const_cast<uint8_t*>(st.host_up_w + static_cast<size_t>(ce) * st.up_exp_bytes), st.up_exp_bytes});
-              ranges.push_back({const_cast<uint8_t*>(st.host_down_w + static_cast<size_t>(ce) * st.down_exp_bytes), st.down_exp_bytes});
-            }
-            static_cast<void>(PrefetchVirtualMemory(GetCurrentProcess(), ranges.size(), ranges.data(), 0));
-          }
-        }
-#endif
       }
 
       if (res_tile_cnt > 0) {
@@ -2325,13 +2658,38 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
             d_sorted_routes, d_tiles, d_num_tiles, res_tile_cnt, chunk_params, d_fc1_out, d_fc2_out));
       }
 
+#if defined(_WIN32)
+      static const int lookahead_min_rows = []() noexcept -> int {
+        int v = 1024;
+        const std::string raw = GetEnvironmentVar("ORT_QMOE_WIN_PREFILL_LOOKAHEAD_MIN_ROWS");
+        if (!raw.empty()) {
+          static_cast<void>(TryParseStringWithClassicLocale(raw, v));
+        }
+        return v;
+      }();
+      if (r0 == 0 && lookahead_min_rows > 0 && chunk_rows >= lookahead_min_rows && st.IsDirectFileMapped()) {
+        const void* scope = st.session_controller.get();
+        std::lock_guard<std::mutex> lk(g_moepacked_mapped_layers_mu);
+        g_moepacked_mapped_layers[{scope, st.layer_index}] = &st;
+        if (!in_warmup) {
+          const auto next_it = g_moepacked_mapped_layers.find({scope, st.layer_index + 1});
+          if (next_it != g_moepacked_mapped_layers.end() && next_it->second != nullptr) {
+            next_it->second->PostMappedNonResidentPrefetch();
+          }
+        }
+      }
+#endif
+
       // 2d. Double-buffered streaming waves for cold experts (CPU parallel staging + H2D copy_stream + GPU Tensor-Core compute)
       // During dummy-token Warmup(), run at most 1 wave to warm wave buffers and Tensor-Core kernels without faulting 40 GiB.
       const int num_cold = in_warmup ? std::min<int>(static_cast<int>(cold_experts.size()), wave_experts)
                                      : static_cast<int>(cold_experts.size());
       for (size_t i = static_cast<size_t>(num_cold); i < cold_experts.size(); ++i) {
-        for (int r : exp_routes[static_cast<size_t>(cold_experts[i])]) {
-          h_topk_scales[r] = 0.0f;
+        const int ce = cold_experts[i];
+        const int* rptr = flat_routes.data() + exp_offsets[static_cast<size_t>(ce)];
+        const int rc = exp_counts[static_cast<size_t>(ce)];
+        for (int ri = 0; ri < rc; ++ri) {
+          h_topk_scales[rptr[ri]] = 0.0f;
           any_pruned = true;
         }
       }
@@ -2340,7 +2698,18 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
             d_topk_scales, h_topk_scales, static_cast<size_t>(total_routes) * sizeof(float),
             cudaMemcpyHostToDevice, stream)));
       }
-      const int num_waves = (num_cold + wave_experts - 1) / wave_experts;
+      // Fast-start Wave 0 with at most 8 cold experts when multiple waves exist so PCIe DMA begins within ~1-2 ms
+      // while retaining the top-8 EMA promotion candidates in Wave 0.
+      std::vector<std::pair<int, int>> wave_spans;
+      if (num_cold > 0) {
+        const int first_cnt = (!in_warmup && num_cold > wave_experts) ? std::min(8, wave_experts)
+                                                                      : std::min(num_cold, wave_experts);
+        wave_spans.emplace_back(0, first_cnt);
+        for (int pos = first_cnt; pos < num_cold; pos += wave_experts) {
+          wave_spans.emplace_back(pos, std::min(wave_experts, num_cold - pos));
+        }
+      }
+      const int num_waves = static_cast<int>(wave_spans.size());
       if (num_waves > 0) {
         ORT_RETURN_IF_ERROR(
             wave_staging.EnsureBankCapacity(static_cast<size_t>(wave_experts) * st.slot_bytes, sess_pinned));
@@ -2352,8 +2721,8 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
 
       auto stage_and_enqueue_wave = [&](int w_idx) -> Status {
         const int b = w_idx & 1;
-        const int e_begin = w_idx * wave_experts;
-        const int w_cnt = std::min(wave_experts, num_cold - e_begin);
+        const int e_begin = wave_spans[static_cast<size_t>(w_idx)].first;
+        const int w_cnt = wave_spans[static_cast<size_t>(w_idx)].second;
         const size_t w_gate_bytes = static_cast<size_t>(w_cnt) * st.gate_exp_bytes;
         const size_t w_up_bytes = static_cast<size_t>(w_cnt) * st.up_exp_bytes;
         const size_t w_down_bytes = static_cast<size_t>(w_cnt) * st.down_exp_bytes;
@@ -2368,6 +2737,9 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
         uint8_t* p_down = p_up + w_up_bytes;
 
         MoEPackedParallelPool::Instance().ParallelFor(st.cpu_threads, w_cnt * 3, [&](int task_idx) {
+#if defined(_WIN32)
+          ScopedMoEPackedPrefillMemPriority low_mem_prio;
+#endif
           const int local_s = task_idx / 3;
           const int bank_id = task_idx - local_s * 3;
           const int exp = cold_experts[static_cast<size_t>(e_begin + local_s)];
@@ -2401,12 +2773,11 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
         int w_tile_cnt = 0;
         for (int local_s = 0; local_s < w_cnt; ++local_s) {
           const int exp = cold_experts[static_cast<size_t>(e_begin + local_s)];
-          const auto& rvec = exp_routes[static_cast<size_t>(exp)];
+          const int c = exp_counts[static_cast<size_t>(exp)];
+          const int* rptr = flat_routes.data() + exp_offsets[static_cast<size_t>(exp)];
           const int start_r = w_route_cnt;
-          for (int r : rvec) {
-            wave_staging.pinned_sorted_routes[b][w_route_cnt++] = r;
-          }
-          const int c = static_cast<int>(rvec.size());
+          std::memcpy(wave_staging.pinned_sorted_routes[b] + w_route_cnt, rptr, static_cast<size_t>(c) * sizeof(int));
+          w_route_cnt += c;
           const int n_t = (c + tile_cap - 1) / tile_cap;
           for (int t = 0; t < n_t; ++t) {
             MoEPackedTile tile{};
@@ -2447,15 +2818,15 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
       }
       for (int w_idx = 0; w_idx < num_waves; ++w_idx) {
         const int b = w_idx & 1;
-        const int e_begin = w_idx * wave_experts;
-        const int w_cnt = std::min(wave_experts, num_cold - e_begin);
+        const int e_begin = wave_spans[static_cast<size_t>(w_idx)].first;
+        const int w_cnt = wave_spans[static_cast<size_t>(w_idx)].second;
         const size_t w_gate_bytes = static_cast<size_t>(w_cnt) * st.gate_exp_bytes;
         const size_t w_up_bytes = static_cast<size_t>(w_cnt) * st.up_exp_bytes;
 
         int w_route_cnt = 0;
         for (int local_s = 0; local_s < w_cnt; ++local_s) {
           const int exp = cold_experts[static_cast<size_t>(e_begin + local_s)];
-          w_route_cnt += static_cast<int>(exp_routes[static_cast<size_t>(exp)].size());
+          w_route_cnt += exp_counts[static_cast<size_t>(exp)];
         }
         const int w_tile_cnt = *wave_staging.pinned_num_tiles[b];
         if (!in_warmup) {
@@ -2473,19 +2844,18 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
             w_tile_cnt, chunk_params, d_fc1_out, d_fc2_out));
 
         // Adaptive D2D promotion of hottest cold experts already in gpu_bank[b] into coldest unpinned resident slots
-        if (!in_warmup && st.is_adaptive && st.resident_slots > 32 && w_idx == 0) {
-          const int min_evict_slot = std::max(16, st.resident_slots - 32);
+        if (!in_warmup && st.is_adaptive && st.resident_slots > 8 && w_idx == 0) {
+          const int min_evict_slot = std::max(4, st.resident_slots - std::min(32, st.resident_slots / 2));
           int promoted_in_wave = 0;
           for (int local_s = 0; local_s < w_cnt && promoted_in_wave < 8; ++local_s) {
             const int exp = cold_experts[static_cast<size_t>(e_begin + local_s)];
             const float cand_score = st.expert_ema[static_cast<size_t>(exp)];
             if (cand_score < 2.0f) continue;
             int best_victim_slot = -1;
-            float lowest_score = cand_score - 0.5f;
+            float lowest_score = cand_score * 0.67f - 1.0f;
             for (int vs = min_evict_slot; vs < st.resident_slots; ++vs) {
               const int v_exp = st.slot_to_expert[static_cast<size_t>(vs)];
-              if (v_exp >= 0 && exp_routes[static_cast<size_t>(v_exp)].empty() &&
-                  st.expert_ema[static_cast<size_t>(v_exp)] < lowest_score) {
+              if (v_exp >= 0 && st.expert_ema[static_cast<size_t>(v_exp)] < lowest_score) {
                 lowest_score = st.expert_ema[static_cast<size_t>(v_exp)];
                 best_victim_slot = vs;
               }

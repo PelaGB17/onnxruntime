@@ -31,9 +31,10 @@ A **single canonical `com.microsoft::QMoE` model package** runs unchanged across
 
 - **Full-HBM GPUs** (e.g., 80 GiB–141 GiB H100/H200): `session.moe.offload.mode="auto"` admits all
   $E$ experts per layer into GPU HBM during session initialization with zero runtime offload overhead.
-- **VRAM-Constrained GPUs with Ample Host RAM** (e.g., 24 GiB / 32 GiB GPU + 64 GiB–128 GiB RAM):
+- **VRAM-Constrained GPUs with Ample Host RAM** (e.g., 16 GiB / 24 GiB / 32 GiB GPU + 64 GiB–128 GiB RAM):
   caches the hottest $C_l < E$ experts per layer in GPU HBM, executes cold routed experts on the
-  CPU via shared-layout AVX-512 / AVX2 microkernels overlapped with GPU resident GEMVs inside a
+  CPU via shared-layout AVX-512 / AVX2 microkernels (or 256-bit EVEX `AVX-512 VNNI` / `AVX2` `Q8` INT8
+  kernels for `com.microsoft::MoEPacked` GGUF models) overlapped with GPU resident GEMVs inside a
   single captured CUDA Graph, and promotes newly hot experts asynchronously in the background.
 - **VRAM- and Host-RAM-Constrained Systems** (e.g., 24 GiB / 30 GiB GPU + 40 GB–48 GB RAM): bounds
   host RAM usage via `FileExpertStore` (`session.moe.offload.host_expert_bytes`), maintaining
@@ -345,16 +346,48 @@ consumes another session's signals, and the library never calls `setenv` while o
 
 Cold-expert CPU execution uses process-wide background threads that are started on demand by the first QMoE
 offload run and shared by every session in the process: the doorbell service (`qmoe-doorbell`), the shared CPU spin
-pools (`qmoe-spin`, see `session.moe.offload.cpu_threads`), and, only while `ORT_QMOE_CROSS_LAYER_PROMO=1`, the
-promotion worker (`qmoe-promo`). The threads are named, so they can be told apart in a debugger or in
-`/proc/<pid>/task/*/comm`.
+pools (`qmoe-spin`, see `session.moe.offload.cpu_threads`), the Windows file-mapped expert prefetch helpers
+(`MappedPrefetchService` for `QMoEOffload` and `MoEPackedMappedPrefetchService` for `MoEPacked`), and, only while
+`ORT_QMOE_CROSS_LAYER_PROMO=1`, the promotion worker (`qmoe-promo`). The threads are named, so they can be told
+apart in a debugger or in `/proc/<pid>/task/*/comm`.
 
 Joining a thread from a static destructor while `FreeLibrary` holds the Windows loader lock deadlocks, so the
 provider does not rely on static destruction. `CUDA_Provider::Shutdown()` (bundled EP) and `~CudaEpFactory()`
 (plugin EP) call `ShutdownQMoEBackgroundServices()` before the library can be unloaded. The call is idempotent,
-stops the doorbell service first and the spin pools after it, and does nothing while any QMoE offload backend is
-still alive (each backend holds a live-backend lease). The services start again on demand if a QMoE kernel is
-created afterwards. The bounded `FileExpertStore` read workers are owned per kernel and stop with the kernel.
+stops the mapped-prefetch and doorbell services first and the spin pools after them, and does nothing while any QMoE
+or `MoEPacked` offload backend is still alive (each backend holds a live-backend lease). The services start again on
+demand if a QMoE or `MoEPacked` kernel is created afterwards. The bounded `FileExpertStore` read workers are owned
+per kernel and stop with the kernel.
+
+### 5.6 Windows File-Mapped Expert Prefetch, 16 GiB WDDM Admission & `MoEPacked` `Q8` Offload
+
+On Windows WDDM workstations (including 16 GiB consumer GPUs and hosts whose physical RAM is smaller than the full
+model package):
+
+- **Bounded Host Cache Fallback on Low-RAM Windows Hosts**: When a bounded `host_expert_bytes` cache exceeds 50% of
+  physical RAM on Windows, `PlanAndAdmitSession` automatically replaces the pinned bounded host cache with the
+  direct read-only file mapping (`ORT_QMOE_FORCE_BOUNDED_HOST_CACHE=1` retains the bounded cache), avoiding
+  `cudaHostRegister` exhaustion of later pinned allocations.
+- **16 GiB WDDM Post-Session Reserve Calibration (`total_vram < 20 GiB`)**: Because `OnSessionInitializationEnd`
+  queries free VRAM after non-MoE target initializers and shared weight pools are already resident on the device,
+  `PlanAndAdmitSession` credits the already-allocated non-MoE footprint from `reserve_device_bytes` on `< 20 GiB`
+  GPUs (`ORT_QMOE_STRICT_DEVICE_EXPERT_BYTES=1` disables dynamic clamping).
+- **Asynchronous Low-Priority Prefill Look-Ahead & Decode Prefetch**:
+  - `ORT_QMOE_WIN_PREFILL_MEMPRIO` (default `1` = `MEMORY_PRIORITY_VERY_LOW`, `0` = unchanged): faults streamed
+    prefill pages at very low memory priority so Windows repurposes one-pass prefill pages before cold experts
+    reused by decode.
+  - `ORT_QMOE_WIN_PREFILL_LOOKAHEAD_MIN_ROWS` (default `1024`, `0` = off): queues coalesced `PrefetchVirtualMemory`
+    for layer `L+1`'s non-resident experts on the background prefetch worker while layer `L` prefills; once a
+    layer's mapped pages have been prefetched and available physical RAM remains `>= 4 GiB`, repeat per-chunk
+    page-table walks are skipped. Synchronous main-thread prefill `PrefetchVirtualMemory` defaults to off
+    (`ORT_QMOE_WIN_PREFETCH_MMAP=0`), and Wave 0 uses an 8-expert fast start so PCIe H2D begins immediately.
+  - `ORT_QMOE_WIN_DECODE_PREFETCH` (`0` = off, `1` = synchronous, `2` = asynchronous background helper, default
+    `2`): batches cold-expert reads ahead of compute when cold pages are not yet resident (`ullAvailPhys < 4 GiB`
+    or prior to full-layer mapped prefetch).
+- **`com.microsoft::MoEPacked` GGUF Cold-Expert `Q8` Kernels (`ep.cuda.moe_packed_cpu_q8_dot="1"`)**:
+  Dispatches at runtime to 256-bit EVEX `AVX-512BW/VL/VNNI` (`vpdpbusd`) kernels (`moe_packed_cpu_avx512.cc`,
+  `ORT_MOE_PACKED_CPU_AVX512=0` disables) or MSVC/GCC/Clang-compatible `AVX2` `Q8` INT8 kernels
+  (`moe_packed_cpu_avx2.cc`) across `IQ3_XXS`, `IQ2_S`, `IQ2_XXS`, `IQ2_XS`, `IQ4_XS`, `IQ4_NL`, and `Q2_0`.
 
 ### 5.5 Cross-Layer Promotion Look-Ahead (Experimental, `ORT_QMOE_CROSS_LAYER_PROMO=1`)
 

@@ -1284,15 +1284,23 @@ class QMoESessionController {
         const bool strict_budget = (strict_len > 0 && strict_buf[0] == '1');
         if (!strict_budget) {
           const bool is_moe_packed = !nodes.empty() && nodes[0]->GetSourceDescriptor().op_type == "MoEPacked";
+          uint64_t effective_reserve = policy.reserve_device_bytes;
           uint64_t extra_wddm_reserve =
               (total_vram >= (28ULL << 30)) ? (is_moe_packed ? (512ULL << 20) : (1792ULL << 20)) : (1536ULL << 20);
           if (total_vram < (20ULL << 30)) {
-            extra_wddm_reserve = is_moe_packed ? (256ULL << 20) : (512ULL << 20);
+            // On 16 GB GPUs (e.g. RTX 5060 Ti), platform_free_vram is queried at OnSessionInitializationEnd after
+            // target non-MoE weights and shared weight pools are already allocated in VRAM, so credit the already-
+            // allocated non-MoE footprint from policy.reserve_device_bytes while leaving >=500 MiB WDDM headroom.
+            const uint64_t deducted_non_moe = is_moe_packed ? (2816ULL << 20) : (1984ULL << 20);
+            if (effective_reserve > deducted_non_moe) {
+              effective_reserve -= deducted_non_moe;
+            }
+            extra_wddm_reserve = 0ULL;
           } else if (total_vram < (28ULL << 30) && (policy.reserve_device_bytes <= (5700ULL << 20) || is_moe_packed)) {
             extra_wddm_reserve = 256ULL << 20;
           }
           const uint64_t post_session_reserve =
-              policy.reserve_device_bytes + policy.device_working_bytes + extra_wddm_reserve;
+              effective_reserve + policy.device_working_bytes + extra_wddm_reserve;
           const uint64_t acct_internal_reserve = policy.device_working_bytes + (640ULL << 20);
           const uint64_t acct_cap =
               (usable_free_vram > acct_internal_reserve)

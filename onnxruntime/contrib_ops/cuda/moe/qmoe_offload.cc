@@ -2766,20 +2766,37 @@ bool QMoEOffload::IsDirectMappedIntBank() const noexcept {
 bool QMoEOffload::PostMappedNonResidentPrefetch() const {
 #if defined(_WIN32)
   if (!IsDirectMappedIntBank()) return false;
+  if (mapped_prefetched_once_.load(std::memory_order_relaxed)) {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys >= (4ULL << 30)) {
+      return false;
+    }
+  }
   const uint8_t* bank_base[4] = {static_cast<const uint8_t*>(nvfp4_fc1_w_->DataRaw()),
                                  static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw()),
                                  static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw()),
                                  static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw())};
   MappedPrefetchRanges ranges;
-  ranges.reserve(static_cast<size_t>(num_experts_) * 4);
-  for (int expert = 0; expert < num_experts_; ++expert) {
-    // A hint only: the slot table of this (idle) layer is read without its lock.
-    if (static_cast<size_t>(expert) < expert_slot_.size() && expert_slot_[expert] >= 0) continue;
+  ranges.reserve(256);
+  for (int expert = 0; expert < num_experts_;) {
+    if (static_cast<size_t>(expert) < expert_slot_.size() && expert_slot_[expert] >= 0) {
+      ++expert;
+      continue;
+    }
+    int end_expert = expert + 1;
+    while (end_expert < num_experts_ &&
+           !(static_cast<size_t>(end_expert) < expert_slot_.size() && expert_slot_[end_expert] >= 0)) {
+      ++end_expert;
+    }
+    const size_t span_cnt = static_cast<size_t>(end_expert - expert);
     for (int b = 0; b < 4; ++b) {
       ranges.push_back({const_cast<uint8_t*>(bank_base[b] + static_cast<size_t>(expert) * resident_bank_bytes_[b]),
-                        resident_bank_bytes_[b]});
+                        span_cnt * resident_bank_bytes_[b]});
     }
+    expert = end_expert;
   }
+  mapped_prefetched_once_.store(true, std::memory_order_relaxed);
   MappedPrefetchService::Instance().Post(std::move(ranges), PrefillMemoryPriority());
   return true;
 #else
@@ -3441,7 +3458,7 @@ QMoEOffload::~QMoEOffload() {
   if (cpu_timing_) {
     std::fprintf(stderr,
                  "QMoEOffload cpu layer=%lld calls=%llu routes=%llu cold_routes=%llu cold_experts=%llu cpu_us=%llu classify_us=%llu "
-                 "gap_in_us=%llu gap_in_n=%llu gap_out_us=%llu gap_out_n=%llu t1_us=%llu t2_us=%llu t3_us=%llu inter_n=%llu prep_us=%llu fc1_us=%llu fc2_us=%llu write_us=%llu\n",
+                 "gap_in_us=%llu gap_in_n=%llu gap_out_us=%llu gap_out_n=%llu t1_us=%llu t2_us=%llu t3_us=%llu inter_n=%llu prep_us=%llu fc1_us=%llu fc2_us=%llu write_us=%llu threads=%d\n",
                  static_cast<long long>(layer_index_), static_cast<unsigned long long>(timing_calls_),
                  static_cast<unsigned long long>(timing_routes_), static_cast<unsigned long long>(timing_cold_routes_),
                  static_cast<unsigned long long>(timing_cold_experts_), static_cast<unsigned long long>(timing_cpu_ns_ / 1000),
@@ -3451,7 +3468,8 @@ QMoEOffload::~QMoEOffload() {
                  static_cast<unsigned long long>(g_t1_ns.load() / 1000), static_cast<unsigned long long>(g_t2_ns.load() / 1000),
                  static_cast<unsigned long long>(g_t3_ns.load() / 1000), static_cast<unsigned long long>(g_inter_n.load()),
                  static_cast<unsigned long long>(timing_prep_ns_ / 1000), static_cast<unsigned long long>(timing_fc1_ns_ / 1000),
-                 static_cast<unsigned long long>(timing_fc2_ns_ / 1000), static_cast<unsigned long long>(timing_write_ns_ / 1000));
+                 static_cast<unsigned long long>(timing_fc2_ns_ / 1000), static_cast<unsigned long long>(timing_write_ns_ / 1000),
+                 cpu_threads_);
   }
   if (resident_log_) {
     std::fprintf(stderr,
@@ -4006,8 +4024,12 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
                                 : ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_ASYNC", allow_cuda_graph_ ? 1 : 0);
   async_ = (default_async == 1) && (resident_slots_ > 0 || v4_planned_mode_ || info.GetAttrOrDefault<int64_t>("stream_rows", 0) == 0);
   pool_task_batch_ = deterministic_replay_ ? 1 : std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_POOL_TASK_BATCH", 1), 1, 16);
+  const int phys_cores = std::clamp(qmoe::DiscoverPhysicalCoreCount(), 1, 64);
+  const int logical_cpus = std::max(phys_cores, static_cast<int>(std::thread::hardware_concurrency()));
   const int default_cpu_threads =
-      std::clamp(qmoe::DiscoverPhysicalCoreCount(), 1, 64);
+      (phys_cores >= 8 && logical_cpus >= phys_cores * 2)
+          ? std::clamp(std::min(logical_cpus - 4, phys_cores + phys_cores / 2 + 2), phys_cores, 64)
+          : phys_cores;
   cpu_threads_ = (v4_planned_mode_ && v4_policy_.cpu_threads > 0)
                      ? static_cast<int>(v4_policy_.cpu_threads)
                      : std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_CPU_THREADS", default_cpu_threads), 1, 256);
@@ -4277,7 +4299,7 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
   }
 
   const int default_fc1_cols = is_int_bank ? 128 : 64;
-  const int default_fc2_cols = is_int_bank ? 256 : 128;
+  const int default_fc2_cols = 128;
   fc1_cols_ = std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_FC1_COLS", default_fc1_cols), 32, 1024) / 32 * 32;
   fc2_cols_ = std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_FC2_COLS", default_fc2_cols), 32, 1024) / 32 * 32;
   cpu_timing_ = ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_CPU_TIMING", 0) == 1;
@@ -4538,6 +4560,12 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
       }
     }
     SharedLayerCache::Register(owned_layer_cache_);
+#if defined(_WIN32)
+    if (IsDirectMappedIntBank()) {
+      std::lock_guard<std::mutex> lock(g_mapped_layers_mutex);
+      g_mapped_layers[{session_controller_.get(), layer_index_}] = this;
+    }
+#endif
     if (nvfp4_mode_ && !mxfp4_mode_ && !int4_bank_mode_ && !int3_bank_mode_ &&
         nvfp4_fc1_w_ && nvfp4_fc1_s_ && nvfp4_fc2_w_ && nvfp4_fc2_s_) {
       const float* fc1_g_base = nvfp4_fc1_g_ ? nvfp4_fc1_g_->Data<float>() : default_global_scales_.data();
@@ -7438,7 +7466,16 @@ int QMoEOffload::RunColdExperts(CpuWork& work, int group_count, const ActT* host
     // with compute.
     static const int decode_prefetch_mode =
         ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_DECODE_PREFETCH", 2);
-    if (decode_prefetch_mode == 1 || decode_prefetch_mode == 2) {
+    bool need_decode_prefetch = (decode_prefetch_mode == 1 || decode_prefetch_mode == 2);
+    if (need_decode_prefetch && mapped_prefetched_once_.load(std::memory_order_relaxed) &&
+        std::getenv("ORT_QMOE_WIN_DECODE_PREFETCH") == nullptr) {
+      MEMORYSTATUSEX ms{};
+      ms.dwLength = sizeof(ms);
+      if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys >= (4ULL << 30)) {
+        need_decode_prefetch = false;
+      }
+    }
+    if (need_decode_prefetch) {
       const uint8_t* bank_base[4] = {static_cast<const uint8_t*>(nvfp4_fc1_w_->DataRaw()),
                                      static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw()),
                                      static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw()),
@@ -8753,7 +8790,9 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       const int8_t inferred_phase = (rows > async_max_tokens_) ? 0 : 1;
       std::fill_n(host_phases, tile_rows, inferred_phase);
     }
-    const bool tile_no_cpu_tail = stream_no_cpu_tail || (streaming && (stream_min_rows_ <= 1 || tile_rows >= 2000));
+    const bool tile_no_cpu_tail =
+        stream_no_cpu_tail ||
+        (streaming && (stream_min_rows_ <= 1 || tile_rows >= 2000 || (in_warmup && tile_rows >= 128)));
     if (!tile_no_cpu_tail) {
       CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(host_input, static_cast<const uint8_t*>(input->DataRaw()) + activation_start * elem_size,
                                            SafeInt<size_t>(tile_rows) * hidden_size_ * elem_size, cudaMemcpyDeviceToHost, stream));
@@ -8897,13 +8936,23 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       skip_experts = stream_skip.data();
       auto& shared = *stream_shared_;
       const size_t stream_count = stream_list.size();
-      const int waves = static_cast<int>((stream_count + wave_experts - 1) / wave_experts);
+      const size_t wave0_experts =
+          (wave_experts > 8 && stream_count > 8 &&
+           (1 + static_cast<int>((stream_count - 8 + wave_experts - 1) / wave_experts)) <=
+               static_cast<int>(shared.copy_done.size()))
+              ? size_t{8}
+              : static_cast<size_t>(wave_experts);
+      const int waves = (stream_count == 0)
+                            ? 0
+                            : (stream_count <= wave0_experts
+                                   ? 1
+                                   : (1 + static_cast<int>((stream_count - wave0_experts + wave_experts - 1) / wave_experts)));
 #if defined(_WIN32)
       if (!in_warmup && start == 0 && (int4_bank_mode_ || int2_bank_mode_ || (int3_bank_mode_ && !expert_blocks_)) &&
           !(host_cache_bytes_ > 0 && file_expert_store_.IsInitialized()) &&
           nvfp4_fc1_w_ && nvfp4_fc2_w_ && nvfp4_fc1_s_ && nvfp4_fc2_s_) {
         static const bool enable_win_prefetch =
-            ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFETCH_MMAP", 1) == 1;
+            ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFETCH_MMAP", 0) == 1;
         MEMORYSTATUSEX pf_mem_stat{};
         pf_mem_stat.dwLength = sizeof(pf_mem_stat);
         const bool has_free_phys =
@@ -8969,8 +9018,9 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       } bank_lease_guard{shared.copy_stream, &file_expert_store_, &bank_leased_experts};
       for (int wave = 0; wave < waves; ++wave) {
         const int bank_idx = wave & 1;
-        const size_t first = static_cast<size_t>(wave) * wave_experts;
-        const int count = static_cast<int>(std::min<size_t>(wave_experts, stream_count - first));
+        const size_t first = (wave == 0) ? size_t{0} : (wave0_experts + static_cast<size_t>(wave - 1) * wave_experts);
+        const size_t cur_wave_cap = (wave == 0) ? wave0_experts : static_cast<size_t>(wave_experts);
+        const int count = static_cast<int>(std::min<size_t>(cur_wave_cap, stream_count - first));
         const auto& offsets = wave_bank_offsets[bank_idx];
 
         // Event-ordered landing ring reuse across waves and across layers (v3 Section 7.6 / F5).

@@ -1933,6 +1933,46 @@ class TestGgufPackedOps(unittest.TestCase):
                         np.testing.assert_array_equal(got, single_rows)
                         np.testing.assert_allclose(got, ref, rtol=3e-2, atol=3e-2)
 
+    def test_moe_packed_cuda_offload_all_q8_formats_cold_decode(self):
+        self._require_moe_offload()
+        # Exercises Q8 INT8 cold-expert kernels (AVX-512 VNNI / AVX2) across IQ2_XXS, IQ2_XS, IQ4_XS, and Q2_0
+        # in addition to IQ2_S, IQ3_XXS, and IQ4_NL.
+        num_experts, hidden_size, inter_size, top_k = 4, 512, 256, 2
+        rng = np.random.default_rng(34201)
+        format_combos = (
+            ((23, 256, 136), (23, 256, 136), (20, 32, 18)),  # IQ4_XS / IQ4_NL
+            ((16, 256, 66), (17, 256, 74), (42, 64, 18)),  # IQ2_XXS + IQ2_XS / Q2_0
+            ((22, 256, 82), (22, 256, 82), (42, 64, 18)),  # IQ2_S / Q2_0
+            ((18, 256, 98), (18, 256, 98), (23, 256, 136)),  # IQ3_XXS / IQ4_XS
+        )
+        for formats in format_combos:
+            qscale = 2**-13 if any(f[0] == 23 for f in formats) else 2**-10
+            raw_weights, weights, slot_bytes = self._offload_moe_weights(
+                rng, num_experts, hidden_size, inter_size, formats, quant_scale=qscale
+            )
+            for dtype in self.activation_dtypes:
+                model = self._offload_moe_model(num_experts, hidden_size, top_k, dtype, formats, raw_weights)
+                session = self._offload_session(
+                    model,
+                    1 * slot_bytes + 4096,
+                    {"ep.cuda.moe_packed_cpu_q8_dot": "1"},
+                )
+                for m in (1, 3, 5):
+                    x = rng.standard_normal((m, hidden_size), dtype=np.float32) * 0.2
+                    logits = np.tile(np.array([[-2.0, -1.5, 2.0, 1.0]], dtype=np.float32), (m, 1))
+                    got = self._run_offload_decode_rows(session, x, logits, dtype)
+                    single_rows = np.concatenate(
+                        [
+                            self._run_offload_decode_rows(session, x[r : r + 1], logits[r : r + 1], dtype)
+                            for r in range(m)
+                        ],
+                        axis=0,
+                    )
+                    ref = _moe_reference(x, logits, *weights, top_k, dtype, True, round_weights=False)
+                    with self.subTest(formats=formats, dtype=dtype, m=m):
+                        np.testing.assert_array_equal(got, single_rows)
+                        np.testing.assert_allclose(got, ref, rtol=3e-2, atol=3e-2)
+
     def test_moe_packed_cuda_offload_device_working_bytes_includes_metadata_banks(self):
         self._require_moe_offload()
         num_experts, hidden_size, inter_size, top_k = 4, 256, 64, 2

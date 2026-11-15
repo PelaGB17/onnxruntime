@@ -116,6 +116,7 @@ class QMoEOffload final : public onnxruntime::cuda::CudaKernel, public MoEBase {
   // are read ahead of its own prefill. Returns false when this backend does not stream from a file mapping.
   bool PostMappedNonResidentPrefetch() const;
   bool IsDirectMappedIntBank() const noexcept;
+  mutable std::atomic<bool> mapped_prefetched_once_{false};
   void InitializeShared(const OpKernelInfo& info);
   void InitializeNvfp4Offload(const OpKernelInfo& info);
   Status ComputeShared(OpKernelContext* context) const;

@@ -11,11 +11,14 @@
 
 #if ORT_MOE_PACKED_CPU_X86_64
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 #include "contrib_ops/cpu/quantization/gguf_quant_tables.h"
+#include "contrib_ops/cpu/quantization/gguf_vec_dot_cpu.h"
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
@@ -675,7 +678,7 @@ void GgufDualDot2ChAvx2Tpl(
         }
       }
     }
-  } else {
+  } else if (gate_type == kGgmlTypeIQ3_XXS) {
     for (int i = 0; i < nb; ++i) {
       const uint8_t* bg0 = gate_row0 + i * 98;
       const uint8_t* bu0 = up_row0 + i * 98;
@@ -716,6 +719,55 @@ void GgufDualDot2ChAvx2Tpl(
           fma_iq3xxs(bg1, aux_g1, vdb_g1, ag1_0, ag1_1);
           fma_iq3xxs(bu1, aux_u1, vdb_u1, au1_0, au1_1);
         }
+      }
+    }
+  } else {
+    // kGgmlTypeIQ4_XS
+    const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i mask0f = _mm_set1_epi8(0x0F);
+    for (int i = 0; i < nb; ++i) {
+      const uint8_t* bg0 = gate_row0 + i * 136;
+      const uint8_t* bu0 = up_row0 + i * 136;
+      const uint8_t* bg1 = gate_row1 + i * 136;
+      const uint8_t* bu1 = up_row1 + i * 136;
+      const float dg0 = Fp16ToFloatFast(LoadU16Le(bg0));
+      const float du0 = Fp16ToFloatFast(LoadU16Le(bu0));
+      const float dg1 = Fp16ToFloatFast(LoadU16Le(bg1));
+      const float du1 = Fp16ToFloatFast(LoadU16Le(bu1));
+      const uint16_t sh_g0 = LoadU16Le(bg0 + 2);
+      const uint16_t sh_u0 = LoadU16Le(bu0 + 2);
+      const uint16_t sh_g1 = LoadU16Le(bg1 + 2);
+      const uint16_t sh_u1 = LoadU16Le(bu1 + 2);
+      for (int ib = 0; ib < 8; ++ib) {
+        const int k_off = i * 256 + ib * 32;
+        const __m256 x0 = _mm256_loadu_ps(xr0 + k_off + 0), x1 = _mm256_loadu_ps(xr0 + k_off + 8);
+        const __m256 x2 = _mm256_loadu_ps(xr0 + k_off + 16), x3 = _mm256_loadu_ps(xr0 + k_off + 24);
+        __m256 y0, y1, y2, y3;
+        if constexpr (RT >= 2) {
+          y0 = _mm256_loadu_ps(xr1 + k_off + 0);
+          y1 = _mm256_loadu_ps(xr1 + k_off + 8);
+          y2 = _mm256_loadu_ps(xr1 + k_off + 16);
+          y3 = _mm256_loadu_ps(xr1 + k_off + 24);
+        }
+        auto fma_iq4xs = [&](const uint8_t* blk, float d, uint16_t sh, __m256& a0, __m256& a1) {
+          const int ls = ((blk[4 + ib / 2] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+          const __m256 vd = _mm256_set1_ps(d * static_cast<float>(ls - 32));
+          const __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 8 + ib * 16));
+          const __m128i v_lo = _mm_shuffle_epi8(lut, _mm_and_si128(raw16, mask0f));
+          const __m128i v_hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(raw16, 4), mask0f));
+          const __m256 w0 = _mm256_mul_ps(vd, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v_lo)));
+          const __m256 w1 = _mm256_mul_ps(vd, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v_lo, 8))));
+          const __m256 w2 = _mm256_mul_ps(vd, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v_hi)));
+          const __m256 w3 = _mm256_mul_ps(vd, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v_hi, 8))));
+          a0 = _mm256_fmadd_ps(w0, x0, _mm256_fmadd_ps(w1, x1, _mm256_fmadd_ps(w2, x2, _mm256_fmadd_ps(w3, x3, a0))));
+          if constexpr (RT >= 2) {
+            a1 = _mm256_fmadd_ps(w0, y0, _mm256_fmadd_ps(w1, y1, _mm256_fmadd_ps(w2, y2, _mm256_fmadd_ps(w3, y3, a1))));
+          }
+        };
+        fma_iq4xs(bg0, dg0, sh_g0, ag0_0, ag0_1);
+        fma_iq4xs(bu0, du0, sh_u0, au0_0, au0_1);
+        fma_iq4xs(bg1, dg1, sh_g1, ag1_0, ag1_1);
+        fma_iq4xs(bu1, du1, sh_u1, au1_0, au1_1);
       }
     }
   }
@@ -767,7 +819,7 @@ bool GgufDualDotRowAvx2(const uint8_t* gate_row, const uint8_t* up_row, int type
 bool GgufDualDot2ChAvx2(const uint8_t* gate_row0, const uint8_t* up_row0, const uint8_t* gate_row1,
                         const uint8_t* up_row1, int type, int K, const float* const* x_rows, int R,
                         float* gate_dots0, float* up_dots0, float* gate_dots1, float* up_dots1) {
-  if (type != kGgmlTypeIQ2_S && type != kGgmlTypeIQ2_XXS && type != kGgmlTypeIQ3_XXS) {
+  if (type != kGgmlTypeIQ2_S && type != kGgmlTypeIQ2_XXS && type != kGgmlTypeIQ3_XXS && type != kGgmlTypeIQ4_XS) {
     return false;
   }
   int r = 0;
@@ -964,6 +1016,454 @@ int GgufDotRowsBy4Avx2(const uint8_t* row0, size_t row_bytes, int n_rows, int ty
         dots[r * dots_ld + c + 1] = d1;
         dots[r * dots_ld + c + 2] = d2;
         dots[r * dots_ld + c + 3] = d3;
+      }
+    }
+  }
+  return c;
+}
+
+namespace {
+
+inline __m256i MakeU256From4xU64Avx2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) noexcept {
+  const __m128i lo = _mm_unpacklo_epi64(_mm_cvtsi64_si128(static_cast<int64_t>(a0)),
+                                        _mm_cvtsi64_si128(static_cast<int64_t>(a1)));
+  const __m128i hi = _mm_unpacklo_epi64(_mm_cvtsi64_si128(static_cast<int64_t>(a2)),
+                                        _mm_cvtsi64_si128(static_cast<int64_t>(a3)));
+  return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+inline __m256i MakeHalfPairI16Avx2(int16_t lo, int16_t hi) noexcept {
+  return _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi16(lo)), _mm_set1_epi16(hi), 1);
+}
+
+inline void Hsum4Avx2Local(__m256 a0, __m256 a1, __m256 a2, __m256 a3, float* out4) noexcept {
+  const __m256 t0 = _mm256_hadd_ps(a0, a1);
+  const __m256 t1 = _mm256_hadd_ps(a2, a3);
+  const __m256 t2 = _mm256_hadd_ps(t0, t1);
+  _mm_storeu_ps(out4, _mm_add_ps(_mm256_castps256_ps128(t2), _mm256_extractf128_ps(t2, 1)));
+}
+
+inline void QuantizeBlockQ8Avx2Local(const float* x, GgufQ8Block* blk) noexcept {
+  const __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+  const __m256 x0 = _mm256_loadu_ps(x + 0);
+  const __m256 x1 = _mm256_loadu_ps(x + 8);
+  const __m256 x2 = _mm256_loadu_ps(x + 16);
+  const __m256 x3 = _mm256_loadu_ps(x + 24);
+  const __m256 m01 = _mm256_max_ps(_mm256_and_ps(x0, sign_mask), _mm256_and_ps(x1, sign_mask));
+  const __m256 m23 = _mm256_max_ps(_mm256_and_ps(x2, sign_mask), _mm256_and_ps(x3, sign_mask));
+  const __m256 mv = _mm256_max_ps(m01, m23);
+  __m128 m128 = _mm_max_ps(_mm256_castps256_ps128(mv), _mm256_extractf128_ps(mv, 1));
+  m128 = _mm_max_ps(m128, _mm_movehl_ps(m128, m128));
+  m128 = _mm_max_ss(m128, _mm_movehdup_ps(m128));
+  const float max_abs = _mm_cvtss_f32(m128);
+  if (!(max_abs > 0.0f)) {
+    blk->d = 0.0f;
+    blk->bsum = 0;
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(blk->qs), _mm256_setzero_si256());
+    return;
+  }
+
+  const float d = max_abs / 127.0f;
+  const float id = 127.0f / max_abs;
+  __m256 s0, s1, s2, s3;
+  if (std::isfinite(id)) {
+    const __m256 id_v = _mm256_set1_ps(id);
+    s0 = _mm256_mul_ps(x0, id_v);
+    s1 = _mm256_mul_ps(x1, id_v);
+    s2 = _mm256_mul_ps(x2, id_v);
+    s3 = _mm256_mul_ps(x3, id_v);
+  } else {
+    const __m256 max_v = _mm256_set1_ps(max_abs);
+    const __m256 c127_v = _mm256_set1_ps(127.0f);
+    s0 = _mm256_mul_ps(_mm256_div_ps(x0, max_v), c127_v);
+    s1 = _mm256_mul_ps(_mm256_div_ps(x1, max_v), c127_v);
+    s2 = _mm256_mul_ps(_mm256_div_ps(x2, max_v), c127_v);
+    s3 = _mm256_mul_ps(_mm256_div_ps(x3, max_v), c127_v);
+  }
+  const __m256i q0 = _mm256_cvtps_epi32(s0);
+  const __m256i q1 = _mm256_cvtps_epi32(s1);
+  const __m256i q2 = _mm256_cvtps_epi32(s2);
+  const __m256i q3 = _mm256_cvtps_epi32(s3);
+  const __m256i p01 = _mm256_packs_epi32(q0, q1);
+  const __m256i p23 = _mm256_packs_epi32(q2, q3);
+  const __m256i p8_raw = _mm256_max_epi8(_mm256_packs_epi16(p01, p23), _mm256_set1_epi8(-127));
+  const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+  const __m256i qs_i8 = _mm256_permutevar8x32_epi32(p8_raw, perm);
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(blk->qs), qs_i8);
+
+  const __m256i sad = _mm256_sad_epu8(_mm256_xor_si256(qs_i8, _mm256_set1_epi8(-128)), _mm256_setzero_si256());
+  const __m128i sad128 = _mm_add_epi64(_mm256_castsi256_si128(sad), _mm256_extracti128_si256(sad, 1));
+  const int64_t u_sum = _mm_cvtsi128_si64(sad128) + _mm_extract_epi64(sad128, 1);
+  blk->d = d;
+  blk->bsum = static_cast<int32_t>(u_sum - 4096);
+}
+
+template <int RT>
+void DualDot2ChQ8Avx2Batch(
+    int type, const uint8_t* g0, const uint8_t* g1, const uint8_t* u0, const uint8_t* u1,
+    const GgufQ8Block* const* x_rows, int K,
+    float* gd0, float* ud0, float* gd1, float* ud1) noexcept {
+  __m256 ag0[RT], au0[RT], ag1[RT], au1[RT];
+  for (int r = 0; r < RT; ++r) {
+    ag0[r] = _mm256_setzero_ps();
+    au0[r] = _mm256_setzero_ps();
+    ag1[r] = _mm256_setzero_ps();
+    au1[r] = _mm256_setzero_ps();
+  }
+
+  if (type == kGgmlTypeIQ3_XXS) {
+    const int nb = K / 256;
+    for (int i = 0; i < nb; ++i) {
+      const uint8_t* bg0 = g0 + i * 98;
+      const uint8_t* bg1 = g1 + i * 98;
+      const uint8_t* bu0 = u0 + i * 98;
+      const uint8_t* bu1 = u1 + i * 98;
+      const float dg0 = Fp16ToFloatFast(LoadU16Le(bg0)) * 0.25f;
+      const float dg1 = Fp16ToFloatFast(LoadU16Le(bg1)) * 0.25f;
+      const float du0 = Fp16ToFloatFast(LoadU16Le(bu0)) * 0.25f;
+      const float du1 = Fp16ToFloatFast(LoadU16Le(bu1)) * 0.25f;
+      for (int ib = 0; ib < 8; ++ib) {
+        const int blk_idx = i * 8 + ib;
+        __m256i xq[RT];
+        float xd[RT];
+        for (int r = 0; r < RT; ++r) {
+          xq[r] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_rows[r][blk_idx].qs));
+          xd[r] = x_rows[r][blk_idx].d;
+        }
+        auto step = [&](const uint8_t* blk, float d025, __m256* acc_arr) MOE_PACKED_AVX2_LAMBDA_INLINE {
+          const uint8_t* qs_ib = blk + 2 + 8 * ib;
+          const uint32_t aux32 = LoadU32Le(blk + 66 + 4 * ib);
+          const uint64_t g01 = static_cast<uint64_t>(iq3xxs_grid[qs_ib[0]]) |
+                               (static_cast<uint64_t>(iq3xxs_grid[qs_ib[1]]) << 32);
+          const uint64_t g23 = static_cast<uint64_t>(iq3xxs_grid[qs_ib[2]]) |
+                               (static_cast<uint64_t>(iq3xxs_grid[qs_ib[3]]) << 32);
+          const uint64_t g45 = static_cast<uint64_t>(iq3xxs_grid[qs_ib[4]]) |
+                               (static_cast<uint64_t>(iq3xxs_grid[qs_ib[5]]) << 32);
+          const uint64_t g67 = static_cast<uint64_t>(iq3xxs_grid[qs_ib[6]]) |
+                               (static_cast<uint64_t>(iq3xxs_grid[qs_ib[7]]) << 32);
+          const __m256i grid = MakeU256From4xU64Avx2(g01, g23, g45, g67);
+          const __m256i signs = MakeU256From4xU64Avx2(
+              kSignBytes7Bit.mask[(aux32 >> 0) & 127u],
+              kSignBytes7Bit.mask[(aux32 >> 7) & 127u],
+              kSignBytes7Bit.mask[(aux32 >> 14) & 127u],
+              kSignBytes7Bit.mask[(aux32 >> 21) & 127u]);
+          const __m256i ls_v = _mm256_set1_epi16(static_cast<int16_t>(2 * (aux32 >> 28) + 1));
+          for (int r = 0; r < RT; ++r) {
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(grid, _mm256_sign_epi8(xq[r], signs)), ls_v);
+            acc_arr[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(d025 * xd[r]), acc_arr[r]);
+          }
+        };
+        step(bg0, dg0, ag0);
+        step(bg1, dg1, ag1);
+        step(bu0, du0, au0);
+        step(bu1, du1, au1);
+      }
+    }
+  } else if (type == kGgmlTypeIQ2_S) {
+    const int nb = K / 256;
+    for (int i = 0; i < nb; ++i) {
+      const uint8_t* bg0 = g0 + i * 82;
+      const uint8_t* bg1 = g1 + i * 82;
+      const uint8_t* bu0 = u0 + i * 82;
+      const uint8_t* bu1 = u1 + i * 82;
+      const float dg0 = Fp16ToFloatFast(LoadU16Le(bg0)) * 0.125f;
+      const float dg1 = Fp16ToFloatFast(LoadU16Le(bg1)) * 0.125f;
+      const float du0 = Fp16ToFloatFast(LoadU16Le(bu0)) * 0.125f;
+      const float du1 = Fp16ToFloatFast(LoadU16Le(bu1)) * 0.125f;
+      for (int ib = 0; ib < 8; ++ib) {
+        const int blk_idx = i * 8 + ib;
+        __m256i xq[RT];
+        float xd[RT];
+        for (int r = 0; r < RT; ++r) {
+          xq[r] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_rows[r][blk_idx].qs));
+          xd[r] = x_rows[r][blk_idx].d;
+        }
+        auto step = [&](const uint8_t* blk, float d0125, __m256* acc_arr) MOE_PACKED_AVX2_LAMBDA_INLINE {
+          const uint8_t* qs_ib = blk + 2 + 4 * ib;
+          const uint8_t* signs_ib = blk + 34 + 4 * ib;
+          const uint32_t qh_b = blk[66 + ib];
+          const uint8_t sc = blk[74 + ib];
+          const __m256i grid = MakeU256From4xU64Avx2(
+              iq2s_grid[qs_ib[0] | ((qh_b << 8) & 0x300u)],
+              iq2s_grid[qs_ib[1] | ((qh_b << 6) & 0x300u)],
+              iq2s_grid[qs_ib[2] | ((qh_b << 4) & 0x300u)],
+              iq2s_grid[qs_ib[3] | ((qh_b << 2) & 0x300u)]);
+          const __m256i signs = MakeU256From4xU64Avx2(
+              kSignBytes8Bit.mask[signs_ib[0]], kSignBytes8Bit.mask[signs_ib[1]],
+              kSignBytes8Bit.mask[signs_ib[2]], kSignBytes8Bit.mask[signs_ib[3]]);
+          const __m256i ls_v = MakeHalfPairI16Avx2(static_cast<int16_t>(2 * (sc & 0xF) + 1),
+                                                   static_cast<int16_t>(2 * (sc >> 4) + 1));
+          for (int r = 0; r < RT; ++r) {
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(grid, _mm256_sign_epi8(xq[r], signs)), ls_v);
+            acc_arr[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(d0125 * xd[r]), acc_arr[r]);
+          }
+        };
+        step(bg0, dg0, ag0);
+        step(bg1, dg1, ag1);
+        step(bu0, du0, au0);
+        step(bu1, du1, au1);
+      }
+    }
+  } else if (type == kGgmlTypeIQ2_XXS) {
+    const int nb = K / 256;
+    for (int i = 0; i < nb; ++i) {
+      const uint8_t* bg0 = g0 + i * 66;
+      const uint8_t* bg1 = g1 + i * 66;
+      const uint8_t* bu0 = u0 + i * 66;
+      const uint8_t* bu1 = u1 + i * 66;
+      const float dg0 = Fp16ToFloatFast(LoadU16Le(bg0)) * 0.125f;
+      const float dg1 = Fp16ToFloatFast(LoadU16Le(bg1)) * 0.125f;
+      const float du0 = Fp16ToFloatFast(LoadU16Le(bu0)) * 0.125f;
+      const float du1 = Fp16ToFloatFast(LoadU16Le(bu1)) * 0.125f;
+      for (int ib = 0; ib < 8; ++ib) {
+        const int blk_idx = i * 8 + ib;
+        __m256i xq[RT];
+        float xd[RT];
+        for (int r = 0; r < RT; ++r) {
+          xq[r] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_rows[r][blk_idx].qs));
+          xd[r] = x_rows[r][blk_idx].d;
+        }
+        auto step = [&](const uint8_t* blk, float d0125, __m256* acc_arr) MOE_PACKED_AVX2_LAMBDA_INLINE {
+          const uint8_t* aux8 = blk + 2 + 8 * ib;
+          const uint32_t aux32 = LoadU32Le(aux8 + 4);
+          const __m256i grid = MakeU256From4xU64Avx2(
+              iq2xxs_grid[aux8[0]], iq2xxs_grid[aux8[1]],
+              iq2xxs_grid[aux8[2]], iq2xxs_grid[aux8[3]]);
+          const __m256i signs = MakeU256From4xU64Avx2(
+              kSignBytes7Bit.mask[(aux32 >> 0) & 127u], kSignBytes7Bit.mask[(aux32 >> 7) & 127u],
+              kSignBytes7Bit.mask[(aux32 >> 14) & 127u], kSignBytes7Bit.mask[(aux32 >> 21) & 127u]);
+          const __m256i ls_v = _mm256_set1_epi16(static_cast<int16_t>(2 * (aux32 >> 28) + 1));
+          for (int r = 0; r < RT; ++r) {
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(grid, _mm256_sign_epi8(xq[r], signs)), ls_v);
+            acc_arr[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(d0125 * xd[r]), acc_arr[r]);
+          }
+        };
+        step(bg0, dg0, ag0);
+        step(bg1, dg1, ag1);
+        step(bu0, du0, au0);
+        step(bu1, du1, au1);
+      }
+    }
+  } else {
+    // kGgmlTypeIQ4_XS
+    const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m256i lut256 = _mm256_broadcastsi128_si256(lut128);
+    const __m256i mask0f = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const int nb = K / 256;
+    for (int i = 0; i < nb; ++i) {
+      const uint8_t* bg0 = g0 + i * 136;
+      const uint8_t* bg1 = g1 + i * 136;
+      const uint8_t* bu0 = u0 + i * 136;
+      const uint8_t* bu1 = u1 + i * 136;
+      const float dg0 = Fp16ToFloatFast(LoadU16Le(bg0));
+      const float dg1 = Fp16ToFloatFast(LoadU16Le(bg1));
+      const float du0 = Fp16ToFloatFast(LoadU16Le(bu0));
+      const float du1 = Fp16ToFloatFast(LoadU16Le(bu1));
+      const uint16_t sh_g0 = LoadU16Le(bg0 + 2);
+      const uint16_t sh_g1 = LoadU16Le(bg1 + 2);
+      const uint16_t sh_u0 = LoadU16Le(bu0 + 2);
+      const uint16_t sh_u1 = LoadU16Le(bu1 + 2);
+      for (int ib = 0; ib < 8; ++ib) {
+        const int blk_idx = i * 8 + ib;
+        __m256i xq[RT], ax[RT];
+        float xd[RT];
+        for (int r = 0; r < RT; ++r) {
+          xq[r] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x_rows[r][blk_idx].qs));
+          ax[r] = _mm256_abs_epi8(xq[r]);
+          xd[r] = x_rows[r][blk_idx].d;
+        }
+        auto step = [&](const uint8_t* blk, float d, uint16_t sh, __m256* acc_arr) MOE_PACKED_AVX2_LAMBDA_INLINE {
+          const int ls = ((blk[4 + ib / 2] >> (4 * (ib & 1))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+          const float scale_w = d * static_cast<float>(ls - 32);
+          const __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 8 + ib * 16));
+          const __m256i nibbles = _mm256_and_si256(
+              _mm256_inserti128_si256(_mm256_castsi128_si256(raw16), _mm_srli_epi16(raw16, 4), 1), mask0f);
+          const __m256i w_i8 = _mm256_shuffle_epi8(lut256, nibbles);
+          for (int r = 0; r < RT; ++r) {
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax[r], _mm256_sign_epi8(w_i8, xq[r])), ones16);
+            acc_arr[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(scale_w * xd[r]), acc_arr[r]);
+          }
+        };
+        step(bg0, dg0, sh_g0, ag0);
+        step(bg1, dg1, sh_g1, ag1);
+        step(bu0, du0, sh_u0, au0);
+        step(bu1, du1, sh_u1, au1);
+      }
+    }
+  }
+
+  for (int r = 0; r < RT; ++r) {
+    float tmp[4];
+    Hsum4Avx2Local(ag0[r], au0[r], ag1[r], au1[r], tmp);
+    gd0[r] = tmp[0];
+    ud0[r] = tmp[1];
+    gd1[r] = tmp[2];
+    ud1[r] = tmp[3];
+  }
+}
+
+}  // namespace
+
+void ConvertHalfRowAvx2(const uint16_t* src, bool is_bf16, float* dst, int K) noexcept {
+  int c = 0;
+  for (; c + 8 <= K; c += 8) {
+    const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + c));
+    const __m256 f = is_bf16 ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16))
+                             : _mm256_cvtph_ps(h);
+    _mm256_storeu_ps(dst + c, f);
+  }
+  for (; c < K; ++c) {
+    dst[c] = is_bf16 ? Bf16BitsToFloatCpu(src[c]) : Fp16BitsToFloatCpu(src[c]);
+  }
+}
+
+void QuantizeRowQ8Avx2(const float* src, int K, GgufQ8Block* dst) noexcept {
+  const int nb = K / 32;
+  for (int b = 0; b < nb; ++b) {
+    QuantizeBlockQ8Avx2Local(src + b * 32, dst + b);
+  }
+}
+
+bool GgufDualDot2ChQ8Avx2(int type, const uint8_t* g0, const uint8_t* g1, const uint8_t* u0, const uint8_t* u1,
+                          const GgufQ8Block* const* x_q8_rows, int R, int K,
+                          float* g_dots0, float* u_dots0, float* g_dots1, float* u_dots1) noexcept {
+  if (type != kGgmlTypeIQ3_XXS && type != kGgmlTypeIQ2_S && type != kGgmlTypeIQ2_XXS && type != kGgmlTypeIQ4_XS) {
+    return false;
+  }
+  int r = 0;
+  for (; r + 2 <= R; r += 2) {
+    DualDot2ChQ8Avx2Batch<2>(type, g0, g1, u0, u1, x_q8_rows + r, K,
+                             g_dots0 + r, u_dots0 + r, g_dots1 + r, u_dots1 + r);
+  }
+  for (; r < R; ++r) {
+    DualDot2ChQ8Avx2Batch<1>(type, g0, g1, u0, u1, x_q8_rows + r, K,
+                             g_dots0 + r, u_dots0 + r, g_dots1 + r, u_dots1 + r);
+  }
+  return true;
+}
+
+int GgufDotRowsBy4Q8Avx2(int type, const uint8_t* row0, size_t row_bytes, int n_rows,
+                         const GgufQ8Block* x_q8_base, size_t q8_stride,
+                         int R, int K, float* dots, int dots_ld) noexcept {
+  if (type != kGgmlTypeIQ4_NL && type != kGgmlTypeQ2_0) {
+    return 0;
+  }
+  int c = 0;
+  if (type == kGgmlTypeIQ4_NL) {
+    const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m256i lut256 = _mm256_broadcastsi128_si256(lut128);
+    const __m256i mask0f = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const int nb = K / 32;
+    for (; c + 4 <= n_rows; c += 4) {
+      const uint8_t* dr0 = row0 + static_cast<size_t>(c) * row_bytes;
+      const uint8_t* dr1 = dr0 + row_bytes;
+      const uint8_t* dr2 = dr1 + row_bytes;
+      const uint8_t* dr3 = dr2 + row_bytes;
+      int r = 0;
+      for (; r + 2 <= R; r += 2) {
+        __m256 a0_0 = _mm256_setzero_ps(), a1_0 = _mm256_setzero_ps(), a2_0 = _mm256_setzero_ps(), a3_0 = _mm256_setzero_ps();
+        __m256 a0_1 = _mm256_setzero_ps(), a1_1 = _mm256_setzero_ps(), a2_1 = _mm256_setzero_ps(), a3_1 = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+          const GgufQ8Block& xb0 = x_q8_base[static_cast<size_t>(r + 0) * q8_stride + i];
+          const GgufQ8Block& xb1 = x_q8_base[static_cast<size_t>(r + 1) * q8_stride + i];
+          const __m256i xq0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb0.qs));
+          const __m256i xq1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb1.qs));
+          const __m256i ax0 = _mm256_abs_epi8(xq0);
+          const __m256i ax1 = _mm256_abs_epi8(xq1);
+          auto step = [&](const uint8_t* blk, __m256& acc0, __m256& acc1) MOE_PACKED_AVX2_LAMBDA_INLINE {
+            const float wd = Fp16ToFloatFast(LoadU16Le(blk));
+            const __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+            const __m256i nibbles = _mm256_and_si256(
+                _mm256_inserti128_si256(_mm256_castsi128_si256(raw16), _mm_srli_epi16(raw16, 4), 1), mask0f);
+            const __m256i w_i8 = _mm256_shuffle_epi8(lut256, nibbles);
+            const __m256i p32_0 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax0, _mm256_sign_epi8(w_i8, xq0)), ones16);
+            const __m256i p32_1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax1, _mm256_sign_epi8(w_i8, xq1)), ones16);
+            acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_0), _mm256_set1_ps(wd * xb0.d), acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32_1), _mm256_set1_ps(wd * xb1.d), acc1);
+          };
+          step(dr0 + i * 18, a0_0, a0_1);
+          step(dr1 + i * 18, a1_0, a1_1);
+          step(dr2 + i * 18, a2_0, a2_1);
+          step(dr3 + i * 18, a3_0, a3_1);
+        }
+        Hsum4Avx2Local(a0_0, a1_0, a2_0, a3_0, dots + (r + 0) * dots_ld + c);
+        Hsum4Avx2Local(a0_1, a1_1, a2_1, a3_1, dots + (r + 1) * dots_ld + c);
+      }
+      for (; r < R; ++r) {
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+          const GgufQ8Block& xb = x_q8_base[static_cast<size_t>(r) * q8_stride + i];
+          const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb.qs));
+          const __m256i ax = _mm256_abs_epi8(xq);
+          auto step = [&](const uint8_t* blk, __m256& acc) MOE_PACKED_AVX2_LAMBDA_INLINE {
+            const float wd = Fp16ToFloatFast(LoadU16Le(blk));
+            const __m128i raw16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + 2));
+            const __m256i nibbles = _mm256_and_si256(
+                _mm256_inserti128_si256(_mm256_castsi128_si256(raw16), _mm_srli_epi16(raw16, 4), 1), mask0f);
+            const __m256i w_i8 = _mm256_shuffle_epi8(lut256, nibbles);
+            const __m256i p32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax, _mm256_sign_epi8(w_i8, xq)), ones16);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_set1_ps(wd * xb.d), acc);
+          };
+          step(dr0 + i * 18, a0);
+          step(dr1 + i * 18, a1);
+          step(dr2 + i * 18, a2);
+          step(dr3 + i * 18, a3);
+        }
+        Hsum4Avx2Local(a0, a1, a2, a3, dots + r * dots_ld + c);
+      }
+    }
+  } else {
+    // kGgmlTypeQ2_0
+    const __m128i mask03 = _mm_set1_epi8(0x03);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const int nb = K / 64;
+    auto unpack_q20 = [&](const uint8_t* qs8) MOE_PACKED_AVX2_LAMBDA_INLINE {
+      const __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(qs8));
+      const __m128i u0 = _mm_and_si128(raw, mask03);
+      const __m128i u1 = _mm_and_si128(_mm_srli_epi16(raw, 2), mask03);
+      const __m128i u2 = _mm_and_si128(_mm_srli_epi16(raw, 4), mask03);
+      const __m128i u3 = _mm_and_si128(_mm_srli_epi16(raw, 6), mask03);
+      const __m128i p01 = _mm_unpacklo_epi8(u0, u1);
+      const __m128i p23 = _mm_unpacklo_epi8(u2, u3);
+      return _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi16(p01, p23)),
+                                     _mm_unpackhi_epi16(p01, p23), 1);
+    };
+    auto hsum_i32 = [](__m256i v) MOE_PACKED_AVX2_LAMBDA_INLINE {
+      const __m128i s128 = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+      const __m128i s64 = _mm_add_epi32(s128, _mm_srli_si128(s128, 8));
+      return static_cast<float>(_mm_cvtsi128_si32(_mm_add_epi32(s64, _mm_srli_si128(s64, 4))));
+    };
+    for (; c + 4 <= n_rows; c += 4) {
+      const uint8_t* dr0 = row0 + static_cast<size_t>(c) * row_bytes;
+      const uint8_t* dr1 = dr0 + row_bytes;
+      const uint8_t* dr2 = dr1 + row_bytes;
+      const uint8_t* dr3 = dr2 + row_bytes;
+      for (int r = 0; r < R; ++r) {
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        for (int i = 0; i < nb; ++i) {
+          const uint8_t* b0 = dr0 + i * 18, *b1 = dr1 + i * 18, *b2 = dr2 + i * 18, *b3 = dr3 + i * 18;
+          const float wd0 = Fp16ToFloatFast(LoadU16Le(b0)), wd1 = Fp16ToFloatFast(LoadU16Le(b1));
+          const float wd2 = Fp16ToFloatFast(LoadU16Le(b2)), wd3 = Fp16ToFloatFast(LoadU16Le(b3));
+          for (int h = 0; h < 2; ++h) {
+            const GgufQ8Block& xb = x_q8_base[static_cast<size_t>(r) * q8_stride + i * 2 + h];
+            const __m256i xq = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb.qs));
+            const float bs = static_cast<float>(xb.bsum);
+            const float p0 = hsum_i32(_mm256_madd_epi16(_mm256_maddubs_epi16(unpack_q20(b0 + 2 + h * 8), xq), ones16)) - bs;
+            const float p1 = hsum_i32(_mm256_madd_epi16(_mm256_maddubs_epi16(unpack_q20(b1 + 2 + h * 8), xq), ones16)) - bs;
+            const float p2 = hsum_i32(_mm256_madd_epi16(_mm256_maddubs_epi16(unpack_q20(b2 + 2 + h * 8), xq), ones16)) - bs;
+            const float p3 = hsum_i32(_mm256_madd_epi16(_mm256_maddubs_epi16(unpack_q20(b3 + 2 + h * 8), xq), ones16)) - bs;
+            s0 = std::fma(p0, wd0 * xb.d, s0);
+            s1 = std::fma(p1, wd1 * xb.d, s1);
+            s2 = std::fma(p2, wd2 * xb.d, s2);
+            s3 = std::fma(p3, wd3 * xb.d, s3);
+          }
+        }
+        dots[r * dots_ld + c + 0] = s0;
+        dots[r * dots_ld + c + 1] = s1;
+        dots[r * dots_ld + c + 2] = s2;
+        dots[r * dots_ld + c + 3] = s3;
       }
     }
   }
