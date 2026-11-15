@@ -106,7 +106,7 @@ inline __m512 Int3LookupAvx512(uint16_t s_bits, float scale, bool bf16) noexcept
 template <int RT, int BlockSize, bool ScaleIsBf16, bool DeferredScale>
 void Int3Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const uint16_t* scales,
                       int64_t n0, int64_t k, const float* a_natural, float (&result)[8][RT]) {
-  static_assert(RT == 1 || RT == 2, "Int3Group8Avx512 is specialized for RT=1,2");
+  static_assert(RT >= 1 && RT <= 4, "Int3Group8Avx512 is specialized for RT=1..4");
   static_assert(BlockSize == 32 || BlockSize == 64, "Int3Group8Avx512 requires BlockSize 32 or 64");
   const int64_t blocks = k / BlockSize;
   const int64_t raw_w_stride = (k * 3) / 8;
@@ -114,14 +114,35 @@ void Int3Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const u
   const __m512i shifts = _mm512_set_epi32(21, 18, 15, 12, 9, 6, 3, 0, 21, 18, 15, 12, 9, 6, 3, 0);
   const __m512i mask7 = _mm512_set1_epi32(7);
   const __m512i four = _mm512_set1_epi32(4);
-  __m512 acc0_0 = _mm512_setzero_ps(), acc0_1 = _mm512_setzero_ps();
-  __m512 acc1_0 = _mm512_setzero_ps(), acc1_1 = _mm512_setzero_ps();
-  __m512 acc2_0 = _mm512_setzero_ps(), acc2_1 = _mm512_setzero_ps();
-  __m512 acc3_0 = _mm512_setzero_ps(), acc3_1 = _mm512_setzero_ps();
-  __m512 acc4_0 = _mm512_setzero_ps(), acc4_1 = _mm512_setzero_ps();
-  __m512 acc5_0 = _mm512_setzero_ps(), acc5_1 = _mm512_setzero_ps();
-  __m512 acc6_0 = _mm512_setzero_ps(), acc6_1 = _mm512_setzero_ps();
-  __m512 acc7_0 = _mm512_setzero_ps(), acc7_1 = _mm512_setzero_ps();
+  const __m256 codes256 = _mm256_setr_ps(-4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f, 3.0f);
+  const __m256i one256 = _mm256_set1_epi32(1);
+  const __m256i bias256 = _mm256_set1_epi32(0x7fff);
+  const __m256i bf16_mask256 = _mm256_set1_epi32(static_cast<int>(0xffff0000u));
+  __m512 acc[8][RT];
+  for (int c = 0; c < 8; ++c) {
+    for (int r = 0; r < RT; ++r) {
+      acc[c][r] = _mm512_setzero_ps();
+    }
+  }
+
+  auto make_table = [&](uint16_t s_bits, float s_val) QMOE_LAMBDA_INLINE -> __m512 {
+    if constexpr (DeferredScale) {
+      return _mm512_set1_ps(s_val);
+    } else if constexpr (ScaleIsBf16) {
+      if ((s_bits & 0x7FFFu) < 0x7E80u) {
+        const __m256 values = _mm256_mul_ps(codes256, _mm256_set1_ps(s_val));
+        const __m256i bits = _mm256_castps_si256(values);
+        const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(bits, 16), one256);
+        const __m256i rounded = _mm256_and_si256(_mm256_add_epi32(bits, _mm256_add_epi32(bias256, lsb)), bf16_mask256);
+        return _mm512_broadcast_f32x8(_mm256_castsi256_ps(rounded));
+      }
+      return Int3LookupAvx512(s_bits, s_val, true);
+    } else {
+      const __m256 values = _mm256_mul_ps(codes256, _mm256_set1_ps(s_val));
+      return _mm512_broadcast_f32x8(
+          _mm256_cvtph_ps(_mm256_cvtps_ph(values, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC)));
+    }
+  };
 
   for (int64_t kb = 0; kb < blocks; ++kb) {
     const int64_t byte_off = kb * kBlockBytes;
@@ -139,7 +160,7 @@ void Int3Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const u
       a3_0 = _mm512_loadu_ps(a_natural + 0 * k + kb * BlockSize + 48);
     }
     __m512 a0_1, a1_1, a2_1, a3_1;
-    if constexpr (RT >= 2) {
+    if constexpr (RT == 2) {
       a0_1 = _mm512_loadu_ps(a_natural + 1 * k + kb * BlockSize);
       a1_1 = _mm512_loadu_ps(a_natural + 1 * k + kb * BlockSize + 16);
       if constexpr (BlockSize == 64) {
@@ -147,52 +168,56 @@ void Int3Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const u
         a3_1 = _mm512_loadu_ps(a_natural + 1 * k + kb * BlockSize + 48);
       }
     }
-    auto step_col = [&](int c, __m512& acc_r0, __m512& acc_r1) QMOE_LAMBDA_INLINE {
+    auto step_col = [&](int c) QMOE_LAMBDA_INLINE {
       const uint8_t* p = w_base + c * raw_w_stride + byte_off;
       const uint16_t s_bits = scales[(n0 + c) * blocks + kb];
       const float s_val = ScaleIsBf16 ? Avx512Int3BFloat16BitsToFloat(s_bits) : Avx512Int3HalfBitsToFloat(s_bits);
-      const __m512 table = DeferredScale ? _mm512_set1_ps(s_val) : Int3LookupAvx512(s_bits, s_val, ScaleIsBf16);
+      const __m512 table = make_table(s_bits, s_val);
       const __m512 w0 = UnpackDequant16Int3Avx512<DeferredScale>(p + 0, shifts, mask7, four, table);
       const __m512 w1 = UnpackDequant16Int3Avx512<DeferredScale>(p + 6, shifts, mask7, four, table);
-      __m512 prod0 = _mm512_fmadd_ps(w0, a0_0, _mm512_mul_ps(w1, a1_0));
-      __m512 prod1;
-      if constexpr (RT >= 2) {
-        prod1 = _mm512_fmadd_ps(w0, a0_1, _mm512_mul_ps(w1, a1_1));
-      }
+      __m512 w2, w3;
       if constexpr (BlockSize == 64) {
-        const __m512 w2 = UnpackDequant16Int3Avx512<DeferredScale>(p + 12, shifts, mask7, four, table);
-        const __m512 w3 = UnpackDequant16Int3Avx512<DeferredScale>(p + 18, shifts, mask7, four, table);
-        prod0 = _mm512_fmadd_ps(w2, a2_0, _mm512_fmadd_ps(w3, a3_0, prod0));
-        if constexpr (RT >= 2) {
-          prod1 = _mm512_fmadd_ps(w2, a2_1, _mm512_fmadd_ps(w3, a3_1, prod1));
+        w2 = UnpackDequant16Int3Avx512<DeferredScale>(p + 12, shifts, mask7, four, table);
+        w3 = UnpackDequant16Int3Avx512<DeferredScale>(p + 18, shifts, mask7, four, table);
+      }
+      if constexpr (RT <= 2) {
+        __m512 prod0 = _mm512_fmadd_ps(w0, a0_0, _mm512_mul_ps(w1, a1_0));
+        if constexpr (BlockSize == 64) {
+          prod0 = _mm512_fmadd_ps(w2, a2_0, _mm512_fmadd_ps(w3, a3_0, prod0));
+        }
+        acc[c][0] = DeferredScale ? _mm512_fmadd_ps(prod0, table, acc[c][0]) : _mm512_add_ps(prod0, acc[c][0]);
+        if constexpr (RT == 2) {
+          __m512 prod1 = _mm512_fmadd_ps(w0, a0_1, _mm512_mul_ps(w1, a1_1));
+          if constexpr (BlockSize == 64) {
+            prod1 = _mm512_fmadd_ps(w2, a2_1, _mm512_fmadd_ps(w3, a3_1, prod1));
+          }
+          acc[c][1] = DeferredScale ? _mm512_fmadd_ps(prod1, table, acc[c][1]) : _mm512_add_ps(prod1, acc[c][1]);
+        }
+      } else {
+        for (int r = 0; r < RT; ++r) {
+          const float* ar = a_natural + r * k + kb * BlockSize;
+          __m512 prod = _mm512_fmadd_ps(w0, _mm512_loadu_ps(ar), _mm512_mul_ps(w1, _mm512_loadu_ps(ar + 16)));
+          if constexpr (BlockSize == 64) {
+            prod = _mm512_fmadd_ps(w2, _mm512_loadu_ps(ar + 32), _mm512_fmadd_ps(w3, _mm512_loadu_ps(ar + 48), prod));
+          }
+          acc[c][r] = DeferredScale ? _mm512_fmadd_ps(prod, table, acc[c][r]) : _mm512_add_ps(prod, acc[c][r]);
         }
       }
-      acc_r0 = DeferredScale ? _mm512_fmadd_ps(prod0, table, acc_r0) : _mm512_add_ps(prod0, acc_r0);
-      if constexpr (RT >= 2) {
-        acc_r1 = DeferredScale ? _mm512_fmadd_ps(prod1, table, acc_r1) : _mm512_add_ps(prod1, acc_r1);
-      }
     };
-    step_col(0, acc0_0, acc0_1);
-    step_col(1, acc1_0, acc1_1);
-    step_col(2, acc2_0, acc2_1);
-    step_col(3, acc3_0, acc3_1);
-    step_col(4, acc4_0, acc4_1);
-    step_col(5, acc5_0, acc5_1);
-    step_col(6, acc6_0, acc6_1);
-    step_col(7, acc7_0, acc7_1);
+    step_col(0);
+    step_col(1);
+    step_col(2);
+    step_col(3);
+    step_col(4);
+    step_col(5);
+    step_col(6);
+    step_col(7);
   }
-  auto store_col = [&](int c, __m512 a0, __m512 a1) QMOE_LAMBDA_INLINE {
-    result[c][0] = _mm512_reduce_add_ps(a0);
-    if constexpr (RT >= 2) result[c][1] = _mm512_reduce_add_ps(a1);
-  };
-  store_col(0, acc0_0, acc0_1);
-  store_col(1, acc1_0, acc1_1);
-  store_col(2, acc2_0, acc2_1);
-  store_col(3, acc3_0, acc3_1);
-  store_col(4, acc4_0, acc4_1);
-  store_col(5, acc5_0, acc5_1);
-  store_col(6, acc6_0, acc6_1);
-  store_col(7, acc7_0, acc7_1);
+  for (int c = 0; c < 8; ++c) {
+    for (int r = 0; r < RT; ++r) {
+      result[c][r] = _mm512_reduce_add_ps(acc[c][r]);
+    }
+  }
 }
 
 template <int RT, int BlockSize, bool ScaleIsBf16, bool DeferredScale>
@@ -271,7 +296,7 @@ void Int3RowTileAvx512(const uint8_t* weights, const uint16_t* scales, const uin
   }
   const int64_t raw_w_stride = (k * 3) / 8;
   int64_t n0 = n_begin;
-  if constexpr (RT <= 2) {
+  if constexpr (RT <= 4) {
     if (block_size == 32 || block_size == 64) {
       for (; n0 + 8 <= n_end; n0 += 8) {
         const uint8_t* w_base = weights + n0 * raw_w_stride;

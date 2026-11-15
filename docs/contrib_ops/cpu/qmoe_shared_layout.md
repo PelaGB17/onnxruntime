@@ -79,7 +79,10 @@ for an infinite gate on the side where `exp(-alpha * gate)` overflows. FC1 range
 bounds); invalid ranges return false without writing output.
 
 Scalar, runtime-dispatched AVX2, and runtime-dispatched AVX-512 implementations
-read the same banks. Code extraction, activation permutation, scale decoding,
+read the same banks. On AVX-512 hosts, SM80 INT4, row-local INT3 (`block_size` 32 or 64),
+and SM80 INT2 all use 8-column multi-row (`RT = 1..4`) inner tiles, 16-wide SIMD SwiGLU
+evaluation with boundary rounding, and vectorized 32-/64-element activation reordering.
+Code extraction, activation permutation, scale decoding,
 and boundary rounding happen inside the consuming kernel. No alternate weight
 matrices or panels are materialized.
 

@@ -210,19 +210,18 @@ template <int RT, bool WeightsPrepacked, bool ScalesBlockMajor, bool ScaleIsBf16
 void Int4Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const uint16_t* scales,
                       int64_t n_total, int64_t n0, int64_t k,
                       const float* a_reordered, float (&result)[8][RT]) {
+  static_assert(RT >= 1 && RT <= 4, "Int4Group8Avx512 is specialized for RT=1..4");
   const int64_t blocks = k / kBlockSize;
   const int64_t group_stride = kColumnsInterleaved * k / 2;
   const int64_t raw_w_stride = k / 2;
   const __m128i mask = _mm_set1_epi8(0x0F);
   const __m512i eight = _mm512_set1_epi32(8);
-  __m512 acc0_0 = _mm512_setzero_ps(), acc0_1 = _mm512_setzero_ps();
-  __m512 acc1_0 = _mm512_setzero_ps(), acc1_1 = _mm512_setzero_ps();
-  __m512 acc2_0 = _mm512_setzero_ps(), acc2_1 = _mm512_setzero_ps();
-  __m512 acc3_0 = _mm512_setzero_ps(), acc3_1 = _mm512_setzero_ps();
-  __m512 acc4_0 = _mm512_setzero_ps(), acc4_1 = _mm512_setzero_ps();
-  __m512 acc5_0 = _mm512_setzero_ps(), acc5_1 = _mm512_setzero_ps();
-  __m512 acc6_0 = _mm512_setzero_ps(), acc6_1 = _mm512_setzero_ps();
-  __m512 acc7_0 = _mm512_setzero_ps(), acc7_1 = _mm512_setzero_ps();
+  __m512 acc[8][RT];
+  for (int c = 0; c < 8; ++c) {
+    for (int r = 0; r < RT; ++r) {
+      acc[c][r] = _mm512_setzero_ps();
+    }
+  }
 
   const uint8_t* w_base1 = WeightsPrepacked ? (w_base + group_stride) : (w_base + 4 * raw_w_stride);
   for (int64_t kb = 0; kb < blocks; ++kb) {
@@ -235,14 +234,14 @@ void Int4Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const u
         _mm_prefetch(reinterpret_cast<const char*>(next_w_base + group_stride + pf_off), _MM_HINT_T0);
       }
     }
-    const __m512 al0 = _mm512_loadu_ps(a_reordered + 0 * k + kb * kBlockSize);
-    const __m512 ah0 = _mm512_loadu_ps(a_reordered + 0 * k + kb * kBlockSize + 16);
-    __m512 al1, ah1;
-    if constexpr (RT >= 2) {
-      al1 = _mm512_loadu_ps(a_reordered + 1 * k + kb * kBlockSize);
-      ah1 = _mm512_loadu_ps(a_reordered + 1 * k + kb * kBlockSize + 16);
+    __m512 al[RT], ah[RT];
+    if constexpr (RT <= 2) {
+      for (int r = 0; r < RT; ++r) {
+        al[r] = _mm512_loadu_ps(a_reordered + r * k + kb * kBlockSize);
+        ah[r] = _mm512_loadu_ps(a_reordered + r * k + kb * kBlockSize + 16);
+      }
     }
-    auto step_col = [&](int c, const uint8_t* byte_ptr, __m512& a0, __m512& a1) QMOE_LAMBDA_INLINE {
+    auto step_col = [&](int c, const uint8_t* byte_ptr) QMOE_LAMBDA_INLINE {
       const __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(byte_ptr));
       const __m512i lo32 = _mm512_cvtepu8_epi32(_mm_and_si128(x, mask));
       const __m512i hi32 = _mm512_cvtepu8_epi32(_mm_and_si128(_mm_srli_epi16(x, 4), mask));
@@ -258,34 +257,27 @@ void Int4Group8Avx512(const uint8_t* w_base, const uint8_t* next_w_base, const u
         wh = _mm512_cvtepi32_ps(_mm512_sub_epi32(hi32, eight));
       }
       const __m512 s = _mm512_set1_ps(DeferredScale ? s_val : 1.0f);
-      const __m512 prod0 = _mm512_fmadd_ps(wl, al0, _mm512_mul_ps(wh, ah0));
-      a0 = DeferredScale ? _mm512_fmadd_ps(prod0, s, a0) : _mm512_add_ps(prod0, a0);
-      if constexpr (RT >= 2) {
-        const __m512 prod1 = _mm512_fmadd_ps(wl, al1, _mm512_mul_ps(wh, ah1));
-        a1 = DeferredScale ? _mm512_fmadd_ps(prod1, s, a1) : _mm512_add_ps(prod1, a1);
+      for (int r = 0; r < RT; ++r) {
+        const __m512 ar_lo = (RT <= 2) ? al[r] : _mm512_loadu_ps(a_reordered + r * k + kb * kBlockSize);
+        const __m512 ar_hi = (RT <= 2) ? ah[r] : _mm512_loadu_ps(a_reordered + r * k + kb * kBlockSize + 16);
+        const __m512 prod = _mm512_fmadd_ps(wl, ar_lo, _mm512_mul_ps(wh, ar_hi));
+        acc[c][r] = DeferredScale ? _mm512_fmadd_ps(prod, s, acc[c][r]) : _mm512_add_ps(prod, acc[c][r]);
       }
     };
-    step_col(0, WeightsPrepacked ? (tile0 + 0 * 32) : (w_base + 0 * raw_w_stride + kb * 16), acc0_0, acc0_1);
-    step_col(1, WeightsPrepacked ? (tile0 + 1 * 32) : (w_base + 1 * raw_w_stride + kb * 16), acc1_0, acc1_1);
-    step_col(2, WeightsPrepacked ? (tile0 + 2 * 32) : (w_base + 2 * raw_w_stride + kb * 16), acc2_0, acc2_1);
-    step_col(3, WeightsPrepacked ? (tile0 + 3 * 32) : (w_base + 3 * raw_w_stride + kb * 16), acc3_0, acc3_1);
-    step_col(4, WeightsPrepacked ? (tile1 + 0 * 32) : (w_base + 4 * raw_w_stride + kb * 16), acc4_0, acc4_1);
-    step_col(5, WeightsPrepacked ? (tile1 + 1 * 32) : (w_base + 5 * raw_w_stride + kb * 16), acc5_0, acc5_1);
-    step_col(6, WeightsPrepacked ? (tile1 + 2 * 32) : (w_base + 6 * raw_w_stride + kb * 16), acc6_0, acc6_1);
-    step_col(7, WeightsPrepacked ? (tile1 + 3 * 32) : (w_base + 7 * raw_w_stride + kb * 16), acc7_0, acc7_1);
+    step_col(0, WeightsPrepacked ? (tile0 + 0 * 32) : (w_base + 0 * raw_w_stride + kb * 16));
+    step_col(1, WeightsPrepacked ? (tile0 + 1 * 32) : (w_base + 1 * raw_w_stride + kb * 16));
+    step_col(2, WeightsPrepacked ? (tile0 + 2 * 32) : (w_base + 2 * raw_w_stride + kb * 16));
+    step_col(3, WeightsPrepacked ? (tile0 + 3 * 32) : (w_base + 3 * raw_w_stride + kb * 16));
+    step_col(4, WeightsPrepacked ? (tile1 + 0 * 32) : (w_base + 4 * raw_w_stride + kb * 16));
+    step_col(5, WeightsPrepacked ? (tile1 + 1 * 32) : (w_base + 5 * raw_w_stride + kb * 16));
+    step_col(6, WeightsPrepacked ? (tile1 + 2 * 32) : (w_base + 6 * raw_w_stride + kb * 16));
+    step_col(7, WeightsPrepacked ? (tile1 + 3 * 32) : (w_base + 7 * raw_w_stride + kb * 16));
   }
-  auto store_col = [&](int c, __m512 a0, __m512 a1) QMOE_LAMBDA_INLINE {
-    result[c][0] = _mm512_reduce_add_ps(a0);
-    if constexpr (RT >= 2) result[c][1] = _mm512_reduce_add_ps(a1);
-  };
-  store_col(0, acc0_0, acc0_1);
-  store_col(1, acc1_0, acc1_1);
-  store_col(2, acc2_0, acc2_1);
-  store_col(3, acc3_0, acc3_1);
-  store_col(4, acc4_0, acc4_1);
-  store_col(5, acc5_0, acc5_1);
-  store_col(6, acc6_0, acc6_1);
-  store_col(7, acc7_0, acc7_1);
+  for (int c = 0; c < 8; ++c) {
+    for (int r = 0; r < RT; ++r) {
+      result[c][r] = _mm512_reduce_add_ps(acc[c][r]);
+    }
+  }
 }
 
 template <int RT, bool WeightsPrepacked, bool ScalesBlockMajor, bool ScaleIsBf16, bool DeferredScale>
@@ -377,7 +369,7 @@ void Int4RowTileAvx512(const uint8_t* weights, const uint16_t* scales, const uin
     }
     const int64_t group_stride = kColumnsInterleaved * k / 2;
     int64_t n0 = aligned_begin;
-    if constexpr (RT <= 2) {
+    if constexpr (RT <= 4) {
       for (; n0 + 8 <= aligned_end; n0 += 8) {
         const uint8_t* group = weights + (n0 / kColumnsInterleaved) * group_stride;
         const uint8_t* next_group = (n0 + 16 <= aligned_end) ? (group + 2 * group_stride) : nullptr;
@@ -583,6 +575,160 @@ void Avx512FloatToBFloat16BitsRow(const float* src, uint16_t* dst, int64_t count
     _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), out16);
   }
   for (; i < count; ++i) dst[i] = FloatToBFloat16(src[i]);
+}
+
+namespace {
+
+inline __m512 Avx512RoundFp16Vec(__m512 v) noexcept {
+  return _mm512_cvtph_ps(_mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+
+inline __m512 Avx512ExpVec16(__m512 x) noexcept {
+  // Cody-Waite range reduction x = n * ln2 + r, |r| <= ln2 / 2, degree-7 minimax polynomial (~0.50 ULP).
+  const __m512 x_clamped = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(-103.9720840454f)), _mm512_set1_ps(88.72283905f));
+  const __m512 inv_ln2 = _mm512_set1_ps(1.44269504088896341f);
+  const __m512 ln2_hi = _mm512_set1_ps(0.693145751953125f);
+  const __m512 ln2_lo = _mm512_set1_ps(1.428606765330187045e-6f);
+  const __m512 n = _mm512_roundscale_ps(_mm512_mul_ps(x_clamped, inv_ln2), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  const __m512 r = _mm512_fnmadd_ps(n, ln2_lo, _mm512_fnmadd_ps(n, ln2_hi, x_clamped));
+
+  __m512 p = _mm512_set1_ps(1.98756915e-4f);
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.39819995e-3f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(8.33345190e-3f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(4.16657959e-2f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.66666657e-1f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.00000012e-1f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+
+  const __m512 res = _mm512_scalef_ps(p, n);
+  const __mmask16 underflow = _mm512_cmp_ps_mask(x, _mm512_set1_ps(-103.9720840454f), _CMP_LT_OQ);
+  const __mmask16 overflow = _mm512_cmp_ps_mask(x, _mm512_set1_ps(88.72283905f), _CMP_GT_OQ);
+  const __mmask16 is_nan = _mm512_cmp_ps_mask(x, x, _CMP_UNORD_Q);
+  __m512 out = _mm512_mask_mov_ps(res, underflow, _mm512_setzero_ps());
+  out = _mm512_mask_mov_ps(out, overflow, _mm512_castsi512_ps(_mm512_set1_epi32(0x7F800000)));
+  return _mm512_mask_mov_ps(out, is_nan, x);
+}
+
+inline __m512 Avx512EvalSwiGlu16(__m512 gate, __m512 up, float alpha, float beta, float limit,
+                                 bool has_limit, bool bf16_out, bool fp16_out) noexcept {
+  if (has_limit) {
+    const __m512 vlim = _mm512_set1_ps(limit);
+    const __m512 vnlim = _mm512_set1_ps(-limit);
+    gate = _mm512_min_ps(gate, vlim);
+    up = _mm512_min_ps(_mm512_max_ps(up, vnlim), vlim);
+  }
+  const __m512 neg_ag = _mm512_mul_ps(_mm512_set1_ps(-alpha), gate);
+  const __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), Avx512ExpVec16(neg_ag));
+  __m512 silu = _mm512_div_ps(gate, denom);
+  // Match scalar limit: when exp(-alpha * gate) overflows to +inf for +/-inf gate, silu is 0.
+  const __m512 pos_inf = _mm512_castsi512_ps(_mm512_set1_epi32(0x7F800000));
+  const __m512 neg_inf = _mm512_castsi512_ps(_mm512_set1_epi32(static_cast<int>(0xFF800000u)));
+  if (alpha > 0.0f) {
+    silu = _mm512_mask_mov_ps(silu, _mm512_cmp_ps_mask(gate, neg_inf, _CMP_EQ_OQ), _mm512_setzero_ps());
+  } else if (alpha < 0.0f) {
+    silu = _mm512_mask_mov_ps(silu, _mm512_cmp_ps_mask(gate, pos_inf, _CMP_EQ_OQ), _mm512_setzero_ps());
+  }
+  __m512 act = _mm512_mul_ps(silu, _mm512_add_ps(up, _mm512_set1_ps(beta)));
+  if (bf16_out) return Avx512RoundBf16Vec(act);
+  if (fp16_out) return Avx512RoundFp16Vec(act);
+  return act;
+}
+
+}  // namespace
+
+void Avx512ReorderInt4Row(const float* src, float* dst, int64_t k) noexcept {
+  const __m512i idx_lo = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+  const __m512i idx_hi = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+  for (int64_t off = 0; off < k; off += 32) {
+    const __m512 v0 = _mm512_loadu_ps(src + off);
+    const __m512 v1 = _mm512_loadu_ps(src + off + 16);
+    _mm512_storeu_ps(dst + off, _mm512_permutex2var_ps(v0, idx_lo, v1));
+    _mm512_storeu_ps(dst + off + 16, _mm512_permutex2var_ps(v0, idx_hi, v1));
+  }
+}
+
+void Avx512ReorderInt2Row(const float* src, float* dst, int64_t k) noexcept {
+  const __m512i idx_lo = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+  const __m512i idx_hi = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+  for (int64_t off = 0; off < k; off += 64) {
+    const __m512 v0 = _mm512_loadu_ps(src + off + 0);
+    const __m512 v1 = _mm512_loadu_ps(src + off + 16);
+    const __m512 v2 = _mm512_loadu_ps(src + off + 32);
+    const __m512 v3 = _mm512_loadu_ps(src + off + 48);
+    _mm512_storeu_ps(dst + off + 0, _mm512_permutex2var_ps(v0, idx_lo, v2));
+    _mm512_storeu_ps(dst + off + 16, _mm512_permutex2var_ps(v0, idx_hi, v2));
+    _mm512_storeu_ps(dst + off + 32, _mm512_permutex2var_ps(v1, idx_lo, v3));
+    _mm512_storeu_ps(dst + off + 48, _mm512_permutex2var_ps(v1, idx_hi, v3));
+  }
+}
+
+// out_order: 0 = natural, 1 = prepacked INT4 (32-block interleave), 2 = prepacked INT2 (64-block interleave).
+void Avx512SwiGluInterleavedPairs(const float* row_tmp, const uint16_t* bias_u16, bool bias_is_bf16,
+                                  bool round_proj_before_bias, int64_t pair_count,
+                                  float alpha, float beta, float limit,
+                                  bool bf16_boundaries, bool fp16_boundaries,
+                                  int out_order, float* dst) noexcept {
+  const __m512i even_idx = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+  const __m512i odd_idx = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+  const __m512i idx_lo = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+  const __m512i idx_hi = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+  const bool has_limit = (limit < 3.402823466e38f);
+
+  auto eval16 = [&](int64_t p0) QMOE_LAMBDA_INLINE -> __m512 {
+    __m512 v0 = _mm512_loadu_ps(row_tmp + 2 * p0);
+    __m512 v1 = _mm512_loadu_ps(row_tmp + 2 * p0 + 16);
+    if (round_proj_before_bias) {
+      if (bf16_boundaries) {
+        v0 = Avx512RoundBf16Vec(v0);
+        v1 = Avx512RoundBf16Vec(v1);
+      } else if (fp16_boundaries) {
+        v0 = Avx512RoundFp16Vec(v0);
+        v1 = Avx512RoundFp16Vec(v1);
+      }
+    }
+    if (bias_u16 != nullptr) {
+      __m512 b0, b1;
+      if (bias_is_bf16) {
+        b0 = _mm512_castsi512_ps(_mm512_slli_epi32(
+            _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(bias_u16 + 2 * p0))), 16));
+        b1 = _mm512_castsi512_ps(_mm512_slli_epi32(
+            _mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(bias_u16 + 2 * p0 + 16))), 16));
+      } else {
+        b0 = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(bias_u16 + 2 * p0)));
+        b1 = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(bias_u16 + 2 * p0 + 16)));
+      }
+      v0 = _mm512_add_ps(v0, b0);
+      v1 = _mm512_add_ps(v1, b1);
+    }
+    const __m512 gate = _mm512_permutex2var_ps(v0, even_idx, v1);
+    const __m512 up = _mm512_permutex2var_ps(v0, odd_idx, v1);
+    return Avx512EvalSwiGlu16(gate, up, alpha, beta, limit, has_limit, bf16_boundaries, fp16_boundaries);
+  };
+
+  if (out_order == 2) {
+    for (int64_t p0 = 0; p0 < pair_count; p0 += 64) {
+      const __m512 a0 = eval16(p0 + 0);
+      const __m512 a1 = eval16(p0 + 16);
+      const __m512 a2 = eval16(p0 + 32);
+      const __m512 a3 = eval16(p0 + 48);
+      _mm512_storeu_ps(dst + p0 + 0, _mm512_permutex2var_ps(a0, idx_lo, a2));
+      _mm512_storeu_ps(dst + p0 + 16, _mm512_permutex2var_ps(a0, idx_hi, a2));
+      _mm512_storeu_ps(dst + p0 + 32, _mm512_permutex2var_ps(a1, idx_lo, a3));
+      _mm512_storeu_ps(dst + p0 + 48, _mm512_permutex2var_ps(a1, idx_hi, a3));
+    }
+  } else if (out_order == 1) {
+    for (int64_t p0 = 0; p0 < pair_count; p0 += 32) {
+      const __m512 a0 = eval16(p0 + 0);
+      const __m512 a1 = eval16(p0 + 16);
+      _mm512_storeu_ps(dst + p0 + 0, _mm512_permutex2var_ps(a0, idx_lo, a1));
+      _mm512_storeu_ps(dst + p0 + 16, _mm512_permutex2var_ps(a0, idx_hi, a1));
+    }
+  } else {
+    for (int64_t p0 = 0; p0 < pair_count; p0 += 16) {
+      _mm512_storeu_ps(dst + p0, eval16(p0));
+    }
+  }
 }
 
 }  // namespace detail

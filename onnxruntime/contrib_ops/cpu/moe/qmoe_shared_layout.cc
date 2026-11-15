@@ -139,6 +139,13 @@ void Avx512HalfBitsToFloatRow(const uint16_t* src, float* dst, int64_t count);
 void Avx512FloatToHalfBitsRow(const float* src, uint16_t* dst, int64_t count);
 void Avx512BFloat16BitsToFloatRow(const uint16_t* src, float* dst, int64_t count);
 void Avx512FloatToBFloat16BitsRow(const float* src, uint16_t* dst, int64_t count);
+void Avx512ReorderInt4Row(const float* src, float* dst, int64_t k) noexcept;
+void Avx512ReorderInt2Row(const float* src, float* dst, int64_t k) noexcept;
+void Avx512SwiGluInterleavedPairs(const float* row_tmp, const uint16_t* bias_u16, bool bias_is_bf16,
+                                  bool round_proj_before_bias, int64_t pair_count,
+                                  float alpha, float beta, float limit,
+                                  bool bf16_boundaries, bool fp16_boundaries,
+                                  int out_order, float* dst) noexcept;
 void SetFp4Group8MaskOverride(int mask) noexcept;
 }  // namespace detail
 #endif
@@ -2262,6 +2269,12 @@ int ReorderedPosition(int k_offset_in_block) {
 }
 
 void ReorderActivationRow(const float* src, float* dst, int64_t k) {
+#if QMOE_COMPILER_SUPPORTS_AVX512
+  if (CpuHasAvx512() && (k % 32) == 0) {
+    detail::Avx512ReorderInt4Row(src, dst, k);
+    return;
+  }
+#endif
   for (int64_t kb = 0; kb < k / kBlockSize; ++kb) {
     const float* s = src + kb * kBlockSize;
     float* d = dst + kb * kBlockSize;
@@ -2284,6 +2297,12 @@ void ReorderRawInt4ActivationRow(const float* src, float* dst, int64_t k) {
 }
 
 void ReorderInt2ActivationRow(const float* src, float* dst, int64_t k) {
+#if QMOE_COMPILER_SUPPORTS_AVX512
+  if (CpuHasAvx512() && (k % 64) == 0) {
+    detail::Avx512ReorderInt2Row(src, dst, k);
+    return;
+  }
+#endif
   for (int64_t kb64 = 0; kb64 < k / 64; ++kb64) {
     const float* s = src + kb64 * 64;
     float* d = dst + kb64 * 64;
@@ -2645,6 +2664,15 @@ void Int4Fc1SwiGluRange(int64_t hidden, int64_t inter, const Int4ExpertView& vie
     for (int64_t r = 0; r < m; ++r) {
       const float* row_tmp = tmp + r * kChunk;
       float* row_out = inter_reordered + r * inter;
+#if QMOE_COMPILER_SUPPORTS_AVX512
+      if (!force_scalar && CpuHasAvx512() && view.weights_are_prepacked && ((nb & 63) == 0) &&
+          (((ne - nb) & 63) == 0) && std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx512SwiGluInterleavedPairs(row_tmp, nullptr, false, false, (ne - nb) / 2,
+                                             swiglu.alpha, swiglu.beta, swiglu.limit,
+                                             bf16_boundaries, fp16_boundaries, 1, row_out + (nb / 2));
+        continue;
+      }
+#endif
       for (int64_t n = nb; n < ne; n += 2) {
         const int64_t j = n / 2;
         const int pos = view.weights_are_prepacked ? ReorderedPosition(static_cast<int>(j & 31))
@@ -2770,6 +2798,15 @@ void Int3Fc1SwiGluRange(int64_t hidden, int64_t inter, const Int3ExpertView& vie
     for (int64_t r = 0; r < m; ++r) {
       const float* row_tmp = tmp + r * kChunk;
       float* row_out = inter_natural + r * inter;
+#if QMOE_COMPILER_SUPPORTS_AVX512
+      if (!force_scalar && CpuHasAvx512() && ((nb & 31) == 0) && (((ne - nb) & 31) == 0) &&
+          std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx512SwiGluInterleavedPairs(row_tmp, nullptr, false, false, (ne - nb) / 2,
+                                             swiglu.alpha, swiglu.beta, swiglu.limit,
+                                             bf16_boundaries, fp16_boundaries, 0, row_out + (nb / 2));
+        continue;
+      }
+#endif
       for (int64_t n = nb; n < ne; n += 2) {
         const int64_t j = n / 2;
         const float gate_projection = row_tmp[n - nb];
@@ -2941,6 +2978,17 @@ bool Int2Fc1SwiGluRange(int64_t hidden, int64_t inter, const Int2ExpertView& vie
     for (int64_t r = 0; r < m; ++r) {
       float* row_tmp = tmp + r * kChunk;
       float* row_out = inter_reordered + r * inter;
+#if QMOE_COMPILER_SUPPORTS_AVX512
+      if (!force_scalar && CpuHasAvx512() && view.weights_are_prepacked && !view.bias_is_fp32 &&
+          ((nb & 127) == 0) && (((ne - nb) & 127) == 0) &&
+          std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx512SwiGluInterleavedPairs(row_tmp, view.fc1_bias ? (view.fc1_bias + nb) : nullptr,
+                                             view.bias_is_bf16, true, (ne - nb) / 2,
+                                             swiglu.alpha, swiglu.beta, swiglu.limit,
+                                             bf16_boundaries, fp16_boundaries, 2, row_out + (nb / 2));
+        continue;
+      }
+#endif
       for (int64_t n = nb; n < ne; n += 2) {
         const int64_t j = n / 2;
         const int pos = view.weights_are_prepacked ? Int2ReorderedPosition(static_cast<int>(j & 63))

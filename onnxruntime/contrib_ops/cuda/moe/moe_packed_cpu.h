@@ -16,6 +16,9 @@
 
 namespace onnxruntime {
 namespace contrib {
+namespace gguf_quant {
+struct GgufQ8Block;
+}  // namespace gguf_quant
 namespace cuda {
 namespace moe_packed_cpu {
 
@@ -40,6 +43,38 @@ bool GgufDualDot2ChAvx2(const uint8_t* gate_row0, const uint8_t* up_row0, const 
 // dots[r * dots_ld + i] = dot(row_i, x_rows[r]). Returns n, or 0 when `type` has no AVX2 kernel.
 int GgufDotRowsBy4Avx2(const uint8_t* row0, size_t row_bytes, int n_rows, int type, int K,
                        const float* const* x_rows, int R, float* dots, int dots_ld);
+
+// AVX2 Q8 INT8 (`vpmaddubsw`) helpers implemented in moe_packed_cpu_avx2.cc (works on MSVC, GCC, and Clang).
+void ConvertHalfRowAvx2(const uint16_t* src, bool is_bf16, float* dst, int K) noexcept;
+void QuantizeRowQ8Avx2(const float* src, int K, onnxruntime::contrib::gguf_quant::GgufQ8Block* dst) noexcept;
+bool GgufDualDot2ChQ8Avx2(int type, const uint8_t* g0, const uint8_t* g1, const uint8_t* u0, const uint8_t* u1,
+                          const onnxruntime::contrib::gguf_quant::GgufQ8Block* const* x_q8_rows, int R, int K,
+                          float* g_dots0, float* u_dots0, float* g_dots1, float* u_dots1) noexcept;
+int GgufDotRowsBy4Q8Avx2(int type, const uint8_t* row0, size_t row_bytes, int n_rows,
+                         const onnxruntime::contrib::gguf_quant::GgufQ8Block* x_q8_base, size_t q8_stride,
+                         int R, int K, float* dots, int dots_ld) noexcept;
+
+// Runtime detection and AVX-512BW + AVX-512VL + AVX-512VNNI (`vpdpbusd`) 256-bit EVEX Q8 INT8 kernels
+// implemented in moe_packed_cpu_avx512.cc.
+bool CpuHasAvx512Vnni() noexcept;
+void ConvertAndQuantizeRowQ8Avx512(const uint16_t* src, bool is_bf16, float* dst_f32, int K,
+                                   onnxruntime::contrib::gguf_quant::GgufQ8Block* dst_q8) noexcept;
+void QuantizeRowQ8Avx512(const float* src, int K, onnxruntime::contrib::gguf_quant::GgufQ8Block* dst) noexcept;
+void SwiGLURoundAndQuantize32Avx512(const float* gate32, const float* up32, bool is_bf16,
+                                    float* dst_inter32,
+                                    onnxruntime::contrib::gguf_quant::GgufQ8Block* dst_q8) noexcept;
+bool GgufFc1Tile32SwiGLUQ8Avx512Vnni(int type, const uint8_t* gate_tile0, size_t gate_row_bytes,
+                                     const uint8_t* up_tile0, size_t up_row_bytes,
+                                     const onnxruntime::contrib::gguf_quant::GgufQ8Block* const* x_q8_rows,
+                                     int R, int K, bool is_bf16,
+                                     onnxruntime::contrib::gguf_quant::GgufQ8Block* dst_inter_q8,
+                                     size_t inter_q8_stride) noexcept;
+bool GgufDualDot2ChQ8Avx512Vnni(int type, const uint8_t* g0, const uint8_t* g1, const uint8_t* u0, const uint8_t* u1,
+                                const onnxruntime::contrib::gguf_quant::GgufQ8Block* const* x_q8_rows, int R, int K,
+                                float* g_dots0, float* u_dots0, float* g_dots1, float* u_dots1) noexcept;
+int GgufDotRowsBy4Q8Avx512Vnni(int type, const uint8_t* row0, size_t row_bytes, int n_rows,
+                               const onnxruntime::contrib::gguf_quant::GgufQ8Block* x_q8_base, size_t q8_stride,
+                               int R, int K, float* dots, int dots_ld) noexcept;
 #endif
 
 }  // namespace moe_packed_cpu

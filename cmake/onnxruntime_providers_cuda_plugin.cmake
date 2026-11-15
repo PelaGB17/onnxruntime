@@ -34,6 +34,16 @@ if(MSVC AND onnxruntime_target_platform STREQUAL "x64")
     "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/moe/moe_packed_cpu_avx2.cc"
     PROPERTIES COMPILE_FLAGS "/arch:AVX2"
   )
+  set_source_files_properties(
+    "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/moe/moe_packed_cpu_avx512.cc"
+    PROPERTIES COMPILE_FLAGS "/arch:AVX512"
+  )
+elseif(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
+       (NOT APPLE OR NOT CMAKE_OSX_ARCHITECTURES OR CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64"))
+  set_source_files_properties(
+    "${ONNXRUNTIME_ROOT}/contrib_ops/cuda/moe/moe_packed_cpu_avx512.cc"
+    PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni -mbmi2 -mfma -mf16c"
+  )
 endif()
 
 file(GLOB_RECURSE CUDA_CONTRIB_OPS_CU_SRCS CONFIGURE_DEPENDS
