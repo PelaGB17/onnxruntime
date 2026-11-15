@@ -57,7 +57,7 @@ CausalConvWithState<T>::CausalConvWithState(const OpKernelInfo& info) : CudaKern
   has_state_update_output_ = causal_conv_with_state_helper::HasOutput(info, 2);
   ORT_ENFORCE(input_channels_ >= 0 && input_channel_offset_ >= 0 && state_length_ >= 0 &&
                   state_channels_last_ >= -1 && state_channels_last_ <= 1 &&
-                  state_update_capacity_ >= 0 && state_update_capacity_ <= 8,
+                  state_update_capacity_ >= 0 && state_update_capacity_ <= kMaxStateUpdateCapacity,
               "invalid packed-channel or state attributes");
 }
 

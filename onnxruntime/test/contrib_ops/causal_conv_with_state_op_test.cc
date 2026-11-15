@@ -3402,7 +3402,7 @@ TEST(ContribOpVarlenCausalConvWithStateTest, RejectsMalformedCaptureCountShape) 
 
 TEST(ContribOpVarlenCausalConvWithStateTest, StateUpdateCapacityIsBounded) {
   OpTester tester("VarlenCausalConvWithState", 1, onnxruntime::kMSDomain);
-  tester.AddAttribute<int64_t>("state_update_capacity", 9);
+  tester.AddAttribute<int64_t>("state_update_capacity", 17);
   tester.AddInput<float>("input", {1, 1}, {1.0f});
   tester.AddInput<float>("weight", {1, 1, 2}, {1.0f, 1.0f});
   tester.AddInput<int32_t>("cumulative_sequence_length", {2}, {0, 1});
@@ -3411,8 +3411,20 @@ TEST(ContribOpVarlenCausalConvWithStateTest, StateUpdateCapacityIsBounded) {
   tester.AddInput<int32_t>("capture_count", {1}, {1});
   tester.AddOutput<float>("output", {1, 1}, {1.0f});
   tester.AddOutput<float>("final_state", {1, 1, 1}, {1.0f});
-  tester.AddOutput<float>("state_update", {1, 9, 1}, std::vector<float>(9, 0.0f));
-  tester.Run(OpTester::ExpectResult::kExpectFailure, "state_update_capacity must be in [0, 8]");
+  tester.AddOutput<float>("state_update", {1, 17, 1}, std::vector<float>(17, 0.0f));
+  tester.Run(OpTester::ExpectResult::kExpectFailure, "state_update_capacity must be in [0, 16]");
+}
+
+TEST(ContribOpVarlenCausalConvWithStateTest, StateUpdateCapacity15WideBlock) {
+  VarlenCausalConvCase c;
+  c.seq_lens = {16, 12};
+  c.channels = 8;
+  c.kernel_size = 4;
+  c.with_initial_state = true;
+  c.state_update_capacity = 15;
+  c.capture_count = {15, 11};
+  c.verify_compact_replay = true;
+  RunVarlenCausalConvCase(c);
 }
 
 TEST(ContribOpVarlenCausalConvWithStateTest, CpuFloatFp16Bf16RaggedDilationAndCompactCapture) {

@@ -602,13 +602,14 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
                             (parameters.block_size % kXqaTokensPerPage) == 0 &&
                             is_supported_quant_type(k_quant_type_) && is_supported_quant_type(v_quant_type_) &&
                             (!is_fp8_cache || device_prop.major >= 9 || (device_prop.major == 8 && device_prop.minor == 9)));
-  // Speculative verification steps (2..8 new tokens per sequence) run on a compiled paged XQA
+  // Speculative verification steps (2..16 new tokens per sequence) run on a compiled paged XQA
   // specialization (H256, plus causal H128 INT8 and BF16/INT4) with a packed mask built by
   // PagedXqaSpecDecMaskKernel. The gate is the
   // metadata query bound, not the aggregate token count: a zero-heavy ragged step can have
   // token_count <= batch_size while still carrying a multi-token sequence. Local windows and
   // attention sinks stay eligible: the kernel's rows are flattened (query token, query head) pairs,
   // so it derives the window from each row's own query position and the sink from its own head.
+  constexpr int kMaxSpecDecQueryLen = 16;
   const bool bf16_int8_spec_xqa_eligible =
       quantized_xqa_eligible && std::is_same<T, BFloat16>::value && kIsInt8Cache &&
       ((parameters.head_size == 256 && (group_size == 6 || group_size == 16)) ||
@@ -623,9 +624,9 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
       ((parameters.head_size == 256) ||
        (parameters.head_size == 128 && parameters.is_causal &&
         (kIsInt8Cache || bf16_int4_spec_xqa_eligible))) &&
-      max_query_len_bound > 1 && max_query_len_bound <= 8;
+      max_query_len_bound > 1 && max_query_len_bound <= kMaxSpecDecQueryLen;
   const bool portable_spec_dec_candidate =
-      has_metadata_bounds && max_query_len_bound > 1 && max_query_len_bound <= 8 &&
+      has_metadata_bounds && max_query_len_bound > 1 && max_query_len_bound <= kMaxSpecDecQueryLen &&
       (std::is_same_v<TCACHE, uint8_t> || (kIsQuantizedCache && per_channel_k && !enable_per_channel_xqa_));
   const bool cudnn_paged_enabled =
       enable_cudnn_paged_ || (auto_enable_cudnn_paged_ && device_prop.major >= 9);

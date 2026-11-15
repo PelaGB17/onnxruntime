@@ -1933,8 +1933,8 @@ TEST(PagedAttention, Cuda_XqaSpecDecInt8CacheHeadSize128UnsupportedWidthFallsBac
   }
 
   IoBindingCase c;
-  c.token_count = 9;
-  c.cumulative_seqlens_q = {0, 9};
+  c.token_count = 17;
+  c.cumulative_seqlens_q = {0, 17};
   c.num_heads = 6;
   c.kv_num_heads = 1;
   c.head_size = 128;
@@ -1946,7 +1946,7 @@ TEST(PagedAttention, Cuda_XqaSpecDecInt8CacheHeadSize128UnsupportedWidthFallsBac
   c.irregular_layout = true;
   c.discriminating_attention = true;
   c.block_table = {3, 1};
-  c.attention_metadata = {9, 134, 134};
+  c.attention_metadata = {17, 142, 142};
 
   testing::internal::CaptureStdout();
   RunIoBindingCase(DefaultCudaExecutionProvider(), kCudaExecutionProvider, true, false, c);
@@ -1956,6 +1956,50 @@ TEST(PagedAttention, Cuda_XqaSpecDecInt8CacheHeadSize128UnsupportedWidthFallsBac
               debug_output.find("SdpaKernel=EFFICIENT_ATTENTION") != std::string::npos ||
               debug_output.find("SdpaKernel=DECODER_ATTENTION") != std::string::npos)
       << debug_output;
+}
+
+TEST(PagedAttention, Cuda_XqaSpecDecInt8CacheHeadSize256Group6Width16) {
+  ScopedEnvironmentVariables scoped_env_vars{
+      EnvVarMap{
+          {onnxruntime::contrib::attention::kDisableFlashAttention, "0"},
+          {onnxruntime::contrib::attention::kDisableMemoryEfficientAttention, "0"},
+          {onnxruntime::contrib::attention::kDisableDecoderAttention, "0"},
+          {onnxruntime::contrib::attention::kEnableAttentionKernelDebugInfo, "1"},
+          {"ORT_ENABLE_XQA", "1"}}};
+
+  if (DefaultCudaExecutionProvider() == nullptr) {
+    GTEST_SKIP() << "CUDA EP not available.";
+  }
+  if (GetCudaArchitecture() < 800) {
+    GTEST_SKIP() << "Speculative XQA requires compute capability 8.0 or later.";
+  }
+
+  IoBindingCase c;
+  c.batch_size = 2;
+  c.token_count = 28;
+  c.cumulative_seqlens_q = {0, 16, 28};
+  c.num_heads = 6;
+  c.kv_num_heads = 1;
+  c.head_size = 256;
+  c.num_blocks = 8;
+  c.past_seqlen = 230;
+  c.int8_cache = true;
+  c.per_channel_scales = true;
+  c.irregular_layout = true;
+  c.discriminating_attention = true;
+  c.attention_metadata = {16, 256, 256};
+
+  const bool xqa_runnable = IsSpecDecGroup6XqaRunnable(false, true, false);
+
+  testing::internal::CaptureStdout();
+  RunIoBindingCase(DefaultCudaExecutionProvider(), kCudaExecutionProvider, true, false, c);
+  const std::string debug_output = testing::internal::GetCapturedStdout();
+  if (!xqa_runnable) {
+    GTEST_SKIP() << "Speculative paged XQA H256/group6 (INT8 cache) is not runnable in this "
+                    "build/device configuration; output parity was still checked.";
+  }
+  EXPECT_NE(debug_output.find("SdpaKernel=XQA"), std::string::npos) << debug_output;
+  EXPECT_NE(debug_output.find("GqaGroupSize=6"), std::string::npos) << debug_output;
 }
 
 TEST(PagedAttention, Cuda_XqaSpecDecInt8CacheHeadSize128NonCausalFallsBack) {

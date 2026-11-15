@@ -3474,7 +3474,7 @@ TEST(GatedDeltaNetTest, StateUpdateCapacityIsBounded) {
   Inputs in = MakeInputs(g, 81);
   OpTester test("GatedDeltaNet", 1, onnxruntime::kMSDomain);
   Options options;
-  options.state_update_capacity = 9;
+  options.state_update_capacity = 17;
   AddCommonAttrs(test, options);
   test.AddInput<MLFloat16>("query", {g.total_tokens, g.hq, g.dk}, ToFloat16(in.q));
   test.AddInput<MLFloat16>("key", {g.total_tokens, g.hq, g.dk}, ToFloat16(in.k));
@@ -3490,11 +3490,25 @@ TEST(GatedDeltaNetTest, StateUpdateCapacityIsBounded) {
                             std::vector<MLFloat16>(static_cast<size_t>(g.total_tokens) * g.hv * g.dv));
   test.AddOutput<float>("final_state", {g.batch, g.hv, g.dv, g.dk},
                         std::vector<float>(in.state0.size()));
-  const int64_t width = 9 * (g.hv + g.hq * g.dk + g.hv * g.dv);
+  const int64_t width = 17 * (g.hv + g.hq * g.dk + g.hv * g.dv);
   test.AddOutput<float>("state_update", {g.batch, width},
                         std::vector<float>(static_cast<size_t>(g.batch) * width));
   test.Run(OpTester::ExpectResult::kExpectFailure,
-           "state_update_capacity must be in [0, 8]");
+           "state_update_capacity must be in [0, 16]");
+}
+
+TEST(GatedDeltaNetTest, StateUpdateCapacity15CapturesWideBlock) {
+  if (NeedSkipGatedDeltaNetTest()) return;
+  Geometry g{28, 2, 2, 4, 128, 128};
+  Options options;
+  options.gate_activation = "softplus";
+  options.beta_activation = "sigmoid";
+  options.qk_l2_norm = 1;
+  options.state_update_capacity = 15;
+  Inputs in = MakeInputs(g, 181);
+  in.cu_seqlens = {0, 16, 28};
+  in.capture_count = {15, 11};
+  RunCase(g, options, in, 3e-2f, 3e-2f, false);
 }
 
 // The plan decision is pure host code, so the consumer-Blackwell shared-memory budget can

@@ -47,8 +47,8 @@ VarlenCausalConvWithState<T>::VarlenCausalConvWithState(const OpKernelInfo& info
               "CPU VarlenCausalConvWithState does not support dynamic grouped convolution (CUDA only)");
 
   const int64_t state_update_capacity = info.GetAttrOrDefault<int64_t>("state_update_capacity", 0);
-  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= kMaxStateWindow,
-              "state_update_capacity must be in [0, ", kMaxStateWindow, "]");
+  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= kMaxStateUpdateCapacity,
+              "state_update_capacity must be in [0, ", kMaxStateUpdateCapacity, "]");
   state_update_capacity_ = static_cast<int>(state_update_capacity);
 
   ORT_THROW_IF_ERROR(causal_conv_with_state_helper::ParseDilation(info, dilation_));

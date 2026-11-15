@@ -173,6 +173,11 @@ constexpr bool LAYOUT_BNSH = true;
 // grow linearly with it, so cap it rather than let a model request an unbounded allocation.
 constexpr int64_t kMaxStateWindow = 8;
 
+// Upper bound on compact per-token `state_update_capacity` across GatedDeltaNet and
+// CausalConvWithState / VarlenCausalConvWithState (e.g. 16-row block drafters such as DSpine-b16
+// need up to 15 speculative transitions, plus 1).
+constexpr int64_t kMaxStateUpdateCapacity = 16;
+
 namespace sparse_attention {
 // Environment variable to enable or disable sparse attention v1 kernel. Default is 0 (enabled).
 constexpr const char* kDisableSparseAttentionV1 = "ORT_DISABLE_SPARSE_ATTENTION_V1";

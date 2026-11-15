@@ -65,8 +65,8 @@ GatedDeltaNet::GatedDeltaNet(const OpKernelInfo& info) : WebGpuKernel(info) {
   chunkwise_prefill_ = info.GetAttrOrDefault<int64_t>("chunk_size", 64) == kDeltaPrefillChunkSize;
   scale_ = info.GetAttrOrDefault<float>("scale", 0.0f);
   const auto state_update_capacity = info.GetAttrOrDefault<int64_t>("state_update_capacity", 0);
-  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= 8,
-              "state_update_capacity must be in [0, 8], got ", state_update_capacity);
+  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= 16,
+              "state_update_capacity must be in [0, 16], got ", state_update_capacity);
   state_update_capacity_ = static_cast<int>(state_update_capacity);
 }
 

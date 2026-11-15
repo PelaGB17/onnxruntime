@@ -1560,7 +1560,7 @@ as GQA does, so that `ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1` works uniformly 
 > `max_query_len == 1` because its output layout is one row per batch index rather than per query
 > token. Quantized-cache XQA may obtain the latter from `attention_metadata` or, failing that, from
 > the readback. A separate token-major speculative XQA path uses replay-safe metadata bounds
-> instead of an aggregate token-count heuristic: it admits `max_query_len` 2–8 when an H256
+> instead of an aggregate token-count heuristic: it admits `max_query_len` 2–16 when an H256
 > specialization is eligible (`group_size = 6` for matching native FP16/BF16 query and cache types
 > or FP16 query with an INT8/FP8 cache or a `PER_CHANNEL` INT4 cache; `group_size ∈ {6, 16}` for
 > BF16 query with an INT8 cache), or when the H128/group-6

@@ -5198,7 +5198,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               channel_offset < 0 || channel_offset > std::numeric_limits<int>::max() ||
               history < 0 || history > std::numeric_limits<int>::max() ||
               state_layout < -1 || state_layout > 1 ||
-              state_update_capacity < 0 || state_update_capacity > 8) {
+              state_update_capacity < 0 || state_update_capacity > kMaxStateUpdateCapacity) {
             fail_shape_inference("CausalConvWithState: invalid extended attributes");
           }
           if (input_channels != 0 || channel_offset != 0 || history != 0 || state_layout != -1 ||
@@ -5509,9 +5509,9 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
             propagateElemTypeFromInputToOutput(ctx, 0, 2);
           }
           const int64_t state_update_capacity = getAttribute(ctx, "state_update_capacity", 0);
-          if (state_update_capacity < 0 || state_update_capacity > kMaxStateWindow) {
+          if (state_update_capacity < 0 || state_update_capacity > kMaxStateUpdateCapacity) {
             fail_shape_inference("VarlenCausalConvWithState: state_update_capacity must be in [0, ",
-                                 kMaxStateWindow, "], got ", state_update_capacity);
+                                 kMaxStateUpdateCapacity, "], got ", state_update_capacity);
           }
 
           const int64_t dilation = getAttribute(ctx, "dilation", 1);
@@ -6273,9 +6273,9 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
 
           const int64_t state_update_capacity =
               getAttribute(ctx, "state_update_capacity", static_cast<int64_t>(0));
-          if (state_update_capacity < 0 || state_update_capacity > kMaxStateWindow) {
+          if (state_update_capacity < 0 || state_update_capacity > kMaxStateUpdateCapacity) {
             fail_shape_inference("GatedDeltaNet: state_update_capacity must be in [0, ",
-                                 kMaxStateWindow, "], got ", state_update_capacity);
+                                 kMaxStateUpdateCapacity, "], got ", state_update_capacity);
           }
           if (ctx.getNumOutputs() > 2) {
             ONNX_NAMESPACE::TensorShapeProto capsule_shape;
