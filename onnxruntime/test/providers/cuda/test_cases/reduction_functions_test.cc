@@ -348,6 +348,130 @@ TEST(ReductionFunctionsTest, ReduceSumNdRank9) {
   CheckDeviceValues(expected.size(), d_output.get(), expected.data(), 0.0f);
 }
 
+namespace {
+// Exact sums of [rows, n] over the last axis, saturated like the kernels, computed on the host in int64.
+template <typename T>
+std::vector<T> ExpectedLastAxisSums(const std::vector<T>& input, int64_t rows, int64_t n) {
+  std::vector<T> expected(static_cast<size_t>(rows));
+  for (int64_t row = 0; row < rows; ++row) {
+    int64_t sum = 0;
+    for (int64_t i = 0; i < n; ++i) {
+      sum += static_cast<int64_t>(input[static_cast<size_t>(row * n + i)]);
+    }
+    expected[static_cast<size_t>(row)] = static_cast<T>(std::clamp<int64_t>(
+        sum, std::numeric_limits<T>::min(), std::numeric_limits<T>::max()));
+  }
+  return expected;
+}
+
+// Reduces [rows, n] over the last axis with the split kernels (with a buffer) and with one block per output
+// (without one), and checks both against the exact sums.
+template <typename T>
+void TestReduceSumNdLastAxisExact(int64_t rows, int64_t n, const std::vector<T>& input) {
+  const std::vector<int64_t> dims{rows, n};
+  const std::vector<int64_t> axes{1};
+  const auto expected = ExpectedLastAxisSums(input, rows, n);
+
+  auto d_input = AllocateDeviceMemory<T>(input.size());
+  auto d_output = AllocateDeviceMemory<T>(expected.size());
+  cudaMemcpy(d_input.get(), input.data(), input.size() * sizeof(T), cudaMemcpyHostToDevice);
+  const size_t buffer_size = compute_reduce_sum_nd_buffer_size<T>(dims, axes);
+  auto d_buffer = AllocateDeviceMemory<char>(std::max<size_t>(buffer_size, 1));
+
+  for (const bool with_buffer : {true, false}) {
+    cudaMemset(d_output.get(), 0xff, expected.size() * sizeof(T));
+    ASSERT_STATUS_OK(reduce_sum_nd(0, d_input.get(), d_output.get(), dims, axes,
+                                   with_buffer ? d_buffer.get() : nullptr, with_buffer ? buffer_size : 0));
+    ASSERT_TRUE(CUDA_CALL(cudaDeviceSynchronize()).IsOK());
+    std::vector<T> actual(expected.size());
+    cudaMemcpy(actual.data(), d_output.get(), actual.size() * sizeof(T), cudaMemcpyDeviceToHost);
+    EXPECT_EQ(actual, expected) << "rows: " << rows << ", n: " << n << ", split buffer: " << with_buffer
+                                << " (" << buffer_size << " bytes)";
+  }
+}
+}  // namespace
+
+TEST(ReductionFunctionsTest, ReduceSumNdSplitBufferSize) {
+  // Long integer reductions with few outputs are split, so they need a buffer.
+  EXPECT_GT(compute_reduce_sum_nd_buffer_size<int64_t>(std::vector<int64_t>{1, 262144}, std::vector<int64_t>{1}), 0u);
+  EXPECT_GT(compute_reduce_sum_nd_buffer_size<int32_t>(std::vector<int64_t>{4, 32768}, std::vector<int64_t>{-1}), 0u);
+  // Short reductions, many outputs and floating point types keep one block per output.
+  EXPECT_EQ(compute_reduce_sum_nd_buffer_size<int64_t>(std::vector<int64_t>{1, 4096}, std::vector<int64_t>{1}), 0u);
+  EXPECT_EQ(compute_reduce_sum_nd_buffer_size<int64_t>(std::vector<int64_t>{65536, 262144}, std::vector<int64_t>{1}),
+            0u);
+  EXPECT_EQ(compute_reduce_sum_nd_buffer_size<float>(std::vector<int64_t>{1, 262144}, std::vector<int64_t>{1}), 0u);
+}
+
+TEST(ReductionFunctionsTest, ReduceSumNdSplitLongRowsExact) {
+  RandomValueGenerator random{static_cast<RandomValueGenerator::RandomSeedType>(5)};
+  // Lengths include ones that are not multiples of the 256-thread block or of the per-block range.
+  for (const int64_t rows : {int64_t{1}, int64_t{4}}) {
+    for (const int64_t n : {int64_t{4096}, int64_t{8193}, int64_t{32768}, int64_t{100003}, int64_t{131072},
+                            int64_t{262144}, int64_t{262221}}) {
+      const std::vector<int64_t> dims{rows, n};
+      const size_t count = static_cast<size_t>(rows * n);
+      TestReduceSumNdLastAxisExact<int32_t>(rows, n, std::vector<int32_t>(count, 1));
+      TestReduceSumNdLastAxisExact<int64_t>(rows, n, std::vector<int64_t>(count, 1));
+      TestReduceSumNdLastAxisExact<int32_t>(rows, n, random.Uniform<int32_t>(dims, -1000, 1001));
+      // Large values: at most 262,221 elements of magnitude at most 2^33, so every partial sum stays below 2^53 in
+      // magnitude and double accumulation is exact.
+      TestReduceSumNdLastAxisExact<int64_t>(rows, n,
+                                            random.Uniform<int64_t>(dims, -(int64_t{1} << 33), int64_t{1} << 33));
+    }
+  }
+  // int32 sums beyond the type saturate in both paths.
+  TestReduceSumNdLastAxisExact<int32_t>(1, 262144, std::vector<int32_t>(262144, 1'000'000));
+}
+
+TEST(ReductionFunctionsTest, ReduceSumNdSplitCudaGraphCaptureAndReplay) {
+  const int64_t rows = 2;
+  const int64_t n = 262221;
+  const std::vector<int64_t> dims{rows, n};
+  const std::vector<int64_t> axes{1};
+  const size_t count = static_cast<size_t>(rows * n);
+  const size_t buffer_size = compute_reduce_sum_nd_buffer_size<int64_t>(dims, axes);
+  ASSERT_GT(buffer_size, 0u);
+
+  auto d_input = AllocateDeviceMemory<int64_t>(count);
+  auto d_output = AllocateDeviceMemory<int64_t>(rows);
+  auto d_buffer = AllocateDeviceMemory<char>(buffer_size);
+  cudaMemset(d_input.get(), 0, count * sizeof(int64_t));
+
+  cudaStream_t stream = nullptr;
+  ASSERT_TRUE(CUDA_CALL(cudaStreamCreate(&stream)).IsOK());
+  // Warm up outside of the capture, the same way the CUDA EP does.
+  ASSERT_STATUS_OK(reduce_sum_nd(stream, d_input.get(), d_output.get(), dims, axes, d_buffer.get(), buffer_size));
+  ASSERT_TRUE(CUDA_CALL(cudaStreamSynchronize(stream)).IsOK());
+
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+  ASSERT_TRUE(CUDA_CALL(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal)).IsOK());
+  ASSERT_STATUS_OK(reduce_sum_nd(stream, d_input.get(), d_output.get(), dims, axes, d_buffer.get(), buffer_size));
+  ASSERT_TRUE(CUDA_CALL(cudaStreamEndCapture(stream, &graph)).IsOK());
+  ASSERT_TRUE(CUDA_CALL(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0)).IsOK());
+
+  // Every replay sees new input values written to the same buffer, as decode steps do.
+  RandomValueGenerator random{static_cast<RandomValueGenerator::RandomSeedType>(7)};
+  for (int replay = 0; replay < 4; ++replay) {
+    const auto input = random.Uniform<int64_t>(dims, -1000 * (replay + 1), 1000 * (replay + 1));
+    const auto expected = ExpectedLastAxisSums(input, rows, n);
+    ASSERT_TRUE(CUDA_CALL(cudaMemcpyAsync(d_input.get(), input.data(), count * sizeof(int64_t),
+                                          cudaMemcpyHostToDevice, stream))
+                    .IsOK());
+    cudaMemsetAsync(d_output.get(), 0xff, static_cast<size_t>(rows) * sizeof(int64_t), stream);
+    ASSERT_TRUE(CUDA_CALL(cudaGraphLaunch(graph_exec, stream)).IsOK());
+    ASSERT_TRUE(CUDA_CALL(cudaStreamSynchronize(stream)).IsOK());
+
+    std::vector<int64_t> actual(static_cast<size_t>(rows));
+    cudaMemcpy(actual.data(), d_output.get(), actual.size() * sizeof(int64_t), cudaMemcpyDeviceToHost);
+    EXPECT_EQ(actual, expected) << "replay: " << replay;
+  }
+
+  ASSERT_TRUE(CUDA_CALL(cudaGraphExecDestroy(graph_exec)).IsOK());
+  ASSERT_TRUE(CUDA_CALL(cudaGraphDestroy(graph)).IsOK());
+  ASSERT_TRUE(CUDA_CALL(cudaStreamDestroy(stream)).IsOK());
+}
+
 TEST(ReductionFunctionsTest, BufferOffsets) {
   const int m = 2048;
   const int n = 1024;
@@ -855,6 +979,71 @@ TEST(ReductionFunctionsTest, DISABLED_ArgMinMaxLastAxisPerf) {
     ASSERT_TRUE(CUDA_CALL(cudaEventElapsedTime(&elapsed_ms, start, stop)).IsOK());
     std::cout << shape.m << "," << shape.n << "," << buffer_size_in_bytes << ","
               << (elapsed_ms * 1000.0f / kTimedIterations) << "\n";
+  }
+
+  ASSERT_TRUE(CUDA_CALL(cudaEventDestroy(start)).IsOK());
+  ASSERT_TRUE(CUDA_CALL(cudaEventDestroy(stop)).IsOK());
+  ASSERT_TRUE(CUDA_CALL(cudaStreamDestroy(stream)).IsOK());
+}
+
+namespace {
+template <typename T>
+void TimeReduceSumNdLastAxis(cudaStream_t stream, cudaEvent_t start, cudaEvent_t stop, int64_t rows, int64_t n,
+                             const char* type_name) {
+  constexpr int kWarmupIterations = 100;
+  constexpr int kTimedIterations = 1000;
+  constexpr int kRepeats = 5;
+  const std::vector<int64_t> dims{rows, n};
+  const std::vector<int64_t> axes{1};
+  const std::vector<T> input(static_cast<size_t>(rows * n), T{1});
+  auto d_input = AllocateDeviceMemory<T>(input.size());
+  auto d_output = AllocateDeviceMemory<T>(static_cast<size_t>(rows));
+  cudaMemcpy(d_input.get(), input.data(), input.size() * sizeof(T), cudaMemcpyHostToDevice);
+  const size_t buffer_size_in_bytes = compute_reduce_sum_nd_buffer_size<T>(dims, axes);
+  auto d_buffer = AllocateDeviceMemory<char>(std::max<size_t>(buffer_size_in_bytes, 1));
+
+  for (int i = 0; i < kWarmupIterations; ++i) {
+    ASSERT_STATUS_OK(reduce_sum_nd(stream, d_input.get(), d_output.get(), dims, axes, d_buffer.get(),
+                                   buffer_size_in_bytes));
+  }
+  ASSERT_TRUE(CUDA_CALL(cudaStreamSynchronize(stream)).IsOK());
+  for (int repeat = 0; repeat < kRepeats; ++repeat) {
+    ASSERT_TRUE(CUDA_CALL(cudaEventRecord(start, stream)).IsOK());
+    for (int i = 0; i < kTimedIterations; ++i) {
+      ASSERT_STATUS_OK(reduce_sum_nd(stream, d_input.get(), d_output.get(), dims, axes, d_buffer.get(),
+                                     buffer_size_in_bytes));
+    }
+    ASSERT_TRUE(CUDA_CALL(cudaEventRecord(stop, stream)).IsOK());
+    ASSERT_TRUE(CUDA_CALL(cudaEventSynchronize(stop)).IsOK());
+    float elapsed_ms = 0.0f;
+    ASSERT_TRUE(CUDA_CALL(cudaEventElapsedTime(&elapsed_ms, start, stop)).IsOK());
+    std::cout << type_name << "," << rows << "," << n << "," << buffer_size_in_bytes << "," << repeat << ","
+              << (elapsed_ms * 1000.0f / kTimedIterations) << "\n";
+  }
+  T first = T{};
+  cudaMemcpy(&first, d_output.get(), sizeof(T), cudaMemcpyDeviceToHost);
+  ASSERT_EQ(static_cast<int64_t>(first), n);
+}
+}  // namespace
+
+// Not run by default: prints a timing table for reduce_sum_nd over the last axis of [rows, n], the shape of the
+// attention-mask ReduceSum in GroupQueryAttention decoders. Run it with
+// "GTEST_FILTER=ReductionFunctionsTest.DISABLED_ReduceSumNdPerf GTEST_ALSO_RUN_DISABLED_TESTS=1
+// onnxruntime_provider_test --gtest_filter=CUDA_EP_Unittest.All". The internal test runner does not receive
+// command line flags, so the disabled-test switch has to come from the environment.
+TEST(ReductionFunctionsTest, DISABLED_ReduceSumNdPerf) {
+  cudaStream_t stream = nullptr;
+  ASSERT_TRUE(CUDA_CALL(cudaStreamCreate(&stream)).IsOK());
+  cudaEvent_t start, stop;
+  ASSERT_TRUE(CUDA_CALL(cudaEventCreate(&start)).IsOK());
+  ASSERT_TRUE(CUDA_CALL(cudaEventCreate(&stop)).IsOK());
+
+  std::cout << "type,rows,n,scratch_bytes,repeat,microseconds\n";
+  for (int64_t rows : {int64_t{1}, int64_t{4}}) {
+    for (int64_t n : {int64_t{4096}, int64_t{32768}, int64_t{131072}, int64_t{262144}}) {
+      TimeReduceSumNdLastAxis<int64_t>(stream, start, stop, rows, n, "int64");
+      TimeReduceSumNdLastAxis<int32_t>(stream, start, stop, rows, n, "int32");
+    }
   }
 
   ASSERT_TRUE(CUDA_CALL(cudaEventDestroy(start)).IsOK());

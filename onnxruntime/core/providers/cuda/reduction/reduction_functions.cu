@@ -638,17 +638,37 @@ __global__ void reduce_sum_nd_kernel(const T* input, T* output, ReduceSumNdMetad
     __syncthreads();  // reduce_storage is reused by the next grid-stride iteration.
   }
 }
-}  // namespace detail
 
-template <typename T>
-Status reduce_sum_nd(cudaStream_t stream, const T* input, T* output,
-                     gsl::span<const int64_t> dims, gsl::span<const int64_t> axes) {
-  ORT_RETURN_IF_NOT(dims.size() <= detail::kMaxReduceRank,
-                    "The general CUDA ReduceSum kernel supports ranks up to ", detail::kMaxReduceRank, ".");
+// One block per output leaves most of the device idle when a few outputs each sum many elements, such as the
+// [batch, max_length] int64 attention mask that GroupQueryAttention decoders reduce on every decode step. For integer
+// types such reductions are split over several blocks per output. Each block adds a contiguous range of reduced
+// elements into a partial sum, and a second kernel adds the partial sums of each output in a fixed order, so the
+// result does not depend on block scheduling (no atomics). As in reduce_sum_nd_kernel, each element is converted to
+// double before it is added, and the sum saturates to the range of T at the end. The sum is exact, and equal to the
+// one-block sum, when every element and every partial sum is exactly representable in double. Keeping them all
+// within +/-2^53 is sufficient (for example, absolute values that add up to at most 2^53). A final sum within that
+// range is not: [2^53 + 1, -2^53] sums to 1, but 2^53 + 1 becomes 2^53 when converted. int32 elements are always
+// representable, and partial sums of up to 2^22 of them stay within 2^53.
+constexpr int kReduceSumNdBlockSize = 256;
+// Each output gets ceil(reduction_count / kReduceSumNdElementsPerSplit) blocks unless the device holds fewer, so a
+// block adds at most this many elements while the device is not the limit. Shorter reductions are not split.
+constexpr int64_t kReduceSumNdElementsPerSplit = 4096;
+constexpr int64_t kMaxReduceSumNdGridDim = 65535;
 
-  detail::ReduceSumNdMetadata metadata;
+int get_device_thread_capacity();
+
+struct ReduceSumNdSplit {
+  int64_t splits = 1;              // blocks per output; 1 selects reduce_sum_nd_kernel
+  int64_t elements_per_split = 0;  // reduced elements per block (fewer in the last one)
+};
+
+Status make_reduce_sum_nd_metadata(gsl::span<const int64_t> dims, gsl::span<const int64_t> axes,
+                                   ReduceSumNdMetadata& metadata) {
+  ORT_RETURN_IF_NOT(dims.size() <= kMaxReduceRank,
+                    "The general CUDA ReduceSum kernel supports ranks up to ", kMaxReduceRank, ".");
+
   const int rank = gsl::narrow_cast<int>(dims.size());
-  std::array<int64_t, detail::kMaxReduceRank> strides{};
+  std::array<int64_t, kMaxReduceRank> strides{};
   SafeInt<int64_t> stride = 1;
   for (int axis = rank - 1; axis >= 0; --axis) {
     ORT_RETURN_IF_NOT(dims[axis] > 0, "ReduceSum dimensions must be positive.");
@@ -656,7 +676,7 @@ Status reduce_sum_nd(cudaStream_t stream, const T* input, T* output,
     stride *= dims[axis];
   }
 
-  std::array<bool, detail::kMaxReduceRank> reduced{};
+  std::array<bool, kMaxReduceRank> reduced{};
   if (axes.empty()) {
     for (int axis = 0; axis < rank; ++axis) reduced[axis] = true;
   } else {
@@ -693,17 +713,152 @@ Status reduce_sum_nd(cudaStream_t stream, const T* input, T* output,
   }
   metadata.output_count = static_cast<int64_t>(output_count);
   metadata.reduction_count = static_cast<int64_t>(reduction_count);
+  return Status::OK();
+}
 
-  constexpr int block_size = 256;
+ReduceSumNdSplit compute_reduce_sum_nd_split(bool is_integral, const ReduceSumNdMetadata& metadata) {
+  ReduceSumNdSplit split;
+  if (!is_integral || metadata.reduction_count < 2 * kReduceSumNdElementsPerSplit) {
+    return split;
+  }
+  const int64_t device_blocks = std::max<int64_t>(1, get_device_thread_capacity() / kReduceSumNdBlockSize);
+  // With half a wave of outputs or more, one block per output already keeps the device busy.
+  if (2 * metadata.output_count > device_blocks || metadata.output_count > kMaxReduceSumNdGridDim) {
+    return split;
+  }
+  const int64_t by_length =
+      (metadata.reduction_count + kReduceSumNdElementsPerSplit - 1) / kReduceSumNdElementsPerSplit;
+  const int64_t by_device = device_blocks / metadata.output_count;
+  const int64_t splits = std::min({by_length, by_device, kMaxReduceSumNdGridDim});
+  if (splits <= 1) {
+    return split;
+  }
+  // Equal contiguous ranges; deriving the block count from the range length leaves no block without elements.
+  split.elements_per_split = (metadata.reduction_count + splits - 1) / splits;
+  split.splits = (metadata.reduction_count + split.elements_per_split - 1) / split.elements_per_split;
+  return split;
+}
+
+size_t compute_reduce_sum_nd_intermediate_buffer_size(bool is_integral, gsl::span<const int64_t> dims,
+                                                      gsl::span<const int64_t> axes) {
+  ReduceSumNdMetadata metadata;
+  if (!make_reduce_sum_nd_metadata(dims, axes, metadata).IsOK()) {
+    return 0;  // reduce_sum_nd() reports the error
+  }
+  const ReduceSumNdSplit split = compute_reduce_sum_nd_split(is_integral, metadata);
+  if (split.splits <= 1) {
+    return 0;
+  }
+  // The partial sums, plus room to align them.
+  return static_cast<size_t>(metadata.output_count * split.splits) * sizeof(SumState<double>) +
+         alignof(SumState<double>) - 1;
+}
+
+// Block (x, y) adds reduced elements [x * elements_per_split, (x + 1) * elements_per_split) of output y.
+template <typename T, int BlockSize>
+__global__ void reduce_sum_nd_split_kernel(const T* input, SumState<double>* partials, ReduceSumNdMetadata metadata,
+                                           int64_t elements_per_split) {
+  static_assert(std::is_integral_v<T>, "only integer reductions are split");
+  using BlockReduce = cub::BlockReduce<SumState<double>, BlockSize>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+  __shared__ int64_t input_base;
+
+  const int64_t output_index = blockIdx.y;
+  if (threadIdx.x == 0) {
+    int64_t remaining = output_index;
+    int64_t base = 0;
+    for (int segment = metadata.output_segment_count - 1; segment >= 0; --segment) {
+      const int64_t coordinate = segment == 0 ? remaining : remaining % metadata.output_segment_sizes[segment];
+      if (segment != 0) remaining /= metadata.output_segment_sizes[segment];
+      base += coordinate * metadata.output_segment_strides[segment];
+    }
+    input_base = base;
+  }
+  __syncthreads();
+
+  const int64_t begin = static_cast<int64_t>(blockIdx.x) * elements_per_split;
+  const int64_t limit = begin + elements_per_split;
+  const int64_t end = limit < metadata.reduction_count ? limit : metadata.reduction_count;
+  SumState<double> thread_sum{};
+  for (int64_t reduction_index = begin + threadIdx.x; reduction_index < end; reduction_index += BlockSize) {
+    int64_t remaining = reduction_index;
+    int64_t input_index = input_base;
+    for (int segment = metadata.reduction_segment_count - 1; segment >= 0; --segment) {
+      const int64_t coordinate = segment == 0 ? remaining : remaining % metadata.reduction_segment_sizes[segment];
+      if (segment != 0) remaining /= metadata.reduction_segment_sizes[segment];
+      input_index += coordinate * metadata.reduction_segment_strides[segment];
+    }
+    thread_sum.Add(static_cast<double>(input[input_index]));
+  }
+
+  const SumState<double> block_sum = BlockReduce(reduce_storage).Reduce(thread_sum, MergeSumState<double>{});
+  if (threadIdx.x == 0) {
+    partials[output_index * gridDim.x + blockIdx.x] = block_sum;
+  }
+}
+
+// Block x adds the partial sums of output x. Each thread visits its partials in increasing order and the block
+// reduction has a fixed shape, so the result is the same on every run.
+template <typename T, int BlockSize>
+__global__ void reduce_sum_nd_combine_kernel(const SumState<double>* partials, T* output, int64_t splits) {
+  using BlockReduce = cub::BlockReduce<SumState<double>, BlockSize>;
+  __shared__ typename BlockReduce::TempStorage reduce_storage;
+
+  const SumState<double>* output_partials = partials + static_cast<int64_t>(blockIdx.x) * splits;
+  SumState<double> thread_sum{};
+  for (int64_t split = threadIdx.x; split < splits; split += BlockSize) {
+    thread_sum = MergeSumState<double>{}(thread_sum, output_partials[split]);
+  }
+  const SumState<double> total = BlockReduce(reduce_storage).Reduce(thread_sum, MergeSumState<double>{});
+  if (threadIdx.x == 0) {
+    output[blockIdx.x] = CastReduceSumResult<T>(total.Result());
+  }
+}
+}  // namespace detail
+
+template <typename T>
+Status reduce_sum_nd(cudaStream_t stream, const T* input, T* output,
+                     gsl::span<const int64_t> dims, gsl::span<const int64_t> axes,
+                     void* buffer, size_t buffer_size) {
+  detail::ReduceSumNdMetadata metadata;
+  ORT_RETURN_IF_ERROR(detail::make_reduce_sum_nd_metadata(dims, axes, metadata));
+
+  constexpr int block_size = detail::kReduceSumNdBlockSize;
+  if constexpr (std::is_integral_v<T>) {
+    const detail::ReduceSumNdSplit split =
+        buffer == nullptr ? detail::ReduceSumNdSplit{} : detail::compute_reduce_sum_nd_split(true, metadata);
+    if (split.splits > 1) {
+      const uintptr_t begin_addr = reinterpret_cast<uintptr_t>(buffer);
+      const uintptr_t partials_addr = detail::round_up_to_aligned(begin_addr, alignof(detail::SumState<double>));
+      const size_t required_size = (partials_addr - begin_addr) +
+                                   static_cast<size_t>(metadata.output_count * split.splits) *
+                                       sizeof(detail::SumState<double>);
+      ORT_RETURN_IF_NOT(required_size <= buffer_size,
+                        "Buffer size is too small (", buffer_size, " bytes). ",
+                        "At least ", required_size, " bytes are needed from the given base address (", buffer, ").");
+      auto* partials = reinterpret_cast<detail::SumState<double>*>(partials_addr);
+      const dim3 split_grid(static_cast<unsigned>(split.splits), static_cast<unsigned>(metadata.output_count));
+      detail::reduce_sum_nd_split_kernel<T, block_size><<<split_grid, block_size, 0, stream>>>(
+          input, partials, metadata, split.elements_per_split);
+      detail::reduce_sum_nd_combine_kernel<T, block_size>
+          <<<static_cast<unsigned>(metadata.output_count), block_size, 0, stream>>>(partials, output, split.splits);
+      return CUDA_CALL(cudaGetLastError());
+    }
+  } else {
+    ORT_UNUSED_PARAMETER(buffer);
+    ORT_UNUSED_PARAMETER(buffer_size);
+  }
+
   constexpr int max_blocks = 65535;
   const int grid_size = static_cast<int>(std::min<int64_t>(max_blocks, metadata.output_count));
   detail::reduce_sum_nd_kernel<T, block_size><<<grid_size, block_size, 0, stream>>>(input, output, metadata);
   return CUDA_CALL(cudaGetLastError());
 }
 
-#define INSTANTIATE_REDUCE_SUM_ND(T)                                               \
-  template Status reduce_sum_nd<T>(cudaStream_t stream, const T* input, T* output, \
-                                   gsl::span<const int64_t> dims, gsl::span<const int64_t> axes)
+#define INSTANTIATE_REDUCE_SUM_ND(T)                                                             \
+  template Status reduce_sum_nd<T>(cudaStream_t stream, const T* input, T* output,               \
+                                   gsl::span<const int64_t> dims, gsl::span<const int64_t> axes, \
+                                   void* buffer, size_t buffer_size)
 INSTANTIATE_REDUCE_SUM_ND(half);
 INSTANTIATE_REDUCE_SUM_ND(float);
 INSTANTIATE_REDUCE_SUM_ND(double);

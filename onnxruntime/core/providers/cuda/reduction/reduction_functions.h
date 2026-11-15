@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "core/providers/cuda/cuda_common.h"
 #include "core/providers/cuda/shared_inc/accumulation_type.h"
 
@@ -15,6 +17,9 @@ size_t compute_reduce_matrix_columns_intermediate_buffer_size(
 
 size_t compute_arg_min_max_last_axis_intermediate_buffer_size(
     int element_size, int num_rows, int num_cols);
+
+size_t compute_reduce_sum_nd_intermediate_buffer_size(
+    bool is_integral, gsl::span<const int64_t> dims, gsl::span<const int64_t> axes);
 }  // namespace detail
 
 /**
@@ -110,10 +115,29 @@ Status reduce_matrix_columns(cudaStream_t stream, const TIn* input, TOut* output
  * Computes ReduceSum for an arbitrary set of axes. This is the general fallback
  * for axis layouts that cannot be flattened into one of the optimized matrix
  * reductions above.
+ *
+ * For integer types, a long reduction with few outputs is split over several
+ * blocks per output when a buffer of compute_reduce_sum_nd_buffer_size() bytes
+ * is given. Without a buffer, one block reduces each output.
+ *
+ * @param buffer The intermediate buffer, may be nullptr.
+ * @param buffer_size The size of the intermediate buffer in bytes.
  */
 template <typename T>
 Status reduce_sum_nd(cudaStream_t stream, const T* input, T* output,
-                     gsl::span<const int64_t> dims, gsl::span<const int64_t> axes);
+                     gsl::span<const int64_t> dims, gsl::span<const int64_t> axes,
+                     void* buffer = nullptr, size_t buffer_size = 0);
+
+/**
+ * Computes the size in bytes of the intermediate buffer reduce_sum_nd() uses to
+ * split a long reduction with few outputs over several blocks.
+ * @tparam T The data type. Only integer types are split.
+ * @return The size of the intermediate buffer. Zero when one block reduces each output.
+ */
+template <typename T>
+size_t compute_reduce_sum_nd_buffer_size(gsl::span<const int64_t> dims, gsl::span<const int64_t> axes) {
+  return detail::compute_reduce_sum_nd_intermediate_buffer_size(std::is_integral_v<T>, dims, axes);
+}
 
 /** Computes ArgMax/ArgMin indices over the last dimension in a row-major matrix.
  *

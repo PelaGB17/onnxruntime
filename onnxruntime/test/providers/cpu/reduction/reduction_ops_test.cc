@@ -2920,6 +2920,29 @@ TEST(ReductionOpTest, ReduceSum_int64_cancellation) {
   execution_providers.push_back(DefaultCudaExecutionProvider());
   test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
 }
+
+// Attention-mask style input: each row is ones followed by zeros, summed over the row. Long integer rows with few
+// outputs take the multi-block path, which uses a scratch buffer from the kernel.
+TEST(ReductionOpTest, ReduceSum_int64_long_rows) {
+  constexpr int64_t kLength = 100003;  // not a multiple of the 256-thread block
+  const std::vector<int64_t> valid_lengths{kLength, 65537};
+  std::vector<int64_t> data;
+  data.reserve(valid_lengths.size() * kLength);
+  for (int64_t valid_length : valid_lengths) {
+    for (int64_t i = 0; i < kLength; ++i) {
+      data.push_back(i < valid_length ? 1 : 0);
+    }
+  }
+  const int64_t rows = static_cast<int64_t>(valid_lengths.size());
+  OpTester test("ReduceSum", 13, onnxruntime::kOnnxDomain);
+  test.AddAttribute("keepdims", int64_t{1});
+  test.AddInput<int64_t>("data", {rows, kLength}, data);
+  test.AddInput<int64_t>("axes", {1}, {1});
+  test.AddOutput<int64_t>("reduced", {rows, 1}, valid_lengths);
+  std::vector<std::unique_ptr<IExecutionProvider>> execution_providers;
+  execution_providers.push_back(DefaultCudaExecutionProvider());
+  test.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &execution_providers);
+}
 #endif
 
 TEST(ReductionOpTest, ReduceSum_default_axes_keepdims) {

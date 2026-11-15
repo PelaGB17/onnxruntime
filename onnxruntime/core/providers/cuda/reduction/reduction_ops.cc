@@ -899,8 +899,14 @@ Status ReduceKernel<allow_multi_axes>::ComputeImpl(OpKernelContext* ctx, cudnnRe
     if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {                                             \
       if (cudnn_reduce_op == CUDNN_REDUCE_TENSOR_ADD &&                                                                   \
           !calculate_log_ && !calculate_sqt_ && !log_sum_exp_) {                                                          \
+        /* Long reductions with few outputs, such as the attention-mask sum of GQA decoders, are split  */                \
+        /* over several blocks. The scratch size depends only on the shape and the device, so it is the same every */     \
+        /* run, as CUDA graph replay requires. */                                                                         \
+        const size_t buffer_size = compute_reduce_sum_nd_buffer_size<CudaT>(X->Shape().GetDims(), axes);                  \
+        auto buffer = GetScratchBuffer<void>(buffer_size, GetComputeStream(ctx));                                         \
         return reduce_sum_nd(Stream(ctx), reinterpret_cast<const CudaT*>(X->Data<T>()),                                   \
-                             reinterpret_cast<CudaT*>(Y->MutableData<T>()), X->Shape().GetDims(), axes);                  \
+                             reinterpret_cast<CudaT*>(Y->MutableData<T>()), X->Shape().GetDims(), axes,                   \
+                             buffer.get(), buffer_size);                                                                  \
       }                                                                                                                   \
     }                                                                                                                     \
                                                                                                                           \
