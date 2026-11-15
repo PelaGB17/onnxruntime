@@ -371,6 +371,8 @@ QMoE::QMoE(const OpKernelInfo& op_kernel_info) : CudaKernel(op_kernel_info), MoE
   ORT_ENFORCE(row_tile_size_ == qmoe::kDisabledRowTileSize || qmoe::IsValidRowTileSize(row_tile_size_),
               row_tile_size_source, " must be 0 (disabled) or an integer in [1, ",
               std::numeric_limits<int>::max(), "], got ", row_tile_size_, ".");
+  default_row_tile_budget_bytes_ = onnxruntime::ParseEnvironmentVariableWithDefault<size_t>(
+      kQMoEDefaultRowTileBudgetBytesForTesting, qmoe::kDefaultRowTileScratchBudgetBytes);
   const auto configured_int_dequant_max_scratch_bytes =
       op_kernel_info.GetConfigOptions().GetConfigEntry(kQMoEIntDequantMaxScratchBytesConfig);
   const char* int_dequant_max_scratch_bytes_source = kQMoEIntDequantMaxScratchBytesConfig;
@@ -2117,7 +2119,7 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
     if (default_row_tile_size_ == 0) {
       const int runner_experts = narrow<int>(moe_params.num_experts);
       default_row_tile_size_ = qmoe::RowTileSizeForScratchBudget(
-          qmoe::kDefaultRowTileScratchBudgetBytes, [&](int64_t rows) {
+          default_row_tile_budget_bytes_, [&](int64_t rows) {
             const size_t runner_workspace_bytes = active_runner->getWorkspaceSize(
                 rows, moe_params.hidden_size, moe_params.inter_size, runner_experts, k_, kernel_activation_type,
                 parallelism_config, use_awq, swiglu_fusion);

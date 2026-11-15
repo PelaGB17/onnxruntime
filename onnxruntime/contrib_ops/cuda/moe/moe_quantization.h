@@ -28,6 +28,9 @@ using namespace onnxruntime::cuda;
 constexpr const char* kEnableQMoEKernelDebugInfo = "ORT_ENABLE_QMOE_KERNEL_DEBUG_INFO";
 constexpr const char* kQMoERowTileSize = "ORT_QMOE_ROW_TILE_SIZE";
 constexpr const char* kQMoERowTileSizeConfig = "ep.cuda.qmoe_row_tile_size";
+// Test-only: replaces qmoe::kDefaultRowTileScratchBudgetBytes when set, so GPU tests can reach the default row tile
+// with small shapes. Not a supported option.
+constexpr const char* kQMoEDefaultRowTileBudgetBytesForTesting = "ORT_QMOE_DEFAULT_ROW_TILE_BUDGET_BYTES_FOR_TESTING";
 constexpr const char* kQMoEIntDequantMaxScratchBytes = "ORT_QMOE_INT_DEQUANT_MAX_SCRATCH_BYTES";
 constexpr const char* kQMoEIntDequantMaxScratchBytesConfig = "ep.cuda.qmoe_int_dequant_max_scratch_bytes";
 constexpr const char* kQMoEDisableInt3TensorCorePrefill = "ORT_DISABLE_INT3_TENSORCORE_PREFILL";
@@ -159,6 +162,8 @@ class QMoE final : public CudaKernel, public MoEBase, public onnxruntime::moe_of
   bool row_tile_size_configured_ = false;
   // Budget-derived row tile of this node; resolved on first use under mGemmProfilerMutex (0 = not resolved yet).
   mutable int64_t default_row_tile_size_ = 0;
+  // Scratch budget for the default row tile, set in the constructor (see kQMoEDefaultRowTileBudgetBytesForTesting).
+  size_t default_row_tile_budget_bytes_ = 0;
   int64_t int_dequant_max_scratch_bytes_ = int64_t{1} << 30;
   // Static prefill options resolved once in the constructor so they cannot change between runs of a session.
   // The automatic expert-compaction cap is derived from the offload policy only for planned offload nodes.

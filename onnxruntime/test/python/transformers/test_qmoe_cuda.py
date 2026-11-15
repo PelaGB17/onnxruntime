@@ -3091,6 +3091,45 @@ class TestQMoEIntPrePackSmoke(unittest.TestCase):
             f"INT4 grouped-MoE row-tiled output differs from untiled output: max_diff={max_diff:.6f}",
         )
 
+    def test_int4_grouped_moe_default_row_tile_from_scratch_budget(self):
+        # With no row tile configured, dense INT grouped calls above 4,096 rows tile with a row count derived from a
+        # scratch budget. Small shapes never reach the 1.25 GiB default budget, so the test-only override sets a
+        # 1-byte budget: even the 4,096-row floor exceeds it, and the floor wins. hidden_size and inter_size are
+        # multiples of 64, as the SM80 INT4 prepacked weight layout requires. ORT_FORCE_DETERMINISTIC_MOE picks the
+        # GEMM tactic from the tile size instead of by timing, so the default and the equivalent explicit tile build
+        # the same plan and must match exactly.
+        tile = 4096
+        shape = dict(hidden_size=128, inter_size=128, num_experts=8, top_k=2, swiglu_fusion=1)
+        env = {"ORT_QMOE_DEFAULT_ROW_TILE_BUDGET_BYTES_FOR_TESTING": "1", "ORT_FORCE_DETERMINISTIC_MOE": "1"}
+        with patch.dict(os.environ, env):
+            # tile + 1 and 10,000 rows end in a partial tile (1 and 1,808 rows).
+            for rows in (tile - 1, tile, tile + 1, 2 * tile + 1808):
+                with self.subTest(rows=rows):
+                    default_output = self._run_one(**shape, batch_size=rows, session_config={})
+                    explicit_output = self._run_one(**shape, batch_size=rows, row_tile_size=tile)
+                    untiled_output = self._run_one(**shape, batch_size=rows, row_tile_size=0)
+                    numpy.testing.assert_array_equal(default_output, explicit_output)
+                    if rows <= tile:
+                        # At or below the floor the default does not tile.
+                        numpy.testing.assert_array_equal(default_output, untiled_output)
+                    max_diff = numpy.max(
+                        numpy.abs(untiled_output.astype(numpy.float32) - default_output.astype(numpy.float32))
+                    )
+                    self.assertLess(
+                        max_diff,
+                        0.02,
+                        f"rows={rows}: default row tile output differs from untiled output: max_diff={max_diff:.6f}",
+                    )
+
+        with patch.dict(os.environ, {"ORT_FORCE_DETERMINISTIC_MOE": "1"}):
+            os.environ.pop("ORT_QMOE_DEFAULT_ROW_TILE_BUDGET_BYTES_FOR_TESTING", None)
+            # Without the override the 1.25 GiB budget gives this shape a tile far above 10,000 rows: nothing tiles.
+            rows = 2 * tile + 1808
+            numpy.testing.assert_array_equal(
+                self._run_one(**shape, batch_size=rows, session_config={}),
+                self._run_one(**shape, batch_size=rows, row_tile_size=0),
+            )
+
 
 def _sm80_prepack_unsigned_codes(codes, bits):
     """Lay out unsigned ``[N, K]`` codes in the SM80 CUTLASS mixed-GEMM layout for 2/4-bit weights.
