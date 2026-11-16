@@ -216,7 +216,9 @@ def _create_session(model_bytes: bytes, session_entries: dict[str, str], enable_
     return ort.InferenceSession(model_bytes, sess_options=so, providers=[("CUDAExecutionProvider", ep_opts)])
 
 
-def _pick_sparse_blocks(rng: np.random.Generator, rows: int, dest_start: int, max_selected: int) -> tuple[np.ndarray, np.ndarray]:
+def _pick_sparse_blocks(
+    rng: np.random.Generator, rows: int, dest_start: int, max_selected: int
+) -> tuple[np.ndarray, np.ndarray]:
     indices = np.full((rows, max_selected), -1, dtype=np.int32)
     counts = np.zeros((rows,), dtype=np.int32)
     for r in range(rows):
@@ -293,8 +295,6 @@ class TestDynamicSparseAttentionKvStreaming(unittest.TestCase):
         ref_v = torch.zeros(cache_shape, dtype=torch_cache_dtype, device="cuda")
         dut_k_map = MappedHostBuffer(self.cudart, cache_nbytes)
         dut_v_map = MappedHostBuffer(self.cudart, cache_nbytes)
-
-        total_seq_cpu = np.array([cache_capacity], dtype=np.int32)
 
         def run_step(rows: int, dest_start: int, fixed_buffers=None, graph_run_opts=None):
             total_len = dest_start + rows

@@ -38,7 +38,7 @@ def load_lib():
     inc_ort = SRC_ROOT.parent / "include" / "onnxruntime"
     if sys.platform == "win32":
         out = tmp_dir / "qmoe_shared_layout.dll"
-        vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / (
+        vswhere = Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / (
             r"Microsoft Visual Studio\Installer\vswhere.exe"
         )
         vcvars = None
@@ -56,11 +56,11 @@ def load_lib():
         bat = tmp_dir / "build_qmoe.bat"
         bat.write_text(
             f'@echo off\r\ncall "{vcvars}" >nul || exit /b 1\r\n'
-            f'cl /nologo /O2 /std:c++20 /EHsc /LD /arch:AVX2 /DQMOE_SHARED_STANDALONE_DLL=1 '
+            f"cl /nologo /O2 /std:c++20 /EHsc /LD /arch:AVX2 /DQMOE_SHARED_STANDALONE_DLL=1 "
             f'/I"{SRC_ROOT}" /I"{inc_ort}" "{KERNEL_SRC}" /Fe:"{out}" /Fo:"{tmp_dir / "qmoe.obj"}"\r\n',
             encoding="utf-8",
         )
-        subprocess.check_call([os.environ.get("ComSpec", "cmd.exe"), "/c", str(bat)])
+        subprocess.check_call([os.environ.get("COMSPEC", "cmd.exe"), "/c", str(bat)])
     else:
         out = tmp_dir / "libqmoe_shared_layout.so"
         subprocess.check_call(
@@ -1090,11 +1090,7 @@ class Avx2KernelParityTest(unittest.TestCase):
         lib.qmoe_shared_set_disable_avx512_for_testing(1)
         try:
             for is_bf16 in (1, 0):
-                make_u16 = (
-                    f32_to_bf16_u16
-                    if is_bf16
-                    else lambda a: a.astype(np.float16).view(np.uint16)
-                )
+                make_u16 = f32_to_bf16_u16 if is_bf16 else lambda a: a.astype(np.float16).view(np.uint16)
                 s1_32 = make_u16(rng.uniform(0.005, 0.03, (n1, hidden // 32)))
                 s2_32 = make_u16(rng.uniform(0.005, 0.03, (hidden, inter // 32)))
                 s1_64 = make_u16(rng.uniform(0.005, 0.03, (n1, hidden // 64)))
@@ -1118,19 +1114,47 @@ class Avx2KernelParityTest(unittest.TestCase):
                         out_dut = np.zeros((m, hidden), dtype=np.float32)
                         self.assertEqual(
                             lib.qmoe_int4_expert_contribution(
-                                w1_i4.ctypes.data, s1_32.ctypes.data, b1.ctypes.data,
-                                w2_i4.ctypes.data, s2_32.ctypes.data, b2.ctypes.data,
-                                hidden, inter, x.ctypes.data, m, out_ref.ctypes.data,
-                                alpha, beta, limit, 1, is_bf16, 1, 1,
+                                w1_i4.ctypes.data,
+                                s1_32.ctypes.data,
+                                b1.ctypes.data,
+                                w2_i4.ctypes.data,
+                                s2_32.ctypes.data,
+                                b2.ctypes.data,
+                                hidden,
+                                inter,
+                                x.ctypes.data,
+                                m,
+                                out_ref.ctypes.data,
+                                alpha,
+                                beta,
+                                limit,
+                                1,
+                                is_bf16,
+                                1,
+                                1,
                             ),
                             1,
                         )
                         self.assertEqual(
                             lib.qmoe_int4_expert_contribution(
-                                w1_i4.ctypes.data, s1_32.ctypes.data, b1.ctypes.data,
-                                w2_i4.ctypes.data, s2_32.ctypes.data, b2.ctypes.data,
-                                hidden, inter, x.ctypes.data, m, out_dut.ctypes.data,
-                                alpha, beta, limit, 1, is_bf16, 1, 0,
+                                w1_i4.ctypes.data,
+                                s1_32.ctypes.data,
+                                b1.ctypes.data,
+                                w2_i4.ctypes.data,
+                                s2_32.ctypes.data,
+                                b2.ctypes.data,
+                                hidden,
+                                inter,
+                                x.ctypes.data,
+                                m,
+                                out_dut.ctypes.data,
+                                alpha,
+                                beta,
+                                limit,
+                                1,
+                                is_bf16,
+                                1,
+                                0,
                             ),
                             1,
                         )
@@ -1141,19 +1165,47 @@ class Avx2KernelParityTest(unittest.TestCase):
                         out_dut.fill(0.0)
                         self.assertEqual(
                             lib.qmoe_int3_expert_contribution(
-                                w1_i3.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
-                                w2_i3.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
-                                hidden, inter, 64, x.ctypes.data, m, out_ref.ctypes.data,
-                                alpha, beta, limit, is_bf16, 1, 1,
+                                w1_i3.ctypes.data,
+                                s1_64.ctypes.data,
+                                b1.ctypes.data,
+                                w2_i3.ctypes.data,
+                                s2_64.ctypes.data,
+                                b2.ctypes.data,
+                                hidden,
+                                inter,
+                                64,
+                                x.ctypes.data,
+                                m,
+                                out_ref.ctypes.data,
+                                alpha,
+                                beta,
+                                limit,
+                                is_bf16,
+                                1,
+                                1,
                             ),
                             1,
                         )
                         self.assertEqual(
                             lib.qmoe_int3_expert_contribution(
-                                w1_i3.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
-                                w2_i3.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
-                                hidden, inter, 64, x.ctypes.data, m, out_dut.ctypes.data,
-                                alpha, beta, limit, is_bf16, 1, 0,
+                                w1_i3.ctypes.data,
+                                s1_64.ctypes.data,
+                                b1.ctypes.data,
+                                w2_i3.ctypes.data,
+                                s2_64.ctypes.data,
+                                b2.ctypes.data,
+                                hidden,
+                                inter,
+                                64,
+                                x.ctypes.data,
+                                m,
+                                out_dut.ctypes.data,
+                                alpha,
+                                beta,
+                                limit,
+                                is_bf16,
+                                1,
+                                0,
                             ),
                             1,
                         )
@@ -1164,19 +1216,49 @@ class Avx2KernelParityTest(unittest.TestCase):
                         out_dut.fill(0.0)
                         self.assertEqual(
                             lib.qmoe_int2_expert_contribution(
-                                w1_i2.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
-                                w2_i2.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
-                                hidden, inter, 64, x.ctypes.data, m, out_ref.ctypes.data,
-                                alpha, beta, limit, 1, is_bf16, 1, 1,
+                                w1_i2.ctypes.data,
+                                s1_64.ctypes.data,
+                                b1.ctypes.data,
+                                w2_i2.ctypes.data,
+                                s2_64.ctypes.data,
+                                b2.ctypes.data,
+                                hidden,
+                                inter,
+                                64,
+                                x.ctypes.data,
+                                m,
+                                out_ref.ctypes.data,
+                                alpha,
+                                beta,
+                                limit,
+                                1,
+                                is_bf16,
+                                1,
+                                1,
                             ),
                             1,
                         )
                         self.assertEqual(
                             lib.qmoe_int2_expert_contribution(
-                                w1_i2.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
-                                w2_i2.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
-                                hidden, inter, 64, x.ctypes.data, m, out_dut.ctypes.data,
-                                alpha, beta, limit, 1, is_bf16, 1, 0,
+                                w1_i2.ctypes.data,
+                                s1_64.ctypes.data,
+                                b1.ctypes.data,
+                                w2_i2.ctypes.data,
+                                s2_64.ctypes.data,
+                                b2.ctypes.data,
+                                hidden,
+                                inter,
+                                64,
+                                x.ctypes.data,
+                                m,
+                                out_dut.ctypes.data,
+                                alpha,
+                                beta,
+                                limit,
+                                1,
+                                is_bf16,
+                                1,
+                                0,
                             ),
                             1,
                         )

@@ -582,7 +582,7 @@ inline __m256 Avx2ExpVec8(__m256 x) noexcept {
 }
 
 inline __m256 Avx2EvalSwiGlu8(__m256 gate, __m256 up, float alpha, float beta, float limit,
-                                                      bool has_limit, bool bf16_out, bool fp16_out) noexcept {
+                              bool has_limit, bool bf16_out, bool fp16_out) noexcept {
   if (has_limit) {
     const __m256 vlim = _mm256_set1_ps(limit);
     const __m256 vnlim = _mm256_set1_ps(-limit);

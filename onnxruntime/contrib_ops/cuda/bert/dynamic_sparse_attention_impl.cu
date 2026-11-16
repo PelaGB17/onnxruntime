@@ -614,8 +614,10 @@ __global__ void FusedDynamicSparseAttentionKernel(const T* query,
       phys_index = index;
       if (page_table != nullptr) {
         const int sl = page_table[index >> 2];
-        if (sl < 0) valid = false;
-        else phys_index = (sl << 2) | (index & 3);
+        if (sl < 0)
+          valid = false;
+        else
+          phys_index = (sl << 2) | (index & 3);
       }
       if (valid) {
         const int64_t offset =
@@ -639,8 +641,10 @@ __global__ void FusedDynamicSparseAttentionKernel(const T* query,
         phys_index = index;
         if (valid && page_table != nullptr) {
           const int sl = page_table[index >> 2];
-          if (sl < 0) valid = false;
-          else phys_index = (sl << 2) | (index & 3);
+          if (sl < 0)
+            valid = false;
+          else
+            phys_index = (sl << 2) | (index & 3);
         }
         if (valid) {
           const int64_t offset =
@@ -1527,8 +1531,10 @@ __global__ void SplitDynamicSparseAttentionKernel(const T* query,
         phys_index = index;
         if (page_table != nullptr) {
           const int sl = page_table[index >> 2];
-          if (sl < 0) valid = false;
-          else phys_index = (sl << 2) | (index & 3);
+          if (sl < 0)
+            valid = false;
+          else
+            phys_index = (sl << 2) | (index & 3);
         }
         if (valid) {
           const int64_t offset =
@@ -1552,8 +1558,10 @@ __global__ void SplitDynamicSparseAttentionKernel(const T* query,
           phys_index = index;
           if (valid && page_table != nullptr) {
             const int sl = page_table[index >> 2];
-            if (sl < 0) valid = false;
-            else phys_index = (sl << 2) | (index & 3);
+            if (sl < 0)
+              valid = false;
+            else
+              phys_index = (sl << 2) | (index & 3);
           }
           if (valid) {
             const int64_t offset =
@@ -2647,7 +2655,8 @@ __global__ void DsaPrefillStageCopyOutKernel(
     uint8_t* hv = host_value + off;
     if ((span_bytes & 15) == 0 &&
         ((reinterpret_cast<uintptr_t>(sk) | reinterpret_cast<uintptr_t>(sv) |
-          reinterpret_cast<uintptr_t>(hk) | reinterpret_cast<uintptr_t>(hv)) & 15) == 0) {
+          reinterpret_cast<uintptr_t>(hk) | reinterpret_cast<uintptr_t>(hv)) &
+         15) == 0) {
       const int64_t vecs = span_bytes >> 4;
       const uint4* sk4 = reinterpret_cast<const uint4*>(sk);
       const uint4* sv4 = reinterpret_cast<const uint4*>(sv);
