@@ -2610,6 +2610,367 @@ class TestGgufPackedOps(unittest.TestCase):
         pos = np.maximum(pre, 0.0)
         np.testing.assert_array_equal(got, _round_to_dtype(pos * pos, dtype))
 
+    def test_matmul_packed_bf16_multi_subtile_decode_up_to_64(self):
+        if TensorProto.BFLOAT16 not in self.activation_dtypes:
+            self.skipTest("Requires CUDA SM80+")
+        rng = np.random.default_rng(20261115)
+        dtype = TensorProto.BFLOAT16
+        cases = [
+            (14, 256, 210, 2560, 512),
+            (14, 256, 210, 6144, 2560),
+            (14, 256, 210, 2560, 16400),
+            (8, 32, 34, 256, 35),
+            (8, 32, 34, 256, 16401),
+            (20, 32, 18, 256, 35),
+            (23, 256, 136, 256, 35),
+        ]
+        for gtype, bel, bbytes, k, n in cases:
+            raw = _make_synthetic_gguf_rows(rng, n, k, gtype, bel, bbytes, quant_scale=2**-8)
+            weights = _round_to_dtype(_dequantize_weights(raw, k, gtype), dtype)
+            session = _session(_matmul_model(k, n, raw.shape[1], gtype, dtype), "CUDAExecutionProvider")
+            a65 = _round_to_dtype(rng.standard_normal((65, k), dtype=np.float32) * 0.2, dtype)
+            ref65 = _round_to_dtype(a65 @ weights.T, dtype)
+            got8 = session.run(None, {"A_f32": a65[:8], "B": raw})[0]
+            np.testing.assert_allclose(got8, ref65[:8], rtol=1e-2, atol=2e-3)
+            got16 = session.run(None, {"A_f32": a65[:16], "B": raw})[0]
+            for m in (9, 16, 17, 32, 33, 56, 64, 65):
+                with self.subTest(gtype=gtype, k=k, n=n, m=m):
+                    got = session.run(None, {"A_f32": a65[:m], "B": raw})[0]
+                    np.testing.assert_allclose(got, ref65[:m], rtol=1e-2, atol=2e-3)
+                    if n > 16384 and (k % 128) == 0 and gtype in (8, 14) and m <= 64:
+                        # SM90 WGMMA large-N kernel uses identical K accumulation order across kMaxM in {16, 32, 64}.
+                        rows_cmp = min(m, 16)
+                        np.testing.assert_array_equal(got[:rows_cmp].view(np.uint32), got16[:rows_cmp].view(np.uint32))
+                    elif (
+                        (m <= 16 or (m <= 32 and n > 16384))
+                        and not (gtype == 8 and n < 8192)
+                        and not (gtype in (8, 14) and n >= 2560 and k >= 6144)
+                    ):
+                        np.testing.assert_array_equal(got[:8].view(np.uint32), got8.view(np.uint32))
+
+        # Also verify unaligned device buffers on both WarpKSplit (n=65) and SM90 WGMMA (n=16403) at m=16, 56.
+        for n_unaligned in (65, 16403):
+            raw_q6 = _make_synthetic_gguf_rows(rng, n_unaligned, 256, 14, 256, 210, quant_scale=2**-8)
+            w_q6 = _round_to_dtype(_dequantize_weights(raw_q6, 256, 14), dtype)
+            bound_sess = _session(
+                _bound_matmul_model(256, n_unaligned, raw_q6.shape[1], 14, dtype), "CUDAExecutionProvider"
+            )
+            for m in (16, 56):
+                a = _round_to_dtype(rng.standard_normal((m, 256), dtype=np.float32) * 0.2, dtype)
+                got_unaligned = _run_cuda_bound(
+                    bound_sess,
+                    {"A": (dtype, _activation_storage(a, dtype), 2), "B": (TensorProto.UINT8, raw_q6, 1)},
+                    (m, n_unaligned),
+                    dtype,
+                )
+                np.testing.assert_allclose(got_unaligned, _round_to_dtype(a @ w_q6.T, dtype), rtol=1e-2, atol=2e-3)
+
+    def test_moe_packed_bf16_multi_slot_decode_and_64route_prefill(self):
+        if TensorProto.BFLOAT16 not in self.activation_dtypes:
+            self.skipTest("Requires CUDA SM80+")
+        dtype = TensorProto.BFLOAT16
+        format_triples = [
+            (((22, 256, 82), (22, 256, 82), (20, 32, 18)), 2**-10),
+            (((18, 256, 98), (18, 256, 98), (20, 32, 18)), 2**-10),
+            (((23, 256, 136), (23, 256, 136), (20, 32, 18)), 2**-12),
+            (((22, 256, 82), (22, 256, 82), (42, 64, 18)), 2**-7),
+        ]
+        # Covers B=1..2 8-route decode (80..160), B=4..8 16-route decode (240..640),
+        # and >640-route SM90 128-route WGMMA prefill across all adaptive N tiers (16/32/64/96/128).
+        for formats, qscale in format_triples:
+            with self.subTest(formats=formats):
+                self._check_moe(
+                    16,
+                    256,
+                    128,
+                    dtype,
+                    formats,
+                    (8, 16, 24, 32, 64, 65, 96, 160, 256),
+                    True,
+                    quant_scale=qscale,
+                    top_k=10,
+                )
+        # Also exercise non-128-multiple inter_size (64) fallback path and single-pass chunking up to 8192 rows.
+        self._check_moe(
+            4, 256, 64, dtype, ((18, 256, 98), (18, 256, 98), (20, 32, 18)), (4097,), True, quant_scale=2**-10, top_k=4
+        )
+
+    def test_matmul_packed_sm90_splitk_body_shapes(self):
+        if TensorProto.BFLOAT16 not in self.activation_dtypes:
+            self.skipTest("Requires CUDA SM80+")
+        rng = np.random.default_rng(20261116)
+        dtype = TensorProto.BFLOAT16
+        cases = (
+            (14, 256, 210, 2560, 6144, "none"),  # Q6_K, sk=5 (480 CTAs) at M<=32, Deq+cuBLAS at M=64
+            (14, 256, 210, 2560, 12288, "none"),  # Q6_K, sk=2 (384 CTAs), Vec4 reduction across M=9..64
+            (8, 32, 34, 4096, 2560, "none"),  # Q8_0, sk=8 (320 CTAs), Vec4 reduction + Q8_0Half128Stage
+            (14, 256, 210, 4096, 2561, "silu"),  # Q6_K, sk=8 (328 CTAs), odd N + SiLU -> scalar reduction
+        )
+        for gtype, bel, bbytes, k, n, act in cases:
+            raw = _make_synthetic_gguf_rows(rng, n, k, gtype, bel, bbytes, quant_scale=2**-8)
+            weights = _round_to_dtype(_dequantize_weights(raw, k, gtype), dtype)
+            model = _model(
+                [
+                    helper.make_node("Cast", ["A_f32"], ["A_typed"], to=int(dtype)),
+                    helper.make_node(
+                        "MatMulPacked",
+                        ["A_typed", "B"],
+                        ["Y_typed"],
+                        domain="com.microsoft",
+                        K=k,
+                        N=n,
+                        packed_type=gtype,
+                        activation_type=act,
+                    ),
+                    helper.make_node("Cast", ["Y_typed"], ["Y_f32"], to=int(TensorProto.FLOAT)),
+                ],
+                [
+                    helper.make_tensor_value_info("A_f32", TensorProto.FLOAT, ["M", k]),
+                    helper.make_tensor_value_info("B", TensorProto.UINT8, [n, raw.shape[1]]),
+                ],
+                [helper.make_tensor_value_info("Y_f32", TensorProto.FLOAT, ["M", n])],
+            )
+            session = _session(model, "CUDAExecutionProvider")
+            a64 = _round_to_dtype(rng.standard_normal((64, k), dtype=np.float32) * 0.2, dtype)
+            pre64 = _round_to_dtype(a64 @ weights.T, dtype)
+            ref64 = (
+                pre64 if act == "none" else _round_to_dtype(pre64 / (1.0 + np.exp(np.clip(-pre64, -80.0, 80.0))), dtype)
+            )
+            for m in (9, 16, 17, 32, 64):
+                with self.subTest(gtype=gtype, k=k, n=n, act=act, m=m):
+                    got = session.run(None, {"A_f32": a64[:m], "B": raw})[0]
+                    np.testing.assert_allclose(got, ref64[:m], rtol=1e-2, atol=2e-3)
+
+    def test_gated_delta_net_qwen_s2_multibatch_and_chunked_fp32(self):
+        if TensorProto.BFLOAT16 not in self.activation_dtypes:
+            self.skipTest("Requires CUDA SM80+")
+        rng = np.random.default_rng(20261117)
+        dtype = TensorProto.BFLOAT16
+        hq, hk, hv, dk, dv = 16, 16, 48, 128, 128
+        packed_dim = (hq + hk) * dk + hv * dv
+
+        def build_gdn_model(packed_qkv: bool, ragged: bool, with_capture: bool):
+            lead = ["T"] if ragged else ["B", "S"]
+            inputs = []
+            node_inputs = []
+            casts = []
+            if packed_qkv:
+                inputs.append(helper.make_tensor_value_info("qkv_f32", TensorProto.FLOAT, [*lead, packed_dim]))
+                casts.append(helper.make_node("Cast", ["qkv_f32"], ["qkv_bf16"], to=int(dtype)))
+                node_inputs.extend(["qkv_bf16", "", ""])
+            else:
+                inputs.extend(
+                    [
+                        helper.make_tensor_value_info("q_f32", TensorProto.FLOAT, [*lead, hq, dk]),
+                        helper.make_tensor_value_info("k_f32", TensorProto.FLOAT, [*lead, hk, dk]),
+                        helper.make_tensor_value_info("v_f32", TensorProto.FLOAT, [*lead, hv, dv]),
+                    ]
+                )
+                casts.extend(
+                    [
+                        helper.make_node("Cast", ["q_f32"], ["q_bf16"], to=int(dtype)),
+                        helper.make_node("Cast", ["k_f32"], ["k_bf16"], to=int(dtype)),
+                        helper.make_node("Cast", ["v_f32"], ["v_bf16"], to=int(dtype)),
+                    ]
+                )
+                node_inputs.extend(["q_bf16", "k_bf16", "v_bf16"])
+            if ragged:
+                inputs.append(helper.make_tensor_value_info("cu_seqlens", TensorProto.INT32, ["B1"]))
+                node_inputs.append("cu_seqlens")
+            else:
+                node_inputs.append("")
+            inputs.extend(
+                [
+                    helper.make_tensor_value_info("decay_f32", TensorProto.FLOAT, [*lead, hv]),
+                    helper.make_tensor_value_info("beta_f32", TensorProto.FLOAT, [*lead, hv]),
+                    helper.make_tensor_value_info("state0", TensorProto.FLOAT, ["B", hv, dv, dk]),
+                    helper.make_tensor_value_info("a_log", TensorProto.FLOAT, [hv]),
+                    helper.make_tensor_value_info("dt_bias", TensorProto.FLOAT, [hv]),
+                ]
+            )
+            casts.extend(
+                [
+                    helper.make_node("Cast", ["decay_f32"], ["decay_bf16"], to=int(dtype)),
+                    helper.make_node("Cast", ["beta_f32"], ["beta_bf16"], to=int(dtype)),
+                ]
+            )
+            node_inputs.extend(["decay_bf16", "beta_bf16", "state0", "a_log", "dt_bias"])
+            attrs = {
+                "update_rule": "gated_delta",
+                "gate_activation": "softplus",
+                "beta_activation": "sigmoid",
+                "qk_l2_norm": 1,
+            }
+            outputs = [
+                helper.make_tensor_value_info("out_f32", TensorProto.FLOAT, [*lead, hv, dv]),
+                helper.make_tensor_value_info("final_state", TensorProto.FLOAT, ["B", hv, dv, dk]),
+            ]
+            node_outputs = ["out_bf16", "final_state"]
+            if with_capture:
+                attrs["state_update_capacity"] = 8
+                inputs.extend(
+                    [
+                        helper.make_tensor_value_info("capture_count", TensorProto.INT32, ["B"]),
+                        helper.make_tensor_value_info("state_update_active", TensorProto.INT32, [1]),
+                    ]
+                )
+                node_inputs.extend(["capture_count", "state_update_active"])
+                node_outputs.append("state_update")
+                outputs.append(helper.make_tensor_value_info("state_update", TensorProto.FLOAT, ["B", None]))
+            gdn = helper.make_node("GatedDeltaNet", node_inputs, node_outputs, domain="com.microsoft", **attrs)
+            out_cast = helper.make_node("Cast", ["out_bf16"], ["out_f32"], to=int(TensorProto.FLOAT))
+            return _model([*casts, gdn, out_cast], inputs, outputs)
+
+        a_log = rng.uniform(-0.1, 0.1, size=(hv,)).astype(np.float32)
+        dt_bias = rng.uniform(-0.1, 0.1, size=(hv,)).astype(np.float32)
+
+        # 1. Multi-batch QwenS2 decode (B in {1, 2, 4, 8}, S in {1, 8}, packed & unpacked, with state capture)
+        # must match ORT_GDN_S2_SPECIALIZE=0 bit-for-bit or within 1 ULP.
+        for packed_qkv in (True, False):
+            m_proto = build_gdn_model(packed_qkv=packed_qkv, ragged=False, with_capture=True)
+            for b, s in ((1, 8), (2, 1), (4, 8), (8, 8)):
+                q = _round_to_dtype(rng.uniform(-0.5, 0.5, (b, s, hq, dk)).astype(np.float32), dtype)
+                k = _round_to_dtype(rng.uniform(-0.5, 0.5, (b, s, hk, dk)).astype(np.float32), dtype)
+                v = _round_to_dtype(rng.uniform(-0.5, 0.5, (b, s, hv, dv)).astype(np.float32), dtype)
+                decay = _round_to_dtype(rng.uniform(-1.5, -0.2, (b, s, hv)).astype(np.float32), dtype)
+                beta = _round_to_dtype(rng.uniform(-0.5, 0.5, (b, s, hv)).astype(np.float32), dtype)
+                state0 = rng.uniform(-0.05, 0.05, (b, hv, dv, dk)).astype(np.float32)
+                cap_cnt = np.full((b,), min(s, 5), dtype=np.int32)
+                feed = {
+                    "decay_f32": decay,
+                    "beta_f32": beta,
+                    "state0": state0,
+                    "a_log": a_log,
+                    "dt_bias": dt_bias,
+                    "capture_count": cap_cnt,
+                    "state_update_active": np.array([1], dtype=np.int32),
+                }
+                if packed_qkv:
+                    feed["qkv_f32"] = np.concatenate(
+                        [q.reshape(b, s, -1), k.reshape(b, s, -1), v.reshape(b, s, -1)], axis=-1
+                    )
+                else:
+                    feed.update({"q_f32": q, "k_f32": k, "v_f32": v})
+                # Note: ORT_GDN_S2_SPECIALIZE is cached via static local, so compare packed vs unpacked + reference!
+                sess = _session(m_proto, "CUDAExecutionProvider")
+                out_got, st_got, su_got = sess.run(None, feed)
+                # Sequential float64 reference for output and final_state
+                st_ref = state0.astype(np.float64).copy()
+                out_ref = np.zeros((b, s, hv, dv), dtype=np.float32)
+                for bi in range(b):
+                    for ti in range(s):
+                        qf = q[bi, ti].astype(np.float64)
+                        kf = k[bi, ti].astype(np.float64)
+                        qf /= np.sqrt(np.sum(qf * qf, axis=-1, keepdims=True) + 1e-12)
+                        kf /= np.sqrt(np.sum(kf * kf, axis=-1, keepdims=True) + 1e-12)
+                        for hvi in range(hv):
+                            hqi = hvi * hq // hv
+                            raw_d = float(decay[bi, ti, hvi]) + float(dt_bias[hvi])
+                            sp = raw_d if raw_d > 20.0 else np.log1p(np.exp(raw_d))
+                            eff_d = max(-np.exp(float(a_log[hvi])) * sp, -5.0)
+                            g_sc = np.exp(eff_d)
+                            bt = 1.0 / (1.0 + np.exp(-float(beta[bi, ti, hvi])))
+                            st_ref[bi, hvi] *= g_sc
+                            retr = st_ref[bi, hvi] @ kf[hqi]
+                            delta = bt * (v[bi, ti, hvi].astype(np.float64) - retr)
+                            st_ref[bi, hvi] += np.outer(delta, kf[hqi])
+                            out_ref[bi, ti, hvi] = _round_to_dtype(
+                                np.array((st_ref[bi, hvi] @ qf[hqi]) / np.sqrt(dk), dtype=np.float32), dtype
+                            )
+                with self.subTest(packed_qkv=packed_qkv, b=b, s=s):
+                    np.testing.assert_allclose(out_got, out_ref, rtol=5e-3, atol=2e-3)
+                    np.testing.assert_allclose(st_got, st_ref.astype(np.float32), rtol=1e-5, atol=1e-5)
+                    self.assertTrue(np.all(np.isfinite(su_got)))
+
+        # 2. Ragged batch where slot 0 has seq_len=12 (>8 fallback) and slots 1..3 have seq_len<=8 (shared fast path),
+        # plus chunked prefill (B=2, S=192 -> Engine::kChunked Bf16Precision::kFp32) vs sequential float64 reference.
+        ragged_proto = build_gdn_model(packed_qkv=True, ragged=True, with_capture=False)
+        ragged_sess = _session(ragged_proto, "CUDAExecutionProvider")
+        cu = np.array([0, 12, 12, 15, 20], dtype=np.int32)
+        tot = int(cu[-1])
+        qr = _round_to_dtype(rng.uniform(-0.5, 0.5, (tot, hq, dk)).astype(np.float32), dtype)
+        kr = _round_to_dtype(rng.uniform(-0.5, 0.5, (tot, hk, dk)).astype(np.float32), dtype)
+        vr = _round_to_dtype(rng.uniform(-0.5, 0.5, (tot, hv, dv)).astype(np.float32), dtype)
+        dr = _round_to_dtype(rng.uniform(-1.5, -0.2, (tot, hv)).astype(np.float32), dtype)
+        br = _round_to_dtype(rng.uniform(-0.5, 0.5, (tot, hv)).astype(np.float32), dtype)
+        st0_r = rng.uniform(-0.05, 0.05, (4, hv, dv, dk)).astype(np.float32)
+        out_r, st_r = ragged_sess.run(
+            None,
+            {
+                "qkv_f32": np.concatenate([qr.reshape(tot, -1), kr.reshape(tot, -1), vr.reshape(tot, -1)], axis=-1),
+                "cu_seqlens": cu,
+                "decay_f32": dr,
+                "beta_f32": br,
+                "state0": st0_r,
+                "a_log": a_log,
+                "dt_bias": dt_bias,
+            },
+        )
+        st_r_ref = st0_r.astype(np.float64).copy()
+        for bi in range(4):
+            for tok in range(int(cu[bi]), int(cu[bi + 1])):
+                qf = qr[tok].astype(np.float64)
+                kf = kr[tok].astype(np.float64)
+                qf /= np.sqrt(np.sum(qf * qf, axis=-1, keepdims=True) + 1e-12)
+                kf /= np.sqrt(np.sum(kf * kf, axis=-1, keepdims=True) + 1e-12)
+                for hvi in range(hv):
+                    hqi = hvi * hq // hv
+                    raw_d = float(dr[tok, hvi]) + float(dt_bias[hvi])
+                    sp = raw_d if raw_d > 20.0 else np.log1p(np.exp(raw_d))
+                    g_sc = np.exp(max(-np.exp(float(a_log[hvi])) * sp, -5.0))
+                    bt = 1.0 / (1.0 + np.exp(-float(br[tok, hvi])))
+                    st_r_ref[bi, hvi] *= g_sc
+                    delta = bt * (vr[tok, hvi].astype(np.float64) - (st_r_ref[bi, hvi] @ kf[hqi]))
+                    st_r_ref[bi, hvi] += np.outer(delta, kf[hqi])
+        np.testing.assert_allclose(st_r, st_r_ref.astype(np.float32), rtol=1e-5, atol=1e-5)
+        self.assertTrue(np.all(np.isfinite(out_r)))
+
+        # 3. Chunked prefill (B=2, S=192 -> 3 chunks of BT=64, Bf16Precision::kFp32).
+        chunk_proto = build_gdn_model(packed_qkv=False, ragged=False, with_capture=False)
+        chunk_sess = _session(chunk_proto, "CUDAExecutionProvider")
+        bc, sc = 2, 192
+        qc = _round_to_dtype(rng.uniform(-0.5, 0.5, (bc, sc, hq, dk)).astype(np.float32), dtype)
+        kc = _round_to_dtype(rng.uniform(-0.5, 0.5, (bc, sc, hk, dk)).astype(np.float32), dtype)
+        vc = _round_to_dtype(rng.uniform(-0.5, 0.5, (bc, sc, hv, dv)).astype(np.float32), dtype)
+        dc = _round_to_dtype(rng.uniform(-1.5, -0.2, (bc, sc, hv)).astype(np.float32), dtype)
+        btc = _round_to_dtype(rng.uniform(-0.5, 0.5, (bc, sc, hv)).astype(np.float32), dtype)
+        st0_c = rng.uniform(-0.05, 0.05, (bc, hv, dv, dk)).astype(np.float32)
+        out_c, st_c = chunk_sess.run(
+            None,
+            {
+                "q_f32": qc,
+                "k_f32": kc,
+                "v_f32": vc,
+                "decay_f32": dc,
+                "beta_f32": btc,
+                "state0": st0_c,
+                "a_log": a_log,
+                "dt_bias": dt_bias,
+            },
+        )
+        st_c_ref = st0_c.astype(np.float64).copy()
+        out_c_ref = np.zeros((bc, sc, hv, dv), dtype=np.float32)
+        for bi in range(bc):
+            for ti in range(sc):
+                qf = qc[bi, ti].astype(np.float64)
+                kf = kc[bi, ti].astype(np.float64)
+                qf /= np.sqrt(np.sum(qf * qf, axis=-1, keepdims=True) + 1e-12)
+                kf /= np.sqrt(np.sum(kf * kf, axis=-1, keepdims=True) + 1e-12)
+                for hvi in range(hv):
+                    hqi = hvi * hq // hv
+                    raw_d = float(dc[bi, ti, hvi]) + float(dt_bias[hvi])
+                    sp = raw_d if raw_d > 20.0 else np.log1p(np.exp(raw_d))
+                    g_sc = np.exp(max(-np.exp(float(a_log[hvi])) * sp, -5.0))
+                    bt = 1.0 / (1.0 + np.exp(-float(btc[bi, ti, hvi])))
+                    st_c_ref[bi, hvi] *= g_sc
+                    delta = bt * (vc[bi, ti, hvi].astype(np.float64) - (st_c_ref[bi, hvi] @ kf[hqi]))
+                    st_c_ref[bi, hvi] += np.outer(delta, kf[hqi])
+                    out_c_ref[bi, ti, hvi] = _round_to_dtype(
+                        np.array((st_c_ref[bi, hvi] @ qf[hqi]) / np.sqrt(dk), dtype=np.float32), dtype
+                    )
+        np.testing.assert_allclose(out_c, out_c_ref, rtol=1e-2, atol=3e-3)
+        np.testing.assert_allclose(st_c, st_c_ref.astype(np.float32), rtol=2e-3, atol=1e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

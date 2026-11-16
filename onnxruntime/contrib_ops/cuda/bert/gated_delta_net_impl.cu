@@ -326,9 +326,10 @@ __device__ __forceinline__ void RunChunkedStep(
         const int t = pair_idx / (DK / 2), d = (pair_idx % (DK / 2)) * 2;
         const float sq = __expf(s.gc[t]);
         const uint32_t qh2 = *reinterpret_cast<const uint32_t*>(s.q_h + t * L::kKh + d);
-        const MT* qh_e = reinterpret_cast<const MT*>(&qh2);
+        MT qh_e0, qh_e1;
+        UnpackHalf2(qh2, qh_e0, qh_e1);
         *reinterpret_cast<uint32_t*>(s.q_h + t * L::kKh + d) =
-            PackHalf2(ScaleElem(qh_e[0], sq), ScaleElem(qh_e[1], sq));
+            PackHalf2(ScaleElem(qh_e0, sq), ScaleElem(qh_e1, sq));
       }
       __syncthreads();
 
@@ -344,9 +345,10 @@ __device__ __forceinline__ void RunChunkedStep(
         const int t = pair_idx / (DK / 2), d = (pair_idx % (DK / 2)) * 2;
         const float sk = __expf(g_total - s.gc[t]);
         const uint32_t kh2 = *reinterpret_cast<const uint32_t*>(s.k_h + t * L::kKh + d);
-        const MT* kh_e = reinterpret_cast<const MT*>(&kh2);
+        MT kh_e0, kh_e1;
+        UnpackHalf2(kh2, kh_e0, kh_e1);
         *reinterpret_cast<uint32_t*>(s.k_h + t * L::kKh + d) =
-            PackHalf2(ScaleElem(kh_e[0], sk), ScaleElem(kh_e[1], sk));
+            PackHalf2(ScaleElem(kh_e0, sk), ScaleElem(kh_e1, sk));
       }
       for (int pair_idx = tid; pair_idx < (DK * kDVB) / 2; pair_idx += kChunkedThreads) {
         const int r = pair_idx / (kDVB / 2), c = (pair_idx % (kDVB / 2)) * 2;
@@ -768,6 +770,119 @@ __global__ __launch_bounds__(32 * kWarps) void GatedDeltaNetDecodeWarpKernel(
     s[i] = pack.initial_state != nullptr ? pack.initial_state[st_off + k] : 0.0f;
   }
 
+  if constexpr (QwenS2 && DK == 128 && kWarps == 8) {
+    if (seq_len <= 8) {
+      // Cooperative CTA prologue across all 8 warps sharing (b, hv):
+      //   - warp `w < seq_len` loads & L2-normalizes q[w] and k[w] once for all 8 warps (8x fewer loads & shuffles)
+      //   - thread `tid < seq_len` computes decay[tid] & beta[tid] once for all 256 threads (256x fewer MUFU ops)
+      __shared__ float s_q[8][128];
+      __shared__ float s_k[8][128];
+      __shared__ float s_decay[8];
+      __shared__ float s_beta[8];
+
+      if (warp < seq_len) {
+        const int64_t tok = tok_base + warp;
+        float kv[kRegs], qv[kRegs];
+        float nq = 0.0f, nk = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kRegs; ++i) {
+          const int k = lane + i * 32;
+          kv[i] = static_cast<float>(pack.key[tok * k_stride + hk * DK + k]);
+          qv[i] = static_cast<float>(pack.query[tok * q_stride + hq * DK + k]);
+          nq += qv[i] * qv[i];
+          nk += kv[i] * kv[i];
+        }
+        const float rq = rsqrtf(WarpReduceK<DK>(nq) + 1e-12f);
+        const float rk = rsqrtf(WarpReduceK<DK>(nk) + 1e-12f);
+#pragma unroll
+        for (int i = 0; i < kRegs; ++i) {
+          const int k = lane + i * 32;
+          qv[i] *= rq;
+          kv[i] *= rk;
+          s_q[warp][k] = qv[i];
+          s_k[warp][k] = kv[i];
+        }
+        if (warp < capture_count && blockIdx.z == 0 && hv == hk * 3) {
+          float* update_key = StateUpdateKey(pack, p, b, warp, hk, DK, d_v);
+          if (update_key != nullptr) {
+#pragma unroll
+            for (int i = 0; i < kRegs; ++i) {
+              update_key[lane + i * 32] = kv[i];
+            }
+          }
+        }
+      }
+
+      const int tid = warp * 32 + lane;
+      if (tid < seq_len) {
+        const int64_t tok = tok_base + tid;
+        const int64_t gi = tok * 48 + hv;
+        const float decay_val =
+            pack.decay != nullptr
+                ? __expf(EffectiveDecay(LoadGate<T>(pack.decay, gi, InputTypeGates), pack.a_log, pack.dt_bias, hv,
+                                        GateActivation::kSoftplusDecay, p.gate_lower_bound))
+                : 1.0f;
+        const float beta_val =
+            pack.beta != nullptr ? EffectiveBeta(LoadGate<T>(pack.beta, gi, InputTypeGates), BetaActivation::kSigmoid)
+                                 : 1.0f;
+        s_decay[tid] = decay_val;
+        s_beta[tid] = beta_val;
+        if (tid < capture_count && blockIdx.z == 0) {
+          float* update_decay = StateUpdateDecay(pack, p, b, tid, hv, DK, d_v);
+          if (update_decay != nullptr) {
+            *update_decay = decay_val;
+          }
+        }
+      }
+      __syncthreads();
+
+      for (int t = 0; t < seq_len; ++t) {
+        const int64_t tok = tok_base + t;
+        const float decay_scalar = s_decay[t];
+        const float beta_t = s_beta[t];
+        float kv[kRegs], qv[kRegs];
+        float r = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kRegs; ++i) {
+          const int k = lane + i * 32;
+          kv[i] = s_k[t][k];
+          qv[i] = s_q[t][k];
+          s[i] *= decay_scalar;
+          r += s[i] * kv[i];
+        }
+        r = WarpReduceK<DK>(r);
+        const float vv = static_cast<float>(pack.value[tok * v_input_stride + hv * d_v + col]);
+        const float delta = beta_t * (vv - r);
+
+        if (t < capture_count && lane == 0) {
+          float* update_delta = StateUpdateDelta(pack, p, b, t, hv, DK, d_v);
+          if (update_delta != nullptr) {
+            update_delta[col] = delta;
+          }
+        }
+
+        float o = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kRegs; ++i) {
+          s[i] += kv[i] * delta;
+          o += s[i] * qv[i];
+        }
+        o = WarpReduceK<DK>(o);
+        if (lane == 0) {
+          pack.output[tok * v_stride + hv * d_v + col] = static_cast<T>(p.scale * o);
+        }
+      }
+
+      if (pack.final_state != nullptr) {
+#pragma unroll
+        for (int i = 0; i < kRegs; ++i) {
+          pack.final_state[st_off + lane + i * 32] = s[i];
+        }
+      }
+      return;
+    }
+  }
+
   for (int t = 0; t < seq_len; ++t) {
     const int64_t tok = tok_base + t;
     const int64_t gi = tok * p.num_heads_v + hv;
@@ -1055,26 +1170,30 @@ void LaunchDecodeWarpSized(const Descriptor& desc, const VariantPack<T>& pack,
       GatedDeltaNetDecodeWarpKernel<T, 64, Warps, InputTypeGates, PackedQkv>
           <<<grid, block, 0, stream>>>(pack, p, desc.head_size_v);
       break;
-    case 128:
-      if constexpr (PackedQkv) {
-        static const int specialize = ParseEnvironmentVariableWithDefault<int>("ORT_GDN_S2_SPECIALIZE", 1);
-        ORT_ENFORCE(specialize == 0 || specialize == 1, "ORT_GDN_S2_SPECIALIZE must be 0 or 1.");
-        if (specialize && desc.batch == 1 && p.total_tokens == p.uniform_len &&
-            p.total_tokens >= 1 && p.total_tokens <= 8 &&
-            p.num_heads_q == 16 && p.num_heads_k == 16 && p.num_heads_v == 48 &&
-            desc.head_size_v == 128 && pack.cu_seqlens == nullptr &&
-            p.gate_activation == GateActivation::kSoftplusDecay &&
-            p.beta_activation == BetaActivation::kSigmoid && p.update_rule == UpdateRule::kGatedDelta &&
-            p.qk_l2_norm && p.decay_per_key_dim_flag == 0 &&
-            !p.state_update_tail_pass && !p.short_row_tail_pass) {
-          GatedDeltaNetDecodeWarpKernel<T, 128, Warps, InputTypeGates, PackedQkv, true>
-              <<<grid, block, 0, stream>>>(pack, p, desc.head_size_v);
-          break;
-        }
+    case 128: {
+      static const int specialize = ParseEnvironmentVariableWithDefault<int>("ORT_GDN_S2_SPECIALIZE", 1);
+      ORT_ENFORCE(specialize == 0 || specialize == 1, "ORT_GDN_S2_SPECIALIZE must be 0 or 1.");
+      const bool uniform_s2_len =
+          (pack.cu_seqlens == nullptr) && (p.uniform_len >= 1) && (p.uniform_len <= 8) &&
+          (p.total_tokens == static_cast<int64_t>(desc.batch) * p.uniform_len);
+      const bool ragged_s2_len =
+          (pack.cu_seqlens != nullptr) && (p.total_tokens >= 1) &&
+          (p.total_tokens <= static_cast<int64_t>(desc.batch) * 8);
+      if (specialize && desc.batch >= 1 && (uniform_s2_len || ragged_s2_len) &&
+          p.num_heads_q == 16 && p.num_heads_k == 16 && p.num_heads_v == 48 &&
+          desc.head_size_v == 128 &&
+          p.gate_activation == GateActivation::kSoftplusDecay &&
+          p.beta_activation == BetaActivation::kSigmoid && p.update_rule == UpdateRule::kGatedDelta &&
+          p.qk_l2_norm && p.decay_per_key_dim_flag == 0 &&
+          !p.state_update_tail_pass && !p.short_row_tail_pass) {
+        GatedDeltaNetDecodeWarpKernel<T, 128, Warps, InputTypeGates, PackedQkv, true>
+            <<<grid, block, 0, stream>>>(pack, p, desc.head_size_v);
+        break;
       }
       GatedDeltaNetDecodeWarpKernel<T, 128, Warps, InputTypeGates, PackedQkv>
           <<<grid, block, 0, stream>>>(pack, p, desc.head_size_v);
       break;
+    }
     default:
       GatedDeltaNetDecodeWarpKernel<T, 256, Warps, InputTypeGates, PackedQkv>
           <<<grid, block, 0, stream>>>(pack, p, desc.head_size_v);
