@@ -8,8 +8,11 @@ Parity test and benchmark performance of SparseAttention. Requires Nvidia GPU of
 """
 
 import os
+import sys
 import unittest
+from unittest.mock import patch
 
+import numpy as np
 import torch
 from benchmark_mha import InputFormats
 from onnx import TensorProto, helper
@@ -19,21 +22,15 @@ from torch import Tensor
 from onnxruntime import InferenceSession, SessionOptions, get_available_providers
 from onnxruntime.transformers.io_binding_helper import CudaSession
 
-try:
-    from gqa_test_helper import (
-        AttentionConfig,
-        GroupQueryAttentionConfig,
-        OrtGroupQueryAttention,
-    )
-except ImportError:
-    import sys
-
+if os.path.dirname(__file__) not in sys.path:
     sys.path.insert(0, os.path.dirname(__file__))
-    from gqa_test_helper import (
-        AttentionConfig,
-        GroupQueryAttentionConfig,
-        OrtGroupQueryAttention,
-    )
+
+from cuda_plugin_ep_helper import resolve_cuda_plugin_ep
+from gqa_test_helper import (
+    AttentionConfig,
+    GroupQueryAttentionConfig,
+    OrtGroupQueryAttention,
+)
 
 ENABLE_DEBUG = False
 
@@ -858,6 +855,203 @@ class TestSparseAttention(unittest.TestCase):
             self.run_relevance_no_past(sm, device)
             self.run_relevance_past(sm, device, do_rotary=False)
             self.run_relevance_past(sm, device, do_rotary=True)
+
+
+class TestPackedSparseAttentionIndexerTensorCore(unittest.TestCase):
+    """Parity tests for QsaScoreTileTopKTcKernel and QsaRaggedPrefillScoreTcKernel."""
+
+    def _build_qsa_model(self, state_capacity: int, token_budget: int = 128):
+        node = helper.make_node(
+            "PackedSparseAttentionIndexer",
+            inputs=[
+                "query",
+                "key",
+                "query_norm_weight",
+                "key_norm_weight",
+                "cos_cache",
+                "sin_cache",
+                "cumulative_sequence_lengths",
+                "past_sequence_lengths",
+                "",
+                "",
+                "",
+                "",
+                "past_key_state",
+                "past_kv_buffer",
+                "",
+                "past_state_lengths",
+            ],
+            outputs=[
+                "selected_indices",
+                "selected_counts",
+                "present_key_state",
+                "present_kv_buffer",
+                "",
+                "present_state_lengths",
+            ],
+            domain="com.microsoft",
+            policy_mode="qsa",
+            compress_ratio=4,
+            state_capacity=state_capacity,
+            token_budget=token_budget,
+        )
+        graph = helper.make_graph(
+            [node],
+            "qsa_tc_parity",
+            [
+                helper.make_tensor_value_info("query", TensorProto.FLOAT, ["T", 512]),
+                helper.make_tensor_value_info("key", TensorProto.FLOAT, ["T", 128]),
+                helper.make_tensor_value_info("query_norm_weight", TensorProto.FLOAT, [128]),
+                helper.make_tensor_value_info("key_norm_weight", TensorProto.FLOAT, [128]),
+                helper.make_tensor_value_info("cos_cache", TensorProto.FLOAT, ["max_pos", 64]),
+                helper.make_tensor_value_info("sin_cache", TensorProto.FLOAT, ["max_pos", 64]),
+                helper.make_tensor_value_info("cumulative_sequence_lengths", TensorProto.INT32, ["B1"]),
+                helper.make_tensor_value_info("past_sequence_lengths", TensorProto.INT32, ["B"]),
+                helper.make_tensor_value_info("past_key_state", TensorProto.FLOAT, ["B", state_capacity, 128]),
+                helper.make_tensor_value_info("past_kv_buffer", TensorProto.FLOAT, ["B", 7, 128]),
+                helper.make_tensor_value_info("past_state_lengths", TensorProto.INT32, ["B", 2]),
+            ],
+            [
+                helper.make_tensor_value_info("selected_indices", TensorProto.INT32, ["T", "out_cap"]),
+                helper.make_tensor_value_info("selected_counts", TensorProto.INT32, ["T"]),
+                helper.make_tensor_value_info("present_key_state", TensorProto.FLOAT, ["B", state_capacity, 128]),
+                helper.make_tensor_value_info("present_kv_buffer", TensorProto.FLOAT, ["B", 7, 128]),
+                helper.make_tensor_value_info("present_state_lengths", TensorProto.INT32, ["B", 2]),
+            ],
+        )
+        model = helper.make_model(
+            graph, opset_imports=[helper.make_opsetid("", 20), helper.make_opsetid("com.microsoft", 1)]
+        )
+        model.ir_version = 10
+        return model.SerializeToString()
+
+    def _check_tc_vs_scalar(self, cu_seqlens, past_lens, cap, seed):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest("Requires SM80+ CUDA GPU")
+
+        rng = np.random.default_rng(seed)
+        batch = len(past_lens)
+        total_t = int(cu_seqlens[-1])
+        max_pos = int(max(p + (cu_seqlens[i + 1] - cu_seqlens[i]) for i, p in enumerate(past_lens)) + 16)
+        past_state_lengths = np.array([[p // 4, p % 4] for p in past_lens], dtype=np.int32)
+        feeds = {
+            "query": rng.standard_normal((total_t, 512), dtype=np.float32),
+            "key": rng.standard_normal((total_t, 128), dtype=np.float32),
+            "query_norm_weight": rng.uniform(0.5, 1.5, (128,)).astype(np.float32),
+            "key_norm_weight": rng.uniform(0.5, 1.5, (128,)).astype(np.float32),
+            "cos_cache": np.cos(rng.uniform(-1.0, 1.0, (max_pos, 64))).astype(np.float32),
+            "sin_cache": np.sin(rng.uniform(-1.0, 1.0, (max_pos, 64))).astype(np.float32),
+            "cumulative_sequence_lengths": np.asarray(cu_seqlens, dtype=np.int32),
+            "past_sequence_lengths": np.asarray(past_lens, dtype=np.int32),
+            "past_key_state": rng.standard_normal((batch, cap, 128), dtype=np.float32),
+            "past_kv_buffer": rng.standard_normal((batch, 7, 128), dtype=np.float32),
+            "past_state_lengths": past_state_lengths,
+        }
+        model_bytes = self._build_qsa_model(cap)
+        ep = resolve_cuda_plugin_ep("CUDAExecutionProvider")
+        results = {}
+        for tc_flag in ("0", "1"):
+            with patch.dict(os.environ, {"ORT_PACKED_SPARSE_INDEXER_TC": tc_flag}):
+                opts = SessionOptions()
+                opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+                sess = InferenceSession(model_bytes, opts, providers=[ep])
+                results[tc_flag] = sess.run(None, feeds)
+
+        np.testing.assert_array_equal(results["1"][1], results["0"][1])
+        idx_ref, idx_tc, counts = results["0"][0], results["1"][0], results["0"][1]
+        for row in range(total_t):
+            n = int(counts[row])
+            self.assertEqual(set(idx_tc[row, :n].tolist()), set(idx_ref[row, :n].tolist()))
+        for out_i in range(2, 5):
+            np.testing.assert_allclose(results["1"][out_i], results["0"][out_i], rtol=1e-5, atol=1e-5)
+
+    def test_multi_slot_decode_and_ragged_prefill_tc_parity(self):
+        # 4-slot speculative verify (8 tokens/slot -> QsaScoreTileTopKTcKernel)
+        self._check_tc_vs_scalar([0, 8, 16, 24, 32], [8192, 4100, 16384, 2050], cap=4112, seed=20261115)
+        # 2-slot ragged prefill across split/tile boundaries (-> QsaRaggedPrefillScoreTcKernel)
+        self._check_tc_vs_scalar([0, 72, 165], [16384, 8196], cap=4200, seed=20261116)
+
+    def test_bounded_partial_topk_fused_emit_parity(self):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest("Requires SM80+ CUDA GPU")
+
+        # Exercises QsaPartialTopKKernel (block_topk = 2048 // 4 = 512 > 32, total_tokens = 96 > 64) across:
+        #   slot 0: past=400   -> block_count <= 512 (direct sort fast path)
+        #   slot 1: past=2049  -> selected == 512 with tail_count = 2..3 against non-multiple-of-4 output_capacity=2051
+        #   slot 2: past=4800  -> 512 < block_count <= 2048 (direct SMEM candidate fast path)
+        #   slot 3: past=12000 -> block_count > 2048 (float4 histogram + SMEM candidate compaction)
+        #   slot 4: past=10000 with zeroed key state -> exact smallest-index tie-breaking on equal scores
+        # Reference runs each 24-token slot independently (total_tokens = 24 <= 64 -> hierarchical Top-K path
+        # with ORT_PACKED_SPARSE_INDEXER_TC=0), providing an independent algorithmic oracle.
+        rng = np.random.default_rng(20261118)
+        cu_seqlens = [0, 24, 48, 72, 96, 120]
+        past_lens = [400, 2049, 4800, 12000, 10000]
+        cap = 4096
+        batch = len(past_lens)
+        total_t = cu_seqlens[-1]
+        max_pos = 12200
+        past_key_state = rng.standard_normal((batch, cap, 128), dtype=np.float32)
+        past_key_state[4, :2600] = 0.0  # force massive ties at 0.0f across > 2048 blocks
+        query = rng.standard_normal((total_t, 512), dtype=np.float32)
+        key = rng.standard_normal((total_t, 128), dtype=np.float32)
+        q_norm = rng.uniform(0.5, 1.5, (128,)).astype(np.float32)
+        k_norm = rng.uniform(0.5, 1.5, (128,)).astype(np.float32)
+        cos_c = np.cos(rng.uniform(-1.0, 1.0, (max_pos, 64))).astype(np.float32)
+        sin_c = np.sin(rng.uniform(-1.0, 1.0, (max_pos, 64))).astype(np.float32)
+        past_kv_buf = rng.standard_normal((batch, 7, 128), dtype=np.float32)
+        past_st_lens = np.array([[p // 4, p % 4] for p in past_lens], dtype=np.int32)
+        feeds = {
+            "query": query,
+            "key": key,
+            "query_norm_weight": q_norm,
+            "key_norm_weight": k_norm,
+            "cos_cache": cos_c,
+            "sin_cache": sin_c,
+            "cumulative_sequence_lengths": np.asarray(cu_seqlens, dtype=np.int32),
+            "past_sequence_lengths": np.asarray(past_lens, dtype=np.int32),
+            "past_key_state": past_key_state.copy(),
+            "past_kv_buffer": past_kv_buf.copy(),
+            "past_state_lengths": past_st_lens.copy(),
+        }
+        model_bytes = self._build_qsa_model(cap, token_budget=2048)
+        ep = resolve_cuda_plugin_ep("CUDAExecutionProvider")
+        cuda_opts = SessionOptions()
+        cuda_opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+        cuda_out = InferenceSession(model_bytes, cuda_opts, providers=[ep]).run(None, feeds)
+
+        with patch.dict(os.environ, {"ORT_PACKED_SPARSE_INDEXER_TC": "0"}):
+            ref_sess = InferenceSession(model_bytes, cuda_opts, providers=[ep])
+            ref_indices, ref_counts = [], []
+            for b in range(batch):
+                s0, s1 = cu_seqlens[b], cu_seqlens[b + 1]
+                sub_out = ref_sess.run(
+                    None,
+                    {
+                        "query": query[s0:s1],
+                        "key": key[s0:s1],
+                        "query_norm_weight": q_norm,
+                        "key_norm_weight": k_norm,
+                        "cos_cache": cos_c,
+                        "sin_cache": sin_c,
+                        "cumulative_sequence_lengths": np.array([0, s1 - s0], dtype=np.int32),
+                        "past_sequence_lengths": np.array([past_lens[b]], dtype=np.int32),
+                        "past_key_state": past_key_state[b : b + 1].copy(),
+                        "past_kv_buffer": past_kv_buf[b : b + 1].copy(),
+                        "past_state_lengths": past_st_lens[b : b + 1].copy(),
+                    },
+                )
+                ref_indices.append(sub_out[0])
+                ref_counts.append(sub_out[1])
+        ref_idx = np.concatenate(ref_indices, axis=0)
+        ref_cnt = np.concatenate(ref_counts, axis=0)
+
+        np.testing.assert_array_equal(cuda_out[1], ref_cnt)
+        for row in range(total_t):
+            n = int(ref_cnt[row])
+            self.assertEqual(set(cuda_out[0][row, :n].tolist()), set(ref_idx[row, :n].tolist()))
+            np.testing.assert_array_equal(cuda_out[0][row, n:], -1)
+        # Slot 4 (rows 96..119) has tied 0.0f scores -> verify exact deterministic index sequence!
+        np.testing.assert_array_equal(cuda_out[0][96:120], ref_idx[96:120])
 
 
 if __name__ == "__main__":
