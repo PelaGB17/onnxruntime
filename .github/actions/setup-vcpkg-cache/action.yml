@@ -40,6 +40,9 @@ runs:
             if not compiler:
                 raise RuntimeError("Initialize the selected MSVC environment before setting up the vcpkg cache.")
             # Servicing updates can change cl.exe without changing VCToolsVersion.
+            # The full file version distinguishes known patches, but vcpkg hashes compiler
+            # contents into package ABIs. Hash bytes rather than assume equal versions
+            # imply equal binaries, avoiding immutable cache hits with no reusable packages.
             compiler_hash = hashlib.sha256(Path(compiler).read_bytes()).hexdigest()
             toolchain = {"cl": compiler_hash}
             for name in ("VCToolsVersion", "WindowsSDKVersion", "VSCMD_ARG_HOST_ARCH", "VSCMD_ARG_TGT_ARCH"):
