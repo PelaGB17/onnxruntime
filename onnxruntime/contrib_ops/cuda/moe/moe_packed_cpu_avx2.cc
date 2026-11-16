@@ -1443,7 +1443,7 @@ int GgufDotRowsBy4Q8Avx2(int type, const uint8_t* row0, size_t row_bytes, int n_
       for (int r = 0; r < R; ++r) {
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         for (int i = 0; i < nb; ++i) {
-          const uint8_t* b0 = dr0 + i * 18, *b1 = dr1 + i * 18, *b2 = dr2 + i * 18, *b3 = dr3 + i * 18;
+          const uint8_t *b0 = dr0 + i * 18, *b1 = dr1 + i * 18, *b2 = dr2 + i * 18, *b3 = dr3 + i * 18;
           const float wd0 = Fp16ToFloatFast(LoadU16Le(b0)), wd1 = Fp16ToFloatFast(LoadU16Le(b1));
           const float wd2 = Fp16ToFloatFast(LoadU16Le(b2)), wd3 = Fp16ToFloatFast(LoadU16Le(b3));
           for (int h = 0; h < 2; ++h) {

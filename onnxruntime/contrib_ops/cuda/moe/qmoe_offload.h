@@ -188,7 +188,11 @@ class QMoEOffload final : public onnxruntime::cuda::CudaKernel, public MoEBase {
   bool v3_compact_shared_ = false;
   bool v4_planned_mode_ = false;
   onnxruntime::moe_offload::MoeOffloadSessionPolicy v4_policy_{};
+  onnxruntime::moe_offload::MoeExpertSourceDescriptor v4_source_desc_{};
   onnxruntime::moe_offload::MoeNodeExecutionPlan v4_plan_{};
+  bool use_mapped_host_eviction_ = false;
+  std::vector<uint8_t> mapped_evictable_expert_;
+  std::vector<int32_t> mapped_evictable_expert_ids_;
   std::array<std::string, 6> v4_bank_paths_{};
   std::array<uint64_t, 6> v4_bank_offsets_{};
   bool nvfp4_mode_ = false;

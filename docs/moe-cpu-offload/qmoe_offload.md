@@ -364,14 +364,18 @@ per kernel and stop with the kernel.
 On Windows WDDM workstations (including 16 GiB consumer GPUs and hosts whose physical RAM is smaller than the full
 model package):
 
-- **Bounded Host Cache Fallback on Low-RAM Windows Hosts**: When a bounded `host_expert_bytes` cache exceeds 50% of
-  physical RAM on Windows, `PlanAndAdmitSession` automatically replaces the pinned bounded host cache with the
-  direct read-only file mapping (`ORT_QMOE_FORCE_BOUNDED_HOST_CACHE=1` retains the bounded cache), avoiding
-  `cudaHostRegister` exhaustion of later pinned allocations.
-- **16 GiB WDDM Post-Session Reserve Calibration (`total_vram < 20 GiB`)**: Because `OnSessionInitializationEnd`
-  queries free VRAM after non-MoE target initializers and shared weight pools are already resident on the device,
-  `PlanAndAdmitSession` credits the already-allocated non-MoE footprint from `reserve_device_bytes` on `< 20 GiB`
-  GPUs (`ORT_QMOE_STRICT_DEVICE_EXPERT_BYTES=1` disables dynamic clamping).
+- **Bounded Host Cache Backing on Low-RAM Windows Hosts**: `PlanAndAdmitSession` always preserves explicit
+  `host_expert_bytes` cap accounting (`bounded_file_cache=1` and `host_cache_slots`) across both `MoEPacked` and
+  `QMoEOffload`. When `host_expert_bytes` exceeds 50% of physical RAM on Windows, `QMoEOffload` switches its
+  backing storage from a private pinned `FileExpertStore` buffer to the read-only OS file mapping while enforcing
+  `host_cache_slots` via mapped-page eviction (`ORT_QMOE_FORCE_BOUNDED_HOST_CACHE=1` retains `FileExpertStore`),
+  matching `MoEPacked` without committing duplicate private memory or starving pinned allocations.
+- **16 GiB WDDM Post-Session Reserve Calibration (`total_vram < 20 GiB`)**: Because `QueryPlatformUsableDeviceMemory`
+  already accounts for the Windows WDDM OS reserve and DXGI local budget, `< 20 GiB` devices add zero extra WDDM
+  surcharge while preserving caller-configured `reserve_device_bytes` in full for post-session external state
+  (`ORT_QMOE_PREALLOCATED_RESERVE_BYTES` optionally credits an independently identified pre-allocated weight
+  allowance bounded by bytes already committed in the session budget account; `ORT_QMOE_STRICT_DEVICE_EXPERT_BYTES=1`
+  disables dynamic clamping).
 - **Asynchronous Low-Priority Prefill Look-Ahead & Decode Prefetch**:
   - `ORT_QMOE_WIN_PREFILL_MEMPRIO` (default `1` = `MEMORY_PRIORITY_VERY_LOW`, `0` = unchanged): faults streamed
     prefill pages at very low memory priority so Windows repurposes one-pass prefill pages before cold experts

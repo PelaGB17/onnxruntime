@@ -365,30 +365,54 @@ class MappedPrefetchService final {
     return instance;
   }
 
+  ~MappedPrefetchService() {
+    if (state_) {
+      {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->stop = true;
+        state_->queue.clear();
+      }
+      state_->cv.notify_all();
+    }
+    if (worker_.joinable()) {
+      worker_.detach();
+    }
+  }
+
   void Post(MappedPrefetchRanges&& ranges, int memory_priority) {
     if (ranges.empty()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (!state_) {
+      state_ = std::make_shared<State>();
+    }
+    std::lock_guard<std::mutex> lock(state_->mutex);
     if (!worker_.joinable()) {
-      stop_ = false;
-      worker_ = std::thread([this] { Loop(); });
+      state_->stop = false;
+      auto st = state_;
+      worker_ = std::thread([st] { Loop(st); });
     }
     constexpr size_t kMaxQueued = 4;
-    if (queue_.size() >= kMaxQueued) queue_.pop_front();
-    queue_.push_back(Request{std::move(ranges), memory_priority});
-    cv_.notify_one();
+    if (state_->queue.size() >= kMaxQueued) state_->queue.pop_front();
+    state_->queue.push_back(Request{std::move(ranges), memory_priority});
+    state_->cv.notify_one();
   }
 
   void Shutdown() noexcept {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!worker_.joinable()) return;
-      stop_ = true;
-      cv_.notify_one();
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    if (!worker_.joinable()) return;
+    if (state_) {
+      {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->stop = true;
+      }
+      state_->cv.notify_all();
     }
     worker_.join();
-    std::lock_guard<std::mutex> lock(mutex_);
-    queue_.clear();
-    stop_ = false;
+    if (state_) {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      state_->queue.clear();
+      state_->stop = false;
+    }
   }
 
  private:
@@ -397,16 +421,26 @@ class MappedPrefetchService final {
     int memory_priority;
   };
 
-  void Loop() {
+  struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Request> queue;
+    bool stop = false;
+  };
+
+  MappedPrefetchService() = default;
+
+  static void Loop(std::shared_ptr<State> state) {
+    qmoe::NameCurrentThread("qmoe-prefetch");
     int current_priority = -1;
     for (;;) {
       Request request;
       {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-        if (stop_) return;
-        request = std::move(queue_.front());
-        queue_.pop_front();
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait(lock, [&state] { return state->stop || !state->queue.empty(); });
+        if (state->stop) return;
+        request = std::move(state->queue.front());
+        state->queue.pop_front();
       }
       const int priority = request.memory_priority > 0 ? request.memory_priority : MEMORY_PRIORITY_NORMAL;
       if (priority != current_priority) {
@@ -420,11 +454,9 @@ class MappedPrefetchService final {
     }
   }
 
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  std::deque<Request> queue_;
+  std::mutex lifecycle_mutex_;
+  std::shared_ptr<State> state_;
   std::thread worker_;
-  bool stop_ = false;
 };
 #endif
 
@@ -2746,7 +2778,11 @@ QMoEOffload::LiveBackendCount::LiveBackendCount() noexcept {
 }
 
 QMoEOffload::LiveBackendCount::~LiveBackendCount() {
-  g_live_offload_backends.fetch_sub(1, std::memory_order_acq_rel);
+  if (g_live_offload_backends.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+#if defined(_WIN32)
+    MappedPrefetchService::Instance().Shutdown();
+#endif
+  }
 }
 
 namespace {
@@ -2777,16 +2813,21 @@ bool QMoEOffload::PostMappedNonResidentPrefetch() const {
                                  static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw()),
                                  static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw()),
                                  static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw())};
+  auto skip_expert = [this](int e) noexcept -> bool {
+    const size_t idx = static_cast<size_t>(e);
+    if (idx < expert_slot_.size() && expert_slot_[idx] >= 0) return true;
+    if (idx < mapped_evictable_expert_.size() && mapped_evictable_expert_[idx] != 0) return true;
+    return false;
+  };
   MappedPrefetchRanges ranges;
   ranges.reserve(256);
   for (int expert = 0; expert < num_experts_;) {
-    if (static_cast<size_t>(expert) < expert_slot_.size() && expert_slot_[expert] >= 0) {
+    if (skip_expert(expert)) {
       ++expert;
       continue;
     }
     int end_expert = expert + 1;
-    while (end_expert < num_experts_ &&
-           !(static_cast<size_t>(end_expert) < expert_slot_.size() && expert_slot_[end_expert] >= 0)) {
+    while (end_expert < num_experts_ && !skip_expert(end_expert)) {
       ++end_expert;
     }
     const size_t span_cnt = static_cast<size_t>(end_expert - expert);
@@ -2796,6 +2837,7 @@ bool QMoEOffload::PostMappedNonResidentPrefetch() const {
     }
     expert = end_expert;
   }
+  if (ranges.empty()) return false;
   mapped_prefetched_once_.store(true, std::memory_order_relaxed);
   MappedPrefetchService::Instance().Post(std::move(ranges), PrefillMemoryPriority());
   return true;
@@ -2863,6 +2905,7 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info,
       MoEBase(info, GetDeviceProp()),
       v4_planned_mode_(true),
       v4_policy_(policy),
+      v4_source_desc_(desc),
       v4_plan_(plan) {
   ORT_ENFORCE(!swiglu_limit_after_activation_, "QMoE offload does not support post-activation SwiGLU clipping.");
   for (size_t b = 0; b < 6; ++b) {
@@ -4196,6 +4239,36 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
           t->DataRaw(), t->SizeInBytes()));
     }
   }
+#if defined(_WIN32)
+  // When a bounded host_expert_bytes cap exceeds half of physical RAM on Windows, allocating and page-locking a
+  // private FileExpertStore buffer commits pagefile-backed memory and starves subsequent pinned allocations. Switch
+  // the backing storage to the read-only OS file mapping while preserving the admitted host_cache_slots cap via
+  // mapped-page eviction (matching MoEPacked). ORT_QMOE_FORCE_BOUNDED_HOST_CACHE=1 keeps FileExpertStore.
+  if (v4_planned_mode_ && host_cache_bytes_ > 0 && v4_plan_.use_file_backing && v4_plan_.host_cache_slots > 0 &&
+      !v4_policy_.host_expert_bytes.is_auto &&
+      (int4_bank_mode_ || int2_bank_mode_ || (int3_bank_mode_ && !expert_blocks_)) &&
+      nvfp4_fc1_w_ && nvfp4_fc2_w_ && nvfp4_fc1_s_ && nvfp4_fc2_s_) {
+    char force_buf[8]{};
+    const DWORD force_len = GetEnvironmentVariableA("ORT_QMOE_FORCE_BOUNDED_HOST_CACHE", force_buf, sizeof(force_buf));
+    const bool force_bounded = (force_len > 0 && force_len < sizeof(force_buf) && force_buf[0] == '1');
+    MEMORYSTATUSEX ram_stat{};
+    ram_stat.dwLength = sizeof(ram_stat);
+    auto is_mapped_view = [](const Tensor* t) noexcept -> bool {
+      MEMORY_BASIC_INFORMATION mbi{};
+      return t != nullptr && t->DataRaw() != nullptr &&
+             VirtualQuery(t->DataRaw(), &mbi, sizeof(mbi)) != 0 &&
+             mbi.State == MEM_COMMIT && mbi.Type == MEM_MAPPED;
+    };
+    if (!force_bounded && GlobalMemoryStatusEx(&ram_stat) &&
+        v4_policy_.host_expert_bytes.bytes > ram_stat.ullTotalPhys / 2 &&
+        is_mapped_view(nvfp4_fc1_w_) && is_mapped_view(nvfp4_fc2_w_) &&
+        is_mapped_view(nvfp4_fc1_s_) && is_mapped_view(nvfp4_fc2_s_)) {
+      host_cache_bytes_ = 0;
+      swap_victim_to_host_cache_ = false;
+      use_mapped_host_eviction_ = (v4_plan_.host_cache_slots < num_experts_ - base_resident_slots_);
+    }
+  }
+#endif
   if (host_cache_bytes_ > 0) InitializeBoundedHostCache();
 
   if (int4_bank_mode_ && ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_INT4_PREFILL_GEMM", 1) == 1) {
@@ -4329,8 +4402,11 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
 
   if (resident_slots_ > 0) {
     if (v4_planned_mode_) {
+      if (use_mapped_host_eviction_) {
+        stream_promotions_ = 0;
+      }
       resident_promotions_ =
-          (!deterministic_replay_ && v4_plan_.enable_background_promotion && spare_slots_ > 0)
+          (!deterministic_replay_ && !use_mapped_host_eviction_ && v4_plan_.enable_background_promotion && spare_slots_ > 0)
               ? std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_RESIDENT_PROMOTIONS", 2), 0, 64)
               : 0;
     } else {
@@ -4500,6 +4576,38 @@ void QMoEOffload::InitializeNvfp4Offload(const OpKernelInfo& info) {
                                  SafeInt<size_t>(num_experts_) * sizeof(int), cudaMemcpyHostToDevice));
       slot_table_dirty_ = false;
     }
+#if defined(_WIN32)
+    if (use_mapped_host_eviction_) {
+      mapped_evictable_expert_.assign(static_cast<size_t>(num_experts_), 0);
+      const int max_cold_to_evict =
+          std::max<int>(0, (num_experts_ - base_resident_slots_) - static_cast<int>(v4_plan_.host_cache_slots));
+      int evicted_cnt = 0;
+      for (auto it = ranked_experts_.rbegin();
+           it != ranked_experts_.rend() && evicted_cnt < max_cold_to_evict; ++it) {
+        const int exp = *it;
+        if (exp < 0 || exp >= num_experts_) continue;
+        if (expert_slot_[static_cast<size_t>(exp)] >= 0 ||
+            mapped_evictable_expert_[static_cast<size_t>(exp)] != 0) {
+          continue;
+        }
+        mapped_evictable_expert_[static_cast<size_t>(exp)] = 1;
+        mapped_evictable_expert_ids_.push_back(static_cast<int32_t>(exp));
+        ++evicted_cnt;
+      }
+      for (int exp = num_experts_ - 1; exp >= 0 && evicted_cnt < max_cold_to_evict; --exp) {
+        if (expert_slot_[static_cast<size_t>(exp)] >= 0 ||
+            mapped_evictable_expert_[static_cast<size_t>(exp)] != 0) {
+          continue;
+        }
+        mapped_evictable_expert_[static_cast<size_t>(exp)] = 1;
+        mapped_evictable_expert_ids_.push_back(static_cast<int32_t>(exp));
+        ++evicted_cnt;
+      }
+      if (!mapped_evictable_expert_ids_.empty()) {
+        onnxruntime::cuda::QMoESessionController::EvictUploadedHostPages(v4_source_desc_, mapped_evictable_expert_ids_);
+      }
+    }
+#endif
     if (host_cache_bytes_ > 0 && ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_HOST_CACHE_PREWARM", 1) == 1) {
       std::vector<int32_t> cold_to_warm;
       const size_t target_warm = file_expert_store_.CacheSlots();
@@ -8011,6 +8119,23 @@ int QMoEOffload::RunColdExperts(CpuWork& work, int group_count, const ActT* host
       timing_write_ns_ += ns(t_write, t_end);
     }
   }
+#if defined(_WIN32)
+  if (!mapped_evictable_expert_.empty()) {
+    std::vector<int32_t> touched_evictable;
+    int last_expert = -1;
+    for (const auto& call : calls) {
+      if (call.expert == last_expert) continue;
+      last_expert = call.expert;
+      if (call.expert >= 0 && static_cast<size_t>(call.expert) < mapped_evictable_expert_.size() &&
+          mapped_evictable_expert_[static_cast<size_t>(call.expert)] != 0) {
+        touched_evictable.push_back(static_cast<int32_t>(call.expert));
+      }
+    }
+    if (!touched_evictable.empty()) {
+      onnxruntime::cuda::QMoESessionController::EvictUploadedHostPages(v4_source_desc_, touched_evictable);
+    }
+  }
+#endif
   return cpu_rows_written;
 }
 
@@ -9243,6 +9368,21 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
             } else {
               for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(count) * 4; ++t) stage_wave_fn(t);
             }
+#if defined(_WIN32)
+            if (!mapped_evictable_expert_.empty()) {
+              std::vector<int32_t> wave_evictable;
+              for (int r = 0; r < count; ++r) {
+                const int exp_id = stream_list[first + r];
+                if (exp_id >= 0 && static_cast<size_t>(exp_id) < mapped_evictable_expert_.size() &&
+                    mapped_evictable_expert_[static_cast<size_t>(exp_id)] != 0) {
+                  wave_evictable.push_back(static_cast<int32_t>(exp_id));
+                }
+              }
+              if (!wave_evictable.empty()) {
+                onnxruntime::cuda::QMoESessionController::EvictUploadedHostPages(v4_source_desc_, wave_evictable);
+              }
+            }
+#endif
             CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(
                 shared.landing + offsets[0], wave_w1_pinned,
                 static_cast<size_t>(SafeInt<size_t>(count) * resident_bank_bytes_[0]),

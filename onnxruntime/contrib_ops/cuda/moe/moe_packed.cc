@@ -225,32 +225,56 @@ class MoEPackedMappedPrefetchService final {
     return svc;
   }
 
+  ~MoEPackedMappedPrefetchService() {
+    if (state_) {
+      {
+        std::lock_guard<std::mutex> lk(state_->mu);
+        state_->stop = true;
+        state_->queue.clear();
+      }
+      state_->cv.notify_all();
+    }
+    if (worker_.joinable()) {
+      worker_.detach();
+    }
+  }
+
   void Post(std::vector<WIN32_MEMORY_RANGE_ENTRY>&& ranges, int memory_priority) {
     if (ranges.empty()) return;
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lifecycle_lk(lifecycle_mu_);
+    if (!state_) {
+      state_ = std::make_shared<State>();
+    }
+    std::lock_guard<std::mutex> lk(state_->mu);
     if (!worker_.joinable()) {
-      stop_ = false;
-      worker_ = std::thread([this]() { Loop(); });
+      state_->stop = false;
+      auto st = state_;
+      worker_ = std::thread([st]() { Loop(st); });
     }
     constexpr size_t kMaxQueued = 4;
-    if (queue_.size() >= kMaxQueued) {
-      queue_.pop_front();
+    if (state_->queue.size() >= kMaxQueued) {
+      state_->queue.pop_front();
     }
-    queue_.push_back(Request{std::move(ranges), memory_priority});
-    cv_.notify_one();
+    state_->queue.push_back(Request{std::move(ranges), memory_priority});
+    state_->cv.notify_one();
   }
 
   void Shutdown() noexcept {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (!worker_.joinable()) return;
-      stop_ = true;
-      cv_.notify_one();
+    std::lock_guard<std::mutex> lifecycle_lk(lifecycle_mu_);
+    if (!worker_.joinable()) return;
+    if (state_) {
+      {
+        std::lock_guard<std::mutex> lk(state_->mu);
+        state_->stop = true;
+      }
+      state_->cv.notify_all();
     }
     worker_.join();
-    std::lock_guard<std::mutex> lk(mu_);
-    queue_.clear();
-    stop_ = false;
+    if (state_) {
+      std::lock_guard<std::mutex> lk(state_->mu);
+      state_->queue.clear();
+      state_->stop = false;
+    }
   }
 
  private:
@@ -259,17 +283,26 @@ class MoEPackedMappedPrefetchService final {
     int memory_priority{0};
   };
 
-  void Loop() {
+  struct State {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<Request> queue;
+    bool stop{false};
+  };
+
+  MoEPackedMappedPrefetchService() = default;
+
+  static void Loop(std::shared_ptr<State> state) {
     qmoe::NameCurrentThread("moepacked-pf");
     int cur_prio = -1;
     for (;;) {
       Request req;
       {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [this]() { return stop_ || !queue_.empty(); });
-        if (stop_) return;
-        req = std::move(queue_.front());
-        queue_.pop_front();
+        std::unique_lock<std::mutex> lk(state->mu);
+        state->cv.wait(lk, [&state]() { return state->stop || !state->queue.empty(); });
+        if (state->stop) return;
+        req = std::move(state->queue.front());
+        state->queue.pop_front();
       }
       const int target_prio = req.memory_priority > 0 ? req.memory_priority : MEMORY_PRIORITY_NORMAL;
       if (target_prio != cur_prio) {
@@ -283,11 +316,9 @@ class MoEPackedMappedPrefetchService final {
     }
   }
 
-  std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<Request> queue_;
+  std::mutex lifecycle_mu_;
+  std::shared_ptr<State> state_;
   std::thread worker_;
-  bool stop_{false};
 };
 #endif
 
@@ -873,6 +904,7 @@ struct MoEPackedOffloadState {
   std::atomic<uint64_t> stream_routes{0};
   std::atomic<uint64_t> stream_waves{0};
   std::atomic<bool> prefill_touched_evictable{false};
+  mutable std::atomic<bool> mapped_prefetched_once{false};
 
   bool InWarmup() const noexcept {
     return session_controller != nullptr && session_controller->RunControls().InWarmup();
@@ -958,18 +990,40 @@ struct MoEPackedOffloadState {
   void PostMappedNonResidentPrefetch() const {
 #if defined(_WIN32)
     if (!IsDirectFileMapped()) return;
+    if (mapped_prefetched_once.load(std::memory_order_relaxed)) {
+      MEMORYSTATUSEX ms{};
+      ms.dwLength = sizeof(ms);
+      if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys >= (4ULL << 30)) {
+        return;
+      }
+    }
+    auto skip_expert = [&](int e) noexcept -> bool {
+      const size_t idx = static_cast<size_t>(e);
+      if (idx < host_expert_to_slot.size() && host_expert_to_slot[idx] >= 0) return true;
+      if (idx < is_evictable_host_expert.size() && is_evictable_host_expert[idx] != 0) return true;
+      return false;
+    };
     std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
-    ranges.reserve(static_cast<size_t>(num_experts) * 3);
-    for (int e = 0; e < num_experts; ++e) {
-      if (static_cast<size_t>(e) < host_expert_to_slot.size() &&
-          host_expert_to_slot[static_cast<size_t>(e)] >= 0) {
+    ranges.reserve(256);
+    for (int e = 0; e < num_experts;) {
+      if (skip_expert(e)) {
+        ++e;
         continue;
       }
-      ranges.push_back({const_cast<uint8_t*>(host_gate_w + static_cast<size_t>(e) * gate_exp_bytes), gate_exp_bytes});
-      ranges.push_back({const_cast<uint8_t*>(host_up_w + static_cast<size_t>(e) * up_exp_bytes), up_exp_bytes});
-      ranges.push_back({const_cast<uint8_t*>(host_down_w + static_cast<size_t>(e) * down_exp_bytes), down_exp_bytes});
+      int end_e = e + 1;
+      while (end_e < num_experts && !skip_expert(end_e)) {
+        ++end_e;
+      }
+      const size_t span = static_cast<size_t>(end_e - e);
+      ranges.push_back({const_cast<uint8_t*>(host_gate_w + static_cast<size_t>(e) * gate_exp_bytes), span * gate_exp_bytes});
+      ranges.push_back({const_cast<uint8_t*>(host_up_w + static_cast<size_t>(e) * up_exp_bytes), span * up_exp_bytes});
+      ranges.push_back({const_cast<uint8_t*>(host_down_w + static_cast<size_t>(e) * down_exp_bytes), span * down_exp_bytes});
+      e = end_e;
     }
-    MoEPackedMappedPrefetchService::Instance().Post(std::move(ranges), MoEPackedPrefillMemPriority());
+    if (!ranges.empty()) {
+      mapped_prefetched_once.store(true, std::memory_order_relaxed);
+      MoEPackedMappedPrefetchService::Instance().Post(std::move(ranges), MoEPackedPrefillMemPriority());
+    }
 #endif
   }
 };
@@ -2154,6 +2208,12 @@ Status MoEPacked<T>::InitializeAdmittedPlan(const onnxruntime::moe_offload::MoeO
     st->session_controller->RegisterOffloadNode();
   }
   MoEPackedDoorbellService::Instance().Register(st.get(), want_hybrid_decode);
+#if defined(_WIN32)
+  if (st->IsDirectFileMapped()) {
+    std::lock_guard<std::mutex> lk(g_moepacked_mapped_layers_mu);
+    g_moepacked_mapped_layers[{st->session_controller.get(), st->layer_index}] = st.get();
+  }
+#endif
   offload_state_ = std::move(st);
   return Status::OK();
 }

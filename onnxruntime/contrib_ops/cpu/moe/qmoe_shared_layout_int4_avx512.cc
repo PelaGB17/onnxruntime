@@ -615,8 +615,11 @@ inline __m512 Avx512EvalSwiGlu16(__m512 gate, __m512 up, float alpha, float beta
   if (has_limit) {
     const __m512 vlim = _mm512_set1_ps(limit);
     const __m512 vnlim = _mm512_set1_ps(-limit);
-    gate = _mm512_min_ps(gate, vlim);
-    up = _mm512_min_ps(_mm512_max_ps(up, vnlim), vlim);
+    // Use ordered comparisons so unordered (NaN) lanes propagate unchanged, matching scalar std::min / std::clamp.
+    gate = _mm512_mask_mov_ps(gate, _mm512_cmp_ps_mask(gate, vlim, _CMP_GT_OQ), vlim);
+    const __mmask16 up_gt = _mm512_cmp_ps_mask(up, vlim, _CMP_GT_OQ);
+    const __mmask16 up_lt = _mm512_cmp_ps_mask(up, vnlim, _CMP_LT_OQ);
+    up = _mm512_mask_mov_ps(_mm512_mask_mov_ps(up, up_gt, vlim), up_lt, vnlim);
   }
   const __m512 neg_ag = _mm512_mul_ps(_mm512_set1_ps(-alpha), gate);
   const __m512 denom = _mm512_add_ps(_mm512_set1_ps(1.0f), Avx512ExpVec16(neg_ag));
@@ -673,7 +676,7 @@ void Avx512SwiGluInterleavedPairs(const float* row_tmp, const uint16_t* bias_u16
   const __m512i odd_idx = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
   const __m512i idx_lo = _mm512_setr_epi32(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
   const __m512i idx_hi = _mm512_setr_epi32(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
-  const bool has_limit = (limit < 3.402823466e38f);
+  const bool has_limit = std::isfinite(limit);
 
   auto eval16 = [&](int64_t p0) QMOE_LAMBDA_INLINE -> __m512 {
     __m512 v0 = _mm512_loadu_ps(row_tmp + 2 * p0);

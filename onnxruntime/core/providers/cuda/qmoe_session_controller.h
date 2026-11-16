@@ -9,9 +9,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1285,16 +1287,29 @@ class QMoESessionController {
         if (!strict_budget) {
           const bool is_moe_packed = !nodes.empty() && nodes[0]->GetSourceDescriptor().op_type == "MoEPacked";
           uint64_t effective_reserve = policy.reserve_device_bytes;
+          // Preserve caller-configured external-state reserves (KV cache, recurrent state, graph capture, child
+          // sessions) in full unless an explicit pre-allocated weight allowance is independently identified and
+          // backed by device bytes already committed to this session/group prior to PlanAndAdmitSession.
+          char credit_buf[32]{};
+          const DWORD credit_len = GetEnvironmentVariableA(
+              "ORT_QMOE_PREALLOCATED_RESERVE_BYTES", credit_buf, sizeof(credit_buf));
+          if (credit_len > 0 && credit_len < sizeof(credit_buf) && credit_buf[0] >= '0' && credit_buf[0] <= '9') {
+            errno = 0;
+            char* end_ptr = nullptr;
+            const unsigned long long parsed = std::strtoull(credit_buf, &end_ptr, 10);
+            if (errno == 0 && end_ptr == credit_buf + credit_len && parsed > 0ULL) {
+              const uint64_t configured_credit = static_cast<uint64_t>(parsed);
+              uint64_t committed_so_far = 0ULL;
+              if (auto acct = BudgetAccount()) {
+                committed_so_far = static_cast<uint64_t>(acct->GetGroupStats().committed);
+              }
+              const uint64_t credit = std::min(configured_credit, committed_so_far);
+              effective_reserve = (effective_reserve > credit) ? (effective_reserve - credit) : 0ULL;
+            }
+          }
           uint64_t extra_wddm_reserve =
               (total_vram >= (28ULL << 30)) ? (is_moe_packed ? (512ULL << 20) : (1792ULL << 20)) : (1536ULL << 20);
           if (total_vram < (20ULL << 30)) {
-            // On 16 GB GPUs (e.g. RTX 5060 Ti), platform_free_vram is queried at OnSessionInitializationEnd after
-            // target non-MoE weights and shared weight pools are already allocated in VRAM, so credit the already-
-            // allocated non-MoE footprint from policy.reserve_device_bytes while leaving >=500 MiB WDDM headroom.
-            const uint64_t deducted_non_moe = is_moe_packed ? (2816ULL << 20) : (1984ULL << 20);
-            if (effective_reserve > deducted_non_moe) {
-              effective_reserve -= deducted_non_moe;
-            }
             extra_wddm_reserve = 0ULL;
           } else if (total_vram < (28ULL << 30) && (policy.reserve_device_bytes <= (5700ULL << 20) || is_moe_packed)) {
             extra_wddm_reserve = 256ULL << 20;
@@ -1591,30 +1606,11 @@ class QMoESessionController {
       }
     }
 
-    bool use_bounded_file_cache =
+    const bool use_bounded_file_cache =
         partial_layers > 0 &&
         !policy.host_expert_bytes.is_auto &&
         policy.host_expert_bytes.bytes < total_cold_bytes &&
         policy.allow_file_backing;
-    bool bounded_cache_replaced_by_mapping = false;
-#if defined(_WIN32)
-    // A private bounded cache that takes more than half of physical RAM can neither be pinned (page-locking it starves
-    // the other pinned allocations of the process) nor kept resident pageable (it is written to the page file). On such a
-    // host the experts are read through the direct file mapping instead, which commits no private memory and whose pages
-    // the memory manager can drop at any time. ORT_QMOE_FORCE_BOUNDED_HOST_CACHE=1 keeps the bounded cache.
-    if (use_bounded_file_cache) {
-      MEMORYSTATUSEX ram_stat{};
-      ram_stat.dwLength = sizeof(ram_stat);
-      char force_buf[8]{};
-      const DWORD force_len = GetEnvironmentVariableA("ORT_QMOE_FORCE_BOUNDED_HOST_CACHE", force_buf, sizeof(force_buf));
-      const bool force_bounded = (force_len > 0 && force_len < sizeof(force_buf) && force_buf[0] == '1');
-      if (!force_bounded && GlobalMemoryStatusEx(&ram_stat) &&
-          policy.host_expert_bytes.bytes > ram_stat.ullTotalPhys / 2) {
-        use_bounded_file_cache = false;
-        bounded_cache_replaced_by_mapping = true;
-      }
-    }
-#endif
 
     std::vector<int32_t> host_cache_counts(num_layers, 0);
     if (use_bounded_file_cache && partial_layers > 0) {
@@ -1762,10 +1758,7 @@ class QMoESessionController {
                      " layers: total_resident_slots=" + std::to_string(total_resident_slots) +
                      ", total_spare_slots=" + std::to_string(total_spare_slots) +
                      ", admitted_gpu_expert_mib=" + std::to_string(total_admitted_gpu_bytes >> 20) +
-                     ", bounded_file_cache=" + (use_bounded_file_cache ? "1" : "0") +
-                     (bounded_cache_replaced_by_mapping
-                          ? " (host_expert_bytes exceeds half of physical RAM: direct file mapping)"
-                          : "");
+                     ", bounded_file_cache=" + (use_bounded_file_cache ? "1" : "0");
 
     plan_committed = true;
     return common::Status::OK();

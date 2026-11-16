@@ -2932,5 +2932,185 @@ TEST(QMoESharedLayoutTest, Avx512MultiRowInt3AndInt4AndSwiGluReorderMatchScalar)
   }
 }
 
+TEST(QMoESharedLayoutTest, Avx512SwiGluClippingPropagatesNaNsMatchingScalar) {
+  auto to_bf16 = [](float f) -> uint16_t {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(u));
+    return static_cast<uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+  };
+  constexpr uint16_t kBf16QuietNaN = 0x7FC1u;
+  constexpr uint16_t kFp16QuietNaN = 0x7E01u;
+  constexpr int64_t H = 128, I = 64;
+
+  std::vector<uint8_t> fc1_i2(static_cast<size_t>((2 * I * H) / 4), 0xABu);
+  std::vector<uint8_t> fc2_i2(static_cast<size_t>((H * I) / 4), 0x55u);
+  std::vector<uint8_t> fc1_i3(static_cast<size_t>((2 * I * H * 3) / 8), 0x9Bu);
+  std::vector<uint8_t> fc2_i3(static_cast<size_t>((H * I * 3) / 8), 0x49u);
+  std::vector<uint8_t> fc1_i4(static_cast<size_t>((2 * I * H) / 2), 0x97u);
+  std::vector<uint8_t> fc2_i4(static_cast<size_t>((H * I) / 2), 0x89u);
+
+  std::vector<uint16_t> fc1_s32(static_cast<size_t>(2 * I * (H / 32)), to_bf16(0.03125f));
+  std::vector<uint16_t> fc2_s32(static_cast<size_t>(H * (I / 32)), to_bf16(0.03125f));
+  std::vector<uint16_t> fc1_s64(static_cast<size_t>(2 * I * (H / 64)), to_bf16(0.03125f));
+  std::vector<uint16_t> fc2_s64(static_cast<size_t>(H * (I / 64)), to_bf16(0.03125f));
+
+  for (float limit_val : {6.0f, std::numeric_limits<float>::max(), std::numeric_limits<float>::infinity()}) {
+    for (int bmode = 0; bmode < 3; ++bmode) {
+      const bool bf16_b = (bmode == 0);
+      const bool fp16_b = (bmode == 1);
+      const bool bias_is_bf16 = !fp16_b;
+      const uint16_t nan_u16 = bias_is_bf16 ? kBf16QuietNaN : kFp16QuietNaN;
+      const shared::SwiGluParams swiglu{1.702f, 0.5f, limit_val};
+
+      // 1. Single-lane NaN gate bias and single-lane NaN up bias (including zero gate -> silu == 0).
+      for (bool nan_on_up : {false, true}) {
+        for (bool zero_input : {false, true}) {
+          if (!nan_on_up && zero_input) continue;
+          SCOPED_TRACE(::testing::Message() << "limit=" << limit_val << " bmode=" << bmode
+                                            << " nan_on_up=" << nan_on_up << " zero_input=" << zero_input);
+          std::vector<uint16_t> fc1_b(static_cast<size_t>(2 * I), 0u);
+          constexpr int64_t kNanPair = 19;
+          fc1_b[static_cast<size_t>(2 * kNanPair + (nan_on_up ? 1 : 0))] = nan_u16;
+
+          shared::Int2ExpertView v2{};
+          v2.fc1_weights = fc1_i2.data();
+          v2.fc1_scales = fc1_s64.data();
+          v2.fc1_bias = fc1_b.data();
+          v2.fc2_weights = fc2_i2.data();
+          v2.fc2_scales = fc2_s64.data();
+          v2.block_size = 64;
+          v2.weights_are_prepacked = true;
+          v2.scale_is_bf16 = true;
+          v2.bias_is_bf16 = bias_is_bf16;
+
+          shared::Int3ExpertView v3{};
+          v3.fc1_weights = fc1_i3.data();
+          v3.fc1_scales = fc1_s64.data();
+          v3.fc1_bias = fc1_b.data();
+          v3.fc2_weights = fc2_i3.data();
+          v3.fc2_scales = fc2_s64.data();
+          v3.block_size = 64;
+          v3.scale_is_bf16 = true;
+          v3.bias_is_bf16 = bias_is_bf16;
+
+          shared::Int4ExpertView v4{};
+          v4.fc1_weights = fc1_i4.data();
+          v4.fc1_scales = fc1_s32.data();
+          v4.fc1_bias = fc1_b.data();
+          v4.fc2_weights = fc2_i4.data();
+          v4.fc2_scales = fc2_s32.data();
+          v4.weights_are_prepacked = true;
+          v4.scale_is_bf16 = true;
+          v4.bias_is_bf16 = bias_is_bf16;
+
+          std::vector<float> x(static_cast<size_t>(2 * H), 0.0f);
+          if (!zero_input) {
+            for (size_t i = 0; i < x.size(); ++i) {
+              x[i] = static_cast<float>(static_cast<int>((i * 11 + 3) % 17) - 8) * 0.25f;
+            }
+          }
+          auto check_fc1 = [&](const std::vector<float>& got, const std::vector<float>& ref) {
+            size_t nan_count = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+              ASSERT_EQ(std::isnan(got[i]), std::isnan(ref[i])) << "idx=" << i;
+              if (std::isnan(ref[i])) {
+                ++nan_count;
+              } else {
+                EXPECT_NEAR(got[i], ref[i], 2e-3f) << "idx=" << i;
+              }
+            }
+            EXPECT_EQ(nan_count, 2u);
+          };
+
+          std::vector<float> got_inter(static_cast<size_t>(2 * I)), ref_inter(static_cast<size_t>(2 * I));
+          ASSERT_TRUE(shared::Int2Fc1SwiGluRange(H, I, v2, x.data(), 2, swiglu, got_inter.data(), 0, 2 * I, false, bf16_b, fp16_b));
+          ASSERT_TRUE(shared::Int2Fc1SwiGluRange(H, I, v2, x.data(), 2, swiglu, ref_inter.data(), 0, 2 * I, true, bf16_b, fp16_b));
+          check_fc1(got_inter, ref_inter);
+
+          shared::Int3Fc1SwiGluRange(H, I, v3, x.data(), 2, swiglu, got_inter.data(), 0, 2 * I, false, bf16_b, fp16_b);
+          shared::Int3Fc1SwiGluRange(H, I, v3, x.data(), 2, swiglu, ref_inter.data(), 0, 2 * I, true, bf16_b, fp16_b);
+          check_fc1(got_inter, ref_inter);
+
+          shared::Int4Fc1SwiGluRange(H, I, v4, x.data(), 2, swiglu, got_inter.data(), 0, 2 * I, false, bf16_b, fp16_b);
+          shared::Int4Fc1SwiGluRange(H, I, v4, x.data(), 2, swiglu, ref_inter.data(), 0, 2 * I, true, bf16_b, fp16_b);
+          check_fc1(got_inter, ref_inter);
+        }
+      }
+    }
+  }
+
+  // 2. Multi-row ExpertForward with NaN in a single activation row propagates NaN only to that row under finite clipping.
+  {
+    constexpr int m = 5;
+    constexpr int kNanRow = 2;
+    std::vector<uint16_t> fc1_b(static_cast<size_t>(2 * I), to_bf16(0.125f));
+    shared::Int2ExpertView v2{};
+    v2.fc1_weights = fc1_i2.data();
+    v2.fc1_scales = fc1_s64.data();
+    v2.fc1_bias = fc1_b.data();
+    v2.fc2_weights = fc2_i2.data();
+    v2.fc2_scales = fc2_s64.data();
+    v2.block_size = 64;
+    v2.weights_are_prepacked = true;
+    v2.scale_is_bf16 = true;
+    v2.bias_is_bf16 = true;
+
+    shared::Int3ExpertView v3{};
+    v3.fc1_weights = fc1_i3.data();
+    v3.fc1_scales = fc1_s64.data();
+    v3.fc1_bias = fc1_b.data();
+    v3.fc2_weights = fc2_i3.data();
+    v3.fc2_scales = fc2_s64.data();
+    v3.block_size = 64;
+    v3.scale_is_bf16 = true;
+    v3.bias_is_bf16 = true;
+
+    shared::Int4ExpertView v4{};
+    v4.fc1_weights = fc1_i4.data();
+    v4.fc1_scales = fc1_s32.data();
+    v4.fc1_bias = fc1_b.data();
+    v4.fc2_weights = fc2_i4.data();
+    v4.fc2_scales = fc2_s32.data();
+    v4.weights_are_prepacked = true;
+    v4.scale_is_bf16 = true;
+    v4.bias_is_bf16 = true;
+
+    std::vector<float> x(static_cast<size_t>(m * H));
+    for (size_t i = 0; i < x.size(); ++i) {
+      x[i] = static_cast<float>(static_cast<int>((i * 13 + 5) % 31) - 15) * 0.125f;
+    }
+    x[static_cast<size_t>(kNanRow * H + 7)] = std::numeric_limits<float>::quiet_NaN();
+
+    const shared::SwiGluParams swiglu{1.702f, 0.5f, 6.0f};
+    auto check_forward = [&](const std::vector<float>& got, const std::vector<float>& ref) {
+      for (int r = 0; r < m; ++r) {
+        for (int64_t c = 0; c < H; ++c) {
+          const size_t idx = static_cast<size_t>(r * H + c);
+          ASSERT_EQ(std::isnan(got[idx]), std::isnan(ref[idx])) << "r=" << r << " c=" << c;
+          if (r == kNanRow) {
+            EXPECT_TRUE(std::isnan(got[idx])) << "r=" << r << " c=" << c;
+          } else {
+            EXPECT_FALSE(std::isnan(got[idx])) << "r=" << r << " c=" << c;
+            EXPECT_NEAR(got[idx], ref[idx], 2e-3f) << "r=" << r << " c=" << c;
+          }
+        }
+      }
+    };
+
+    std::vector<float> got(static_cast<size_t>(m * H)), ref(static_cast<size_t>(m * H));
+    ASSERT_TRUE(shared::Int2ExpertForward(H, I, v2, x.data(), m, swiglu, got.data(), false, false, true, false));
+    ASSERT_TRUE(shared::Int2ExpertForward(H, I, v2, x.data(), m, swiglu, ref.data(), true, false, true, false));
+    check_forward(got, ref);
+
+    ASSERT_TRUE(shared::Int3ExpertForward(H, I, v3, x.data(), m, swiglu, got.data(), false, false, true, false));
+    ASSERT_TRUE(shared::Int3ExpertForward(H, I, v3, x.data(), m, swiglu, ref.data(), true, false, true, false));
+    check_forward(got, ref);
+
+    ASSERT_TRUE(shared::Int4ExpertForward(H, I, v4, x.data(), m, swiglu, got.data(), false, false, true, false));
+    ASSERT_TRUE(shared::Int4ExpertForward(H, I, v4, x.data(), m, swiglu, ref.data(), true, false, true, false));
+    check_forward(got, ref);
+  }
+}
+
 }  // namespace
 }  // namespace onnxruntime::test

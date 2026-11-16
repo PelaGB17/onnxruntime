@@ -586,6 +586,76 @@ TEST(QMoEOffloadAdmissionTest, LargeBoundedHostCapStaysWithinLimitOnLowRamHost) 
   }
 }
 
+#if defined(_WIN32)
+TEST(QMoEOffloadAdmissionTest, ExplicitExternalDeviceReserveIsPreservedOnWindows) {
+  uint64_t usable_free = 0;
+  uint64_t total_vram = 0;
+  QMoESessionController::QueryPlatformUsableDeviceMemory(/*device_id=*/0, &usable_free, &total_vram);
+  if (total_vram == 0 || usable_free < (3ULL << 30)) {
+    GTEST_SKIP() << "Requires a CUDA device with at least 3 GiB usable free VRAM.";
+  }
+
+  for (const char* op_type : {"MoEPacked", "QMoE"}) {
+    SCOPED_TRACE(op_type);
+    constexpr size_t kNumLayers = 24;
+    constexpr int32_t kExpertsPerLayer = 32;
+    constexpr uint64_t kSlotBytes = 16ULL << 20;  // 512 MiB/layer -> 12 GiB full GPU bytes
+    constexpr uint64_t kWorkingBytes = 64ULL << 20;
+    constexpr uint64_t kTargetExpertAllowance = 768ULL << 20;
+
+    const bool is_moe_packed = (std::string(op_type) == "MoEPacked");
+    uint64_t extra_wddm = (total_vram >= (28ULL << 30))
+                              ? (is_moe_packed ? (512ULL << 20) : (1792ULL << 20))
+                              : (total_vram < (20ULL << 30) ? 0ULL : (256ULL << 20));
+    const uint64_t overhead = kWorkingBytes + extra_wddm + kTargetExpertAllowance;
+    if (usable_free <= overhead + (1ULL << 30)) {
+      continue;
+    }
+    const uint64_t external_reserve = usable_free - overhead;
+    if (total_vram >= (20ULL << 30) && total_vram < (28ULL << 30) &&
+        !is_moe_packed && external_reserve > (5700ULL << 20)) {
+      extra_wddm = 1536ULL << 20;
+      if (usable_free <= kWorkingBytes + extra_wddm + kTargetExpertAllowance + (1ULL << 30)) {
+        continue;
+      }
+    }
+    const uint64_t eff_external_reserve = usable_free - (kWorkingBytes + extra_wddm + kTargetExpertAllowance);
+
+    std::vector<MockOffloadNode> nodes;
+    nodes.reserve(kNumLayers);
+    for (size_t i = 0; i < kNumLayers; ++i) {
+      nodes.emplace_back(static_cast<int32_t>(i), kExpertsPerLayer);
+      nodes.back().Descriptor().op_type = op_type;
+      nodes.back().Capabilities().gpu_slot_bytes = kSlotBytes;
+    }
+
+    MoeOffloadSessionPolicy policy = StaticPolicy(8ULL << 30);
+    policy.device_working_bytes = kWorkingBytes;
+    policy.device_working_bytes_explicit = true;
+    policy.reserve_device_bytes = eff_external_reserve;
+    policy.reserve_device_bytes_explicit = true;
+
+    SetEnvironmentVariableA("ORT_QMOE_STRICT_DEVICE_EXPERT_BYTES", nullptr);
+    SetEnvironmentVariableA("ORT_QMOE_PREALLOCATED_RESERVE_BYTES", nullptr);
+
+    QMoESessionController controller(/*device_id=*/0);
+    for (auto& node : nodes) {
+      int32_t layer_index = node.GetSourceDescriptor().layer_index;
+      controller.RegisterMoeOffloadNode(&node, policy, layer_index);
+    }
+    QMoESessionController::SessionPlanReport report;
+    ASSERT_TRUE(controller.PlanAndAdmitSession(report).IsOK());
+
+    uint64_t total_admitted_gpu_bytes = 0;
+    for (const auto& node : nodes) {
+      total_admitted_gpu_bytes += node.Plan().admitted_gpu_expert_bytes;
+    }
+    // Allow small live DXGI free-VRAM jitter (up to 128 MiB), which stays far below a 1.9-2.75 GiB reserve deduction.
+    EXPECT_LE(total_admitted_gpu_bytes, kTargetExpertAllowance + (128ULL << 20));
+  }
+}
+#endif
+
 #if defined(__linux__)
 namespace {
 
