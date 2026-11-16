@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #pragma once
+#include <chrono>
 #ifdef _WIN32
 #include <Windows.h>
 #include <mutex>
