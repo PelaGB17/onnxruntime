@@ -397,7 +397,7 @@ std::optional<GQAWorkspaceBounds> BuildBounds(
   bool mea_reachable = false;
 #if USE_MEMORY_EFFICIENT_ATTENTION
   mea_reachable =
-      !k_quantized && !has_bias && kernel_options.UseEfficientAttention() &&
+      !k_quantized && !has_bias && !has_sink && kernel_options.UseEfficientAttention() &&
       has_memory_efficient_attention_for_head_size_bounds(
           device_prop.major * 10 + device_prop.minor,
           /*is_half=*/!config.is_bf16, config.is_bf16,

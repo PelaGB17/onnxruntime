@@ -258,6 +258,29 @@ TYPED_TEST(GroupQueryAttentionFp16Bf16EligibilityTest, FlashChecksEachGate) {
 #endif
 
 #if USE_MEMORY_EFFICIENT_ATTENTION
+TYPED_TEST(GroupQueryAttentionFp16Bf16EligibilityTest, MemoryEfficientRejectsHeadSinkAcrossPhases) {
+  contrib::GroupQueryAttentionParameters parameters{};
+  parameters.num_heads = 8;
+  parameters.kv_num_heads = 8;
+  parameters.head_size = 128;
+  parameters.past_kv_format = contrib::AttentionQkvFormat::Q_K_V_BNSH;
+  for (bool first_prompt : {false, true}) {
+    for (int sequence : {1, 4}) {
+      for (bool smooth_softmax : {false, true}) {
+        SCOPED_TRACE(testing::Message() << "first_prompt=" << first_prompt
+                                        << " sequence=" << sequence << " smooth_softmax=" << smooth_softmax);
+        parameters.is_first_prompt = first_prompt;
+        parameters.sequence_length = sequence;
+        parameters.use_smooth_softmax = smooth_softmax;
+        EXPECT_TRUE(contrib::cuda::IsGQAMemoryEfficientEligible<TypeParam>(
+            parameters, 80, false, false, false, false));
+        EXPECT_FALSE(contrib::cuda::IsGQAMemoryEfficientEligible<TypeParam>(
+            parameters, 80, false, false, false, true));
+      }
+    }
+  }
+}
+
 TYPED_TEST(GroupQueryAttentionFp16Bf16EligibilityTest, H512PrefillSelectsMemoryEfficientWorkspace) {
   contrib::GroupQueryAttentionParameters parameters{};
   parameters.num_heads = 32;

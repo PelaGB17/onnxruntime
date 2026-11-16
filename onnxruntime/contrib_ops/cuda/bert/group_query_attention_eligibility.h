@@ -195,7 +195,9 @@ inline bool IsGQAMemoryEfficientEligible(const GroupQueryAttentionParameters& pa
                                          bool is_inputs_quantized,
                                          bool has_attention_bias,
                                          bool has_head_sink) {
-  return !PreferNativeGqa(parameters, sm / 10, is_inputs_quantized, has_head_sink) &&
+  // CUTLASS supports zero-logit smooth softmax, not an arbitrary per-head sink.
+  return !has_head_sink &&
+         !PreferNativeGqa(parameters, sm / 10, is_inputs_quantized, has_head_sink) &&
          IsGQAMemoryEfficientEligibleSeqFree<T>(sm, disable_memory_efficient_attention,
                                                 is_inputs_quantized, has_attention_bias,
                                                 parameters.head_size);
