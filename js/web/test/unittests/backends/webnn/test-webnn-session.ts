@@ -2,12 +2,16 @@
 // Licensed under the MIT License.
 
 import { expect } from 'chai';
-import { InferenceSession, Tensor } from 'onnxruntime-common';
+import { InferenceSession, Tensor, env } from 'onnxruntime-common';
 
 import { onnx } from '../../../../lib/onnxjs/ort-schema/protobuf/onnx';
+import { Test } from '../../../test-types';
 
 // Exercises WebNN backend initialization (`jsepInit('webnn', ...)` or native `webnnInit(...)`), session creation and
-// inference. CPU fallback is disabled so the tests fail if the WebNN EP is not used.
+// inference. CPU fallback is disabled so the tests fail if the WebNN EP is not used. They run only when WebNN is
+// selected with `-b=webnn` and proxy mode is off, and fail if WebNN is selected but unavailable.
+
+const testConfig = require('../../../testdata-config.json') as Test.Config;
 
 const dims = [2, 2];
 const a = new Float32Array([1, 2, 3, 4]);
@@ -42,8 +46,12 @@ const noCpuFallback: InferenceSession.SessionOptions['extra'] = { session: { dis
 
 describe('#UnitTest# - webnn - session initialization and inference', function () {
   before(function (this: Mocha.Context) {
-    if (typeof navigator === 'undefined' || !navigator.ml) {
+    // Proxy mode does not support MLTensor IO binding or `preferredOutputLocation`.
+    if (!testConfig.backends.includes('webnn') || env.wasm.proxy) {
       this.skip();
+    }
+    if (typeof navigator === 'undefined' || !navigator.ml) {
+      throw new Error('WebNN was selected, but navigator.ml is not available.');
     }
   });
 

@@ -157,6 +157,7 @@ async function main() {
   npmlog.info('TestRunnerCli', 'Initialization completed. Start to run tests...');
   run({
     unittest,
+    backends: args.backends,
     model: modelTestGroups,
     op: opTestGroups,
     log: args.logConfig,

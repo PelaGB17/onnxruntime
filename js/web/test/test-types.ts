@@ -164,6 +164,8 @@ export declare namespace Test {
    */
   export interface Config {
     unittest: boolean;
+    // Backends selected with `-b`; unit tests for a specific backend run only when it is selected.
+    backends: readonly string[];
     op: readonly OperatorTestGroup[];
     model: readonly ModelTestGroup[];
 
