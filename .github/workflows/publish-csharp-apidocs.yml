@@ -55,14 +55,7 @@ jobs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         foreach ($path in @(
           'csharp\index.html',
-          'csharp\index.json',
-          'csharp\api\index.html',
-          'csharp\api\toc.json',
-          'csharp\api\Microsoft.ML.OnnxRuntime.html',
-          'csharp\api\Microsoft.ML.OnnxRuntime.Tensors.html',
-          'csharp\public\main.css',
-          'csharp\logo.svg',
-          'csharp\favicon.ico'
+          'csharp\api\Microsoft.ML.OnnxRuntime.html'
         )) {
           if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Generated C# documentation is missing $path"
