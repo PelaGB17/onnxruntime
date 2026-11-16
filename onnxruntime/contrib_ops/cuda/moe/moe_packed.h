@@ -20,7 +20,7 @@ namespace cuda {
 
 using namespace onnxruntime::cuda;
 
-inline constexpr int kMoEPackedMaxChunkRows = 4096;
+inline constexpr int kMoEPackedMaxChunkRows = 8192;
 inline constexpr int kMoEPackedMaxOffloadChunkRows = 8192;
 // Covers 512/640-element K-loop increments and rounded 2048-element finalize tiles.
 inline constexpr int64_t kMoEPackedMaxDimension = std::numeric_limits<int>::max() - 2047;
@@ -60,6 +60,7 @@ struct MoEPackedParams {
   float routed_scaling_factor{1.0f};
   float routing_epsilon{0.0f};
   bool bf16_tc_supported{false};
+  bool sm90_wgmma_supported{false};
   bool relu_squared{false};
   bool router_is_float{false};
   const void* router_weights{nullptr};
@@ -73,7 +74,7 @@ struct MoEPackedParams {
 
 Status GetMoEPackedWorkspaceBytes(const MoEPackedParams& params, size_t elem_bytes, size_t& workspace_bytes);
 
-Status GetMoEPackedBf16KernelSupport(int device_id, bool& supported);
+Status GetMoEPackedBf16KernelSupport(int device_id, bool& supported, bool* sm90_wgmma_supported = nullptr);
 
 Status LaunchMoEPackedCuda(
     cudaStream_t stream,
@@ -171,6 +172,7 @@ class MoEPacked final : public CudaKernel, public onnxruntime::moe_offload::IMoe
   int64_t up_type_{-1};
   int64_t down_type_{-1};
   bool bf16_tc_supported_{false};
+  bool sm90_wgmma_supported_{false};
 
   onnxruntime::moe_offload::MoeOffloadSessionPolicy offload_policy_{};
   onnxruntime::moe_offload::MoeExpertSourceDescriptor offload_source_desc_{};

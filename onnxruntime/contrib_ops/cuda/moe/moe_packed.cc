@@ -1459,7 +1459,7 @@ MoEPacked<T>::MoEPacked(const OpKernelInfo& info) : CudaKernel(info) {
               "MoEPacked relu2 currently requires IQ2_XXS gate and down weights");
   if constexpr (std::is_same_v<T, BFloat16>) {
     ORT_ENFORCE(GetDeviceProp().major >= 8, "MoEPacked BF16 requires compute capability 8.0 or higher");
-    ORT_THROW_IF_ERROR(GetMoEPackedBf16KernelSupport(GetDeviceId(), bf16_tc_supported_));
+    ORT_THROW_IF_ERROR(GetMoEPackedBf16KernelSupport(GetDeviceId(), bf16_tc_supported_, &sm90_wgmma_supported_));
   }
 
   // Check if inputs 2..4 were placed on CPU by PlaceMoeOffloadInitializersOnCpu for hybrid offload.
@@ -1915,6 +1915,7 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
       p.k = static_cast<int>(k_);
       p.normalize_routing_weights = (normalize_routing_weights_ != 0);
       p.bf16_tc_supported = bf16_tc_supported_;
+      p.sm90_wgmma_supported = sm90_wgmma_supported_;
       p.gate_type = static_cast<int>(gate_type_);
       p.up_type = static_cast<int>(up_type_);
       p.down_type = static_cast<int>(down_type_);
@@ -1969,6 +1970,7 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
       p.k = static_cast<int>(k_);
       p.normalize_routing_weights = (normalize_routing_weights_ != 0);
       p.bf16_tc_supported = bf16_tc_supported_;
+      p.sm90_wgmma_supported = sm90_wgmma_supported_;
       p.gate_type = static_cast<int>(gate_type_);
       p.up_type = static_cast<int>(up_type_);
       p.down_type = static_cast<int>(down_type_);
@@ -2015,6 +2017,7 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
     max_params.k = static_cast<int>(k_);
     max_params.normalize_routing_weights = (normalize_routing_weights_ != 0);
     max_params.bf16_tc_supported = bf16_tc_supported_;
+    max_params.sm90_wgmma_supported = sm90_wgmma_supported_;
     max_params.gate_type = static_cast<int>(gate_type_);
     max_params.up_type = static_cast<int>(up_type_);
     max_params.down_type = static_cast<int>(down_type_);
@@ -2556,6 +2559,7 @@ Status MoEPacked<T>::ComputeInternal(OpKernelContext* context) const {
   max_params.routed_scaling_factor = routed_scaling_factor_;
   max_params.routing_epsilon = routing_epsilon_;
   max_params.bf16_tc_supported = bf16_tc_supported_;
+  max_params.sm90_wgmma_supported = sm90_wgmma_supported_;
   max_params.relu_squared = relu_squared;
   max_params.router_is_float = router_probs->IsDataType<float>();
   max_params.gate_type = static_cast<int>(gate_type_);

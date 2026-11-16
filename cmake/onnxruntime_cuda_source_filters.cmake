@@ -80,8 +80,23 @@ function(onnxruntime_extract_sm_specific_cuda_sources CU_SRC_LIST)
     list(REMOVE_ITEM _list ${_matmul_block_scaled_fp4_sm120_srcs})
   endif()
 
+  # Native SM90a WGMMA kernels for MoEPacked and MatMulPacked must be compiled at 90a-real
+  # (never in the default CUDA source list, where 90-real lacks wgmma.mma_async).
+  set(_gguf_packed_sm90_srcs)
+  foreach(_src IN LISTS _list)
+    if(_src MATCHES "/(moe_packed_sm90|matmul_packed_sm90)\\.cu$")
+      list(APPEND _gguf_packed_sm90_srcs "${_src}")
+    endif()
+  endforeach()
+  if(_gguf_packed_sm90_srcs)
+    list(REMOVE_ITEM _list ${_gguf_packed_sm90_srcs})
+  endif()
+
   # Extract SM90 TMA WS generated files
   set(_sm90_srcs)
+  if(ORT_HAS_SM90 AND NOT MSVC AND _gguf_packed_sm90_srcs)
+    list(APPEND _sm90_srcs ${_gguf_packed_sm90_srcs})
+  endif()
   if(ORT_HAS_SM90_OR_LATER)
     foreach(_src IN LISTS _list)
       if(_src MATCHES "moe_gemm_tma_ws_sm90_.*\\.generated\\.cu$")

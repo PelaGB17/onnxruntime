@@ -180,13 +180,14 @@ __device__ __forceinline__ uint2 ReadQ6K8BUnalignedRow(const uint8_t* ptr) {
 }
 
 // SWAR unpack of 4 Q6_K weights (4 low-nibble bytes + 4 2-bit high-bit bytes) into two bf16x2 words.
+// Uses exact IEEE-754 2^23 magic bias (0x4B000000 | u6_byte) - 8388640.0f to eliminate XU-pipe I2F conversions.
 __device__ __forceinline__ uint2 DecodeQ6KWord4ToBf16x2(
     uint32_t ql_w, uint32_t qh_w, int ql_shift, int qh_shift, float dl) {
   const uint32_t u6 = ((ql_w >> ql_shift) & 0x0F0F0F0Fu) | (((qh_w >> qh_shift) & 0x03030303u) << 4);
-  const float v0 = dl * static_cast<float>(static_cast<int>(u6 & 0xFFu) - 32);
-  const float v1 = dl * static_cast<float>(static_cast<int>((u6 >> 8) & 0xFFu) - 32);
-  const float v2 = dl * static_cast<float>(static_cast<int>((u6 >> 16) & 0xFFu) - 32);
-  const float v3 = dl * static_cast<float>(static_cast<int>(u6 >> 24) - 32);
+  const float v0 = __fmul_rn(dl, __fadd_rn(__uint_as_float(__byte_perm(u6, 0x00004B00u, 0x5440u)), -8388640.0f));
+  const float v1 = __fmul_rn(dl, __fadd_rn(__uint_as_float(__byte_perm(u6, 0x00004B00u, 0x5441u)), -8388640.0f));
+  const float v2 = __fmul_rn(dl, __fadd_rn(__uint_as_float(__byte_perm(u6, 0x00004B00u, 0x5442u)), -8388640.0f));
+  const float v3 = __fmul_rn(dl, __fadd_rn(__uint_as_float(__byte_perm(u6, 0x00004B00u, 0x5443u)), -8388640.0f));
   uint2 res;
   *reinterpret_cast<__nv_bfloat162*>(&res.x) = __floats2bfloat162_rn(v0, v1);
   *reinterpret_cast<__nv_bfloat162*>(&res.y) = __floats2bfloat162_rn(v2, v3);
@@ -229,8 +230,8 @@ __device__ __forceinline__ uint4 DecodeQ6KHalf128GroupBf16x2(
     const Q6KHalf128Stage<kAlignedRow4B>& st, int q_grp, int t) {
   const int sc_idx = 2 * q_grp + (t >> 1);
   const uint32_t sc_word = (sc_idx < 4) ? st.sc_all.x : st.sc_all.y;
-  const int8_t sc = static_cast<int8_t>((sc_word >> (8 * (sc_idx & 3))) & 0xFFu);
-  const float dl = st.d * static_cast<float>(sc);
+  const uint32_t sc_u8 = ((sc_word >> (8 * (sc_idx & 3))) & 0xFFu) ^ 0x80u;
+  const float dl = __fmul_rn(st.d, __fadd_rn(__uint_as_float(0x4B000000u | sc_u8), -8388736.0f));
   const uint2 ql = (q_grp & 1) ? st.ql_13 : st.ql_02;
   const int ql_shift = (q_grp >> 1) * 4;
   const int qh_shift = q_grp * 2;
@@ -598,21 +599,88 @@ __device__ __forceinline__ void DecodeIq2SubBlock16Bf16(
   DecodeIq2StageToBf16(packed, scale, low, high);
 }
 
-// Register-only lookup of kvalues_iq4nl[n & 0xF] via hardware prmt.b32 (__byte_perm).
+// Register-only lookup of kvalues_iq4nl[n & 0xF] via hardware prmt.b32 (__byte_perm) + IEEE-754 2^23 magic bias
+// ((kvalues_iq4nl[n] + 128) | 0x4B000000) - 8388736.0f, avoiding XU-pipe I2F conversions.
 __device__ __forceinline__ float Iq4NlValueDev(uint32_t n4) {
   const uint32_t n = n4 & 0xFu;
-  const uint32_t lo = __byte_perm(0xbfad9881u, 0xf6eaddcfu, n);
-  const uint32_t hi = __byte_perm(0x26190d01u, 0x71594535u, n);
-  return static_cast<float>(static_cast<int8_t>((n & 8u) ? hi : lo));
+  const uint32_t lo = __byte_perm(0x3f2d1801u, 0x766a5d4fu, n);
+  const uint32_t hi = __byte_perm(0xa6998d81u, 0xf1d9c5b5u, n);
+  const uint32_t u = (n & 8u) ? hi : lo;
+  return __fadd_rn(__uint_as_float(__byte_perm(u, 0x00004B00u, 0x5440u)), -8388736.0f);
 }
 
-// Fast 2-block (36-byte, 4-byte aligned when row_ptr & 3 == 0) IQ4_NL unpack for FC2 decode.
+// Pre-expands 2, 4, or 8 unsigned codebook bytes (each in 0..255, which has <= 8 significant bits and is therefore
+// 100% bit-exact in IEEE-754 bfloat16 with zero low-16-bit mantissa truncation) into packed unsigned bf16x2 words.
+__device__ __forceinline__ uint32_t PackU8PairToBf16x2BitsDev(uint32_t u16) {
+  const float f0 = __fadd_rn(__uint_as_float(__byte_perm(u16, 0x00004B00u, 0x5440u)), -8388608.0f);
+  const float f1 = __fadd_rn(__uint_as_float(__byte_perm(u16, 0x00004B00u, 0x5441u)), -8388608.0f);
+  return (__float_as_uint(f0) >> 16) | (__float_as_uint(f1) & 0xFFFF0000u);
+}
+
+__device__ __forceinline__ uint2 PackU8QuadToBf16x2PairDev(uint32_t g4) {
+  return make_uint2(PackU8PairToBf16x2BitsDev(g4), PackU8PairToBf16x2BitsDev(g4 >> 16));
+}
+
+__device__ __forceinline__ uint4 PackU8OctetToBf16x2QuadDev(uint64_t g8) {
+  const uint32_t lo = static_cast<uint32_t>(g8);
+  const uint32_t hi = static_cast<uint32_t>(g8 >> 32);
+  return make_uint4(PackU8PairToBf16x2BitsDev(lo),
+                    PackU8PairToBf16x2BitsDev(lo >> 16),
+                    PackU8PairToBf16x2BitsDev(hi),
+                    PackU8PairToBf16x2BitsDev(hi >> 16));
+}
+
+// Applies 8 sign bits and FP32 scale `db` to 8 pre-expanded unsigned bf16x2 magnitudes (`mag`),
+// using carry-free `IMAD + LOP3` sign-bit injection (`100%` bit-identical to PackIqBytesSign8ToBf16x2).
+__device__ __forceinline__ uint4 PackBf16Mag8Sign8ToBf16x2(uint4 mag, uint32_t signs, float db) {
+  const uint32_t s8 = signs & 0xFFu;
+  const uint32_t words[4] = {mag.x, mag.y, mag.z, mag.w};
+  uint4 res;
+  uint32_t* out_words = reinterpret_cast<uint32_t*>(&res);
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const uint32_t sign_prod = s8 * ((1u << (15 - 2 * pair)) + (1u << (30 - 2 * pair)));
+    const uint32_t signed_pair = words[pair] | (sign_prod & 0x80008000u);
+    const float v0 = __fmul_rn(db, __uint_as_float(signed_pair << 16));
+    const float v1 = __fmul_rn(db, __uint_as_float(signed_pair & 0xFFFF0000u));
+    *reinterpret_cast<__nv_bfloat162*>(&out_words[pair]) = __floats2bfloat162_rn(v0, v1);
+  }
+  return res;
+}
+
+// Converts 8 unsigned codebook bytes (in g_lo, g_hi) + 8 sign bits + scale db into BF16x2 MMA register quad
+// with zero I2F instructions and 100% IEEE-754 bit-exactness.
+__device__ __forceinline__ uint4 PackIqBytesSign8ToBf16x2(
+    uint32_t g_lo, uint32_t g_hi, uint32_t signs, float db) {
+  float out[8];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float m_lo = __fadd_rn(__uint_as_float(__byte_perm(g_lo, 0x00004B00u, 0x5440u + j)), -8388608.0f);
+    const float m_hi = __fadd_rn(__uint_as_float(__byte_perm(g_hi, 0x00004B00u, 0x5440u + j)), -8388608.0f);
+    out[j] = __fmul_rn((signs & (1u << j)) ? -db : db, m_lo);
+    out[j + 4] = __fmul_rn((signs & (1u << (j + 4))) ? -db : db, m_hi);
+  }
+  return PackFloat8ToBf16x2(out);
+}
+
+// Fast 2-block (36-byte, 4-byte aligned when row_ptr & 3 == 0) IQ4_NL unpack for FC2 decode/prefill.
 __device__ __forceinline__ uint4 PackIq4NlWordsToBf16x2(uint32_t q0, uint32_t q1, int shift, float d) {
   float out[8];
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
     out[j] = d * Iq4NlValueDev(q0 >> (8 * j + shift));
     out[j + 4] = d * Iq4NlValueDev(q1 >> (8 * j + shift));
+  }
+  return PackFloat8ToBf16x2(out);
+}
+
+__device__ __forceinline__ uint4 PackIq4NlWordsSmemToBf16x2(
+    uint32_t q0, uint32_t q1, int shift, int t, const float* s_iq4_f32, float d) {
+  float out[8];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    out[j] = __fmul_rn(d, s_iq4_f32[(((q0 >> (8 * j + shift)) & 0xFu) << 2) | t]);
+    out[j + 4] = __fmul_rn(d, s_iq4_f32[(((q1 >> (8 * j + shift)) & 0xFu) << 2) | t]);
   }
   return PackFloat8ToBf16x2(out);
 }
@@ -634,6 +702,101 @@ __device__ __forceinline__ void DecodeIq4NlPair64AlignedBf16x2(
   const uint32_t q1_0 = __ldg(p32 + 5 + off);
   const uint32_t q1_1 = __ldg(p32 + 6 + off);
   out1 = PackIq4NlWordsToBf16x2(q1_0, q1_1, shift, d1);
+}
+
+// Zero-bank-conflict 64-element IQ4_NL pair unpack using 32-way lane-replicated float[16 * 32] LUT (2 KB smem):
+// lane `lane` (0..31) always accesses shared-memory bank `((nibble << 5) | lane) & 31 == lane`,
+// guaranteeing 0 shared-memory bank conflicts for arbitrary weight nibble distributions.
+__device__ __forceinline__ uint4 PackIq4NlWordsBankFreeToBf16x2(
+    uint32_t q0, uint32_t q1, int shift, int lane, const float* s_iq4_32bank, float d) {
+  float out[8];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    out[j] = __fmul_rn(d, s_iq4_32bank[(((q0 >> (8 * j + shift)) & 0xFu) << 5) | lane]);
+    out[j + 4] = __fmul_rn(d, s_iq4_32bank[(((q1 >> (8 * j + shift)) & 0xFu) << 5) | lane]);
+  }
+  return PackFloat8ToBf16x2(out);
+}
+
+__device__ __forceinline__ void DecodeIq4NlPair64BankFreeBf16x2(
+    const uint8_t* pair_ptr, int lane, const float* s_iq4_32bank, uint4& out0, uint4& out1) {
+  const auto* p32 = reinterpret_cast<const uint32_t*>(pair_ptr);
+  const int t = lane & 3;
+  const int shift = (t >> 1) * 4;
+  const int off = (t & 1) * 2;
+  const uint32_t w0 = __ldg(p32);
+  const uint32_t a0 = __ldg(p32 + off);
+  const uint32_t b0 = __ldg(p32 + off + 1);
+  const uint32_t c0 = __ldg(p32 + off + 2);
+  const uint32_t w4 = __ldg(p32 + 4);
+  const uint32_t q10 = __ldg(p32 + 5 + off);
+  const uint32_t q11 = __ldg(p32 + 6 + off);
+  const float d0 = Fp16ToFloatDev(static_cast<uint16_t>(w0 & 0xFFFFu));
+  const float d1 = Fp16ToFloatDev(static_cast<uint16_t>(w4 >> 16));
+  out0 = PackIq4NlWordsBankFreeToBf16x2(
+      __funnelshift_r(a0, b0, 16), __funnelshift_r(b0, c0, 16), shift, lane, s_iq4_32bank, d0);
+  out1 = PackIq4NlWordsBankFreeToBf16x2(q10, q11, shift, lane, s_iq4_32bank, d1);
+}
+
+__device__ __forceinline__ void DecodeIq4NlPair64SmemBf16x2(
+    const uint8_t* pair_ptr, int t, const float* s_iq4_f32, uint4& out0, uint4& out1) {
+  const auto* p32 = reinterpret_cast<const uint32_t*>(pair_ptr);
+  const int shift = (t >> 1) * 4;
+  const int off = (t & 1) * 2;
+  const uint32_t w0 = __ldg(p32);
+  const float d0 = Fp16ToFloatDev(static_cast<uint16_t>(w0 & 0xFFFFu));
+  const uint32_t a0 = (off == 0) ? w0 : __ldg(p32 + 2);
+  const uint32_t b0 = __ldg(p32 + off + 1);
+  const uint32_t c0 = __ldg(p32 + off + 2);
+  out0 = PackIq4NlWordsSmemToBf16x2(__funnelshift_r(a0, b0, 16), __funnelshift_r(b0, c0, 16), shift, t, s_iq4_f32, d0);
+
+  const uint32_t w4 = __ldg(p32 + 4);
+  const float d1 = Fp16ToFloatDev(static_cast<uint16_t>(w4 >> 16));
+  const uint32_t q1_0 = __ldg(p32 + 5 + off);
+  const uint32_t q1_1 = __ldg(p32 + 6 + off);
+  out1 = PackIq4NlWordsSmemToBf16x2(q1_0, q1_1, shift, t, s_iq4_f32, d1);
+}
+
+// Lookup two IQ4_NL nibbles per LDS.64 from a 256-entry float2 table (2 KB smem).
+__device__ __forceinline__ uint4 PackIq4NlWordsSmemPairToBf16x2(
+    uint32_t q0, uint32_t q1, int shift, const float2* s_iq4_f32x2, float d) {
+  const uint32_t p0 = (q0 >> shift) & 0x0F0F0F0Fu;
+  const uint32_t p1 = (q1 >> shift) & 0x0F0F0F0Fu;
+  const float2 v01 = s_iq4_f32x2[(p0 & 0xFu) | ((p0 >> 4) & 0xF0u)];
+  const float2 v23 = s_iq4_f32x2[((p0 >> 16) & 0xFu) | ((p0 >> 20) & 0xF0u)];
+  const float2 u01 = s_iq4_f32x2[(p1 & 0xFu) | ((p1 >> 4) & 0xF0u)];
+  const float2 u23 = s_iq4_f32x2[((p1 >> 16) & 0xFu) | ((p1 >> 20) & 0xF0u)];
+  float out[8];
+  out[0] = __fmul_rn(d, v01.x);
+  out[1] = __fmul_rn(d, v01.y);
+  out[2] = __fmul_rn(d, v23.x);
+  out[3] = __fmul_rn(d, v23.y);
+  out[4] = __fmul_rn(d, u01.x);
+  out[5] = __fmul_rn(d, u01.y);
+  out[6] = __fmul_rn(d, u23.x);
+  out[7] = __fmul_rn(d, u23.y);
+  return PackFloat8ToBf16x2(out);
+}
+
+// Branchless 36-byte (64-element) IQ4_NL pair unpack using 2-nibble/LDS.64 shared float2[256] LUT:
+// zero lane divergence (`off = (t & 1) * 2`) and zero warp-shuffle stalls.
+__device__ __forceinline__ void DecodeIq4NlPair64QuadSplitBf16x2(
+    const uint8_t* pair_ptr, int t, const float2* s_iq4_f32x2, uint4& out0, uint4& out1) {
+  const auto* p32 = reinterpret_cast<const uint32_t*>(pair_ptr);
+  const int shift = (t >> 1) * 4;
+  const int off = (t & 1) * 2;
+  const uint32_t w0 = __ldg(p32);
+  const uint32_t a0 = __ldg(p32 + off);
+  const uint32_t b0 = __ldg(p32 + off + 1);
+  const uint32_t c0 = __ldg(p32 + off + 2);
+  const uint32_t w4 = __ldg(p32 + 4);
+  const uint32_t q10 = __ldg(p32 + 5 + off);
+  const uint32_t q11 = __ldg(p32 + 6 + off);
+  const float d0 = Fp16ToFloatDev(static_cast<uint16_t>(w0 & 0xFFFFu));
+  const float d1 = Fp16ToFloatDev(static_cast<uint16_t>(w4 >> 16));
+  out0 = PackIq4NlWordsSmemPairToBf16x2(
+      __funnelshift_r(a0, b0, 16), __funnelshift_r(b0, c0, 16), shift, s_iq4_f32x2, d0);
+  out1 = PackIq4NlWordsSmemPairToBf16x2(q10, q11, shift, s_iq4_f32x2, d1);
 }
 
 // Decodes 8 contiguous elements [sb32_idx * 32 + l * 8 .. + 7] (where l in 0..3) of a GGUF weight row.

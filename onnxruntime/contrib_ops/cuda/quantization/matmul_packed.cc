@@ -60,7 +60,7 @@ MatMulPacked<T>::MatMulPacked(const OpKernelInfo& info) : CudaKernel(info) {
               "MatMulPacked: invalid K=", k_, " for packed_type=", ggml_type_);
   if constexpr (std::is_same_v<T, BFloat16>) {
     ORT_ENFORCE(GetDeviceProp().major >= 8, "MatMulPacked BF16 requires compute capability 8.0 or higher");
-    ORT_THROW_IF_ERROR(GetMatMulPackedBf16KernelSupport(GetDeviceId(), bf16_tc_supported_));
+    ORT_THROW_IF_ERROR(GetMatMulPackedBf16KernelSupport(GetDeviceId(), bf16_tc_supported_, &sm90_wgmma_supported_));
   }
   const std::string policy = info.GetConfigOptions().GetConfigOrDefault(
       kOrtSessionOptionsCudaMatMulPackedAllowUnroundedGemv, "0");
@@ -109,12 +109,16 @@ Status MatMulPacked<T>::ComputeInternal(OpKernelContext* context) const {
   ORT_RETURN_IF_NOT((n_ + 7) / 8 <= GetDeviceProp().maxGridSize[0],
                     "MatMulPacked N exceeds the CUDA grid limit");
   const int64_t scratch_rows = std::min<int64_t>(n_, kMatMulPackedPrefillNTile);
+  constexpr bool is_bf16 = std::is_same_v<T, BFloat16>;
+  const bool uses_tc_decode =
+      (m <= 8) ||
+      (is_bf16 && (UseMatMulPackedBf16Sm90Wgmma(sm90_wgmma_supported_, false, static_cast<int>(ggml_type_), k_, n_, m) ||
+                   UseMatMulPackedBf16MultiRowTc(bf16_tc_supported_, false, k_, n_, m)));
   ORT_RETURN_IF_NOT(PackedTensorBytesFit(m, k_, sizeof(T)) &&
                         PackedTensorBytesFit(n_, expected_rb, 1) &&
                         PackedTensorBytesFit(m, n_, sizeof(T)) &&
-                        (m <= 8 || PackedTensorBytesFit(scratch_rows, k_, sizeof(T))),
+                        (uses_tc_decode || PackedTensorBytesFit(scratch_rows, k_, sizeof(T))),
                     "MatMulPacked tensor byte size exceeds the supported address range");
-  constexpr bool is_bf16 = std::is_same_v<T, BFloat16>;
 
   MatMulPackedParams params{};
   params.b_data = b->Data<uint8_t>();
@@ -126,6 +130,7 @@ Status MatMulPacked<T>::ComputeInternal(OpKernelContext* context) const {
   params.ggml_type = static_cast<int>(ggml_type_);
   params.activation_type = activation_type_;
   params.bf16_tc_supported = bf16_tc_supported_;
+  params.sm90_wgmma_supported = sm90_wgmma_supported_;
   params.fp32_prefill = !is_bf16 && ggml_type_ != gguf_quant::kGgmlTypeF16;
 
   size_t workspace_bytes = 0;

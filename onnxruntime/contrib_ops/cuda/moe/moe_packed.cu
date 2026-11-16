@@ -2,6 +2,9 @@
 // Licensed under the MIT License.
 
 #include "contrib_ops/cuda/moe/moe_packed.h"
+#if defined(COMPILE_HOPPER_TMA_GEMMS)
+#include "contrib_ops/cuda/moe/moe_packed_sm90.h"
+#endif
 #include "contrib_ops/cuda/moe/moe_group_router_impl.h"
 
 #include <gsl/util>
@@ -477,9 +480,10 @@ __global__ __launch_bounds__(512) void BuildMoEPackedTilesKernel(
 
 // Decode Warp-K-Split Tensor-Core BF16 FC1 + SwiGLU kernel (inspired by bolt_ops.cu MmaGemvKernel):
 // KW=4 warps (128 threads) per CTA split K across the 4 warps (only 20 iterations/warp for K=2560,
-// zero __syncthreads() in the K-loop) while computing MT*8 = 16 inter_size channels (32 gate+up rows).
-template <int KW, int MT, int kGateUpType>
-__global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
+// zero __syncthreads() in the K-loop) while computing MT*8 = 16 inter_size channels (32 gate+up rows)
+// across MS*8 routes (8 routes for MS=1, up to 16 routes for MS=2).
+template <int KW, int MT, int kGateUpType, int MS = 1>
+__global__ __launch_bounds__(KW * 32, (MS == 2 && kGateUpType >= 0) ? 5 : 0) void MoEPackedFc1DecodeWarpKSplitKernel(
     const __nv_bfloat16* __restrict__ input,
     const uint8_t* __restrict__ gate_weights,
     const uint8_t* __restrict__ up_weights,
@@ -492,26 +496,27 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
   if (tile_idx >= __ldg(d_num_tiles)) return;
 
   constexpr int kThreads = KW * 32;
+  constexpr int kMaxRoutes = MS * 8;
+  constexpr int kRedStride = (MS == 1) ? 8 : (MS * 8 + 8);
   using namespace onnxruntime::contrib::gguf_quant;
-  constexpr int kLutU64Count = (kGateUpType == kGgmlTypeIQ2_S)
-                                   ? 1024
+  constexpr int kLutU64Count = (kGateUpType == kGgmlTypeIQ2_S || kGateUpType == kGgmlTypeIQ3_XXS)
+                                   ? 2048
                                    : ((kGateUpType == kGgmlTypeIQ2_XS)
                                           ? 512
-                                          : ((kGateUpType == kGgmlTypeIQ2_XXS)
-                                                 ? 256
-                                                 : ((kGateUpType == kGgmlTypeIQ3_XXS) ? 512 : 1)));
+                                          : ((kGateUpType == kGgmlTypeIQ2_XXS) ? 256 : 1));
 
   __shared__ uint64_t s_lut[kLutU64Count];
-  __shared__ float s_red[KW][MT * 16][8];
-  __shared__ int s_routes[8];
-  __shared__ int s_token_rows[8];
+  __shared__ float s_red[KW][MT * 16][kRedStride];
+  __shared__ int s_routes[kMaxRoutes];
+  __shared__ int s_token_rows[kMaxRoutes];
 
   const MoEPackedTile tile = tiles[tile_idx];
   const int count = tile.count;
   const int expert = tile.expert;
+  const int num_ms = (MS == 1) ? 1 : ((count + 7) >> 3);
 
   const int tid = static_cast<int>(threadIdx.x);
-  if (tid < 8) {
+  if (tid < kMaxRoutes) {
     const int r = (tid < count) ? __ldg(&sorted_routes[tile.start_route + tid]) : 0;
     s_routes[tid] = r;
     s_token_rows[tid] = r / p.k;
@@ -521,16 +526,19 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
   } else if constexpr (kGateUpType == kGgmlTypeIQ2_XS) {
     for (int i = tid; i < 512; i += kThreads) s_lut[i] = __ldg(iq2xs_grid + i);
   } else if constexpr (kGateUpType == kGgmlTypeIQ2_S) {
-    for (int i = tid; i < 1024; i += kThreads) s_lut[i] = __ldg(iq2s_grid + i);
+    uint4* s_lut_iq2s = reinterpret_cast<uint4*>(s_lut);
+    for (int i = tid; i < 1024; i += kThreads) {
+      s_lut_iq2s[i] = gguf_cuda::PackU8OctetToBf16x2QuadDev(__ldg(iq2s_grid + i));
+    }
   } else if constexpr (kGateUpType == kGgmlTypeIQ3_XXS) {
-    // Replicate 256-entry uint32 LUT 4x across banks [entry * 4 + bank] to avoid 4-lane bank conflicts.
-    uint32_t* s_lut32 = reinterpret_cast<uint32_t*>(s_lut);
+    // Pre-expand 256-entry uint32 grid into bf16x2 pairs (uint2) replicated 8x across [(entry << 3) | (lane & 7)] (16 KB).
+    uint2* s_lut_iq3 = reinterpret_cast<uint2*>(s_lut);
     for (int i = tid; i < 256; i += kThreads) {
-      const uint32_t v = __ldg(iq3xxs_grid + i);
-      s_lut32[i * 4 + 0] = v;
-      s_lut32[i * 4 + 1] = v;
-      s_lut32[i * 4 + 2] = v;
-      s_lut32[i * 4 + 3] = v;
+      const uint2 mag = gguf_cuda::PackU8QuadToBf16x2PairDev(__ldg(iq3xxs_grid + i));
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        s_lut_iq3[(i << 3) | r] = mag;
+      }
     }
   }
   __syncthreads();
@@ -544,7 +552,7 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
   const uint8_t* gate_ptrs[MT];
   const uint8_t* up_ptrs[MT];
   bool valid_rows[MT];
-  float acc[MT][4];
+  float acc[MT][MS][4];
 #pragma unroll
   for (int m = 0; m < MT; ++m) {
     const int j_out = cta_ch_base + m * 8 + g;
@@ -554,15 +562,23 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
     gate_ptrs[m] = gate_weights + exp_row_idx * p.gate_row_bytes;
     up_ptrs[m] = up_weights + exp_row_idx * p.up_row_bytes;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      acc[m][i] = 0.0f;
+    for (int ms = 0; ms < MS; ++ms) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        acc[m][ms][i] = 0.0f;
+      }
     }
   }
 
-  const bool x_valid = (g < count);
-  const __nv_bfloat16* x_row =
-      input + static_cast<int64_t>(x_valid ? s_token_rows[g] : 0) * p.hidden_size;
-  const bool x_aligned = ((reinterpret_cast<uintptr_t>(x_row) & 15u) == 0) && ((p.hidden_size & 7) == 0);
+  bool x_valid_arr[MS];
+  const __nv_bfloat16* x_rows[MS];
+#pragma unroll
+  for (int ms = 0; ms < MS; ++ms) {
+    const int rm = ms * 8 + g;
+    x_valid_arr[ms] = (rm < count);
+    x_rows[ms] = input + static_cast<int64_t>(x_valid_arr[ms] ? s_token_rows[rm] : 0) * p.hidden_size;
+  }
+  const bool x_aligned = ((reinterpret_cast<uintptr_t>(input) & 15u) == 0) && ((p.hidden_size & 7) == 0);
 
   if constexpr ((kGateUpType == kGgmlTypeIQ3_XXS || kGateUpType == kGgmlTypeIQ2_S || kGateUpType == kGgmlTypeIQ4_XS)) {
     if ((p.hidden_size & 127) == 0 &&
@@ -573,52 +589,68 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
       for (int half_idx = warp; half_idx < num_halves; half_idx += KW) {
         const int sb256 = half_idx >> 1;
         const int ip = half_idx & 1;
-        uint4 b_vecs[4];
+        uint4 b_vecs[MS][4];
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-          const __nv_bfloat16* x_ptr = x_row + half_idx * 128 + q * 32 + t * 8;
-          b_vecs[q] = x_valid ? (x_aligned ? __ldg(reinterpret_cast<const uint4*>(x_ptr))
-                                           : gguf_cuda::LoadU4Dev(x_ptr))
-                              : make_uint4(0u, 0u, 0u, 0u);
+        for (int ms = 0; ms < MS; ++ms) {
+          if (MS == 1 || ms < num_ms) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              const __nv_bfloat16* x_ptr = x_rows[ms] + half_idx * 128 + q * 32 + t * 8;
+              b_vecs[ms][q] = x_valid_arr[ms] ? (x_aligned ? __ldg(reinterpret_cast<const uint4*>(x_ptr))
+                                                           : gguf_cuda::LoadU4Dev(x_ptr))
+                                              : make_uint4(0u, 0u, 0u, 0u);
+            }
+          }
         }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           if (valid_rows[m]) {
             if constexpr (kGateUpType == kGgmlTypeIQ3_XXS) {
-              const uint32_t* s_lut32 = reinterpret_cast<const uint32_t*>(s_lut);
+              const uint2* s_lut_iq3 = reinterpret_cast<const uint2*>(s_lut);
+              const int lut_rep = lane & 7;
               const uint8_t* g_blk = gate_ptrs[m] + static_cast<int64_t>(sb256) * 98;
               const uint8_t* u_blk = up_ptrs[m] + static_cast<int64_t>(sb256) * 98;
               const float dg = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(g_blk))) * 0.5f;
               const float du = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(u_blk))) * 0.5f;
+              const int my_ib = ip * 4 + t;
+              const auto* ag16 = reinterpret_cast<const uint16_t*>(g_blk + 66 + 4 * my_ib);
+              const auto* au16 = reinterpret_cast<const uint16_t*>(u_blk + 66 + 4 * my_ib);
+              const uint32_t my_aux_g = static_cast<uint32_t>(__ldg(ag16)) | (static_cast<uint32_t>(__ldg(ag16 + 1)) << 16);
+              const uint32_t my_aux_u = static_cast<uint32_t>(__ldg(au16)) | (static_cast<uint32_t>(__ldg(au16 + 1)) << 16);
+              const auto* gq16 = reinterpret_cast<const uint16_t*>(g_blk + 2 + 8 * my_ib);
+              const auto* uq16 = reinterpret_cast<const uint16_t*>(u_blk + 2 + 8 * my_ib);
+              const uint32_t my_gq_lo = static_cast<uint32_t>(__ldg(gq16 + 0)) | (static_cast<uint32_t>(__ldg(gq16 + 1)) << 16);
+              const uint32_t my_gq_hi = static_cast<uint32_t>(__ldg(gq16 + 2)) | (static_cast<uint32_t>(__ldg(gq16 + 3)) << 16);
+              const uint32_t my_uq_lo = static_cast<uint32_t>(__ldg(uq16 + 0)) | (static_cast<uint32_t>(__ldg(uq16 + 1)) << 16);
+              const uint32_t my_uq_hi = static_cast<uint32_t>(__ldg(uq16 + 2)) | (static_cast<uint32_t>(__ldg(uq16 + 3)) << 16);
+              const int q16_shift = 16 * (t & 1);
 #pragma unroll
               for (int q = 0; q < 4; ++q) {
-                const int ib = ip * 4 + q;
-                const auto* ag16 = reinterpret_cast<const uint16_t*>(g_blk + 66 + 4 * ib);
-                const auto* au16 = reinterpret_cast<const uint16_t*>(u_blk + 66 + 4 * ib);
-                const uint32_t aux_g = static_cast<uint32_t>(__ldg(ag16)) | (static_cast<uint32_t>(__ldg(ag16 + 1)) << 16);
-                const uint32_t aux_u = static_cast<uint32_t>(__ldg(au16)) | (static_cast<uint32_t>(__ldg(au16 + 1)) << 16);
-                const float dbg = dg * (0.5f + static_cast<float>(aux_g >> 28));
-                const float dbu = du * (0.5f + static_cast<float>(aux_u >> 28));
-                const uint8_t sg = gguf_cuda::Iq2xsSignsDev(aux_g >> (7 * t));
-                const uint8_t su = gguf_cuda::Iq2xsSignsDev(aux_u >> (7 * t));
-                const uint16_t q2_g = __ldg(reinterpret_cast<const uint16_t*>(g_blk + 2 + 8 * ib + 2 * t));
-                const uint16_t q2_u = __ldg(reinterpret_cast<const uint16_t*>(u_blk + 2 + 8 * ib + 2 * t));
-                const uint32_t g1 = s_lut32[(q2_g & 0xFFu) * 4 + t];
-                const uint32_t g2 = s_lut32[(q2_g >> 8) * 4 + t];
-                const uint32_t u1 = s_lut32[(q2_u & 0xFFu) * 4 + t];
-                const uint32_t u2 = s_lut32[(q2_u >> 8) * 4 + t];
-                float g_vals[8], u_vals[8];
+                const uint32_t aux_g = __shfl_sync(0xFFFFFFFFu, my_aux_g, q, 4);
+                const uint32_t aux_u = __shfl_sync(0xFFFFFFFFu, my_aux_u, q, 4);
+                const uint32_t gq_lo = __shfl_sync(0xFFFFFFFFu, my_gq_lo, q, 4);
+                const uint32_t gq_hi = __shfl_sync(0xFFFFFFFFu, my_gq_hi, q, 4);
+                const uint32_t uq_lo = __shfl_sync(0xFFFFFFFFu, my_uq_lo, q, 4);
+                const uint32_t uq_hi = __shfl_sync(0xFFFFFFFFu, my_uq_hi, q, 4);
+                const float dbg = dg * __fadd_rn(__uint_as_float(0x4B000000u | (aux_g >> 28)), -8388607.5f);
+                const float dbu = du * __fadd_rn(__uint_as_float(0x4B000000u | (aux_u >> 28)), -8388607.5f);
+                const uint32_t sg = gguf_cuda::Iq2xsSignsDev(aux_g >> (7 * t));
+                const uint32_t su = gguf_cuda::Iq2xsSignsDev(aux_u >> (7 * t));
+                const uint32_t q2_g = (((t & 2) ? gq_hi : gq_lo) >> q16_shift) & 0xFFFFu;
+                const uint32_t q2_u = (((t & 2) ? uq_hi : uq_lo) >> q16_shift) & 0xFFFFu;
+                const uint2 g1 = s_lut_iq3[((q2_g & 0xFFu) << 3) | lut_rep];
+                const uint2 g2 = s_lut_iq3[((q2_g >> 8) << 3) | lut_rep];
+                const uint2 u1 = s_lut_iq3[((q2_u & 0xFFu) << 3) | lut_rep];
+                const uint2 u2 = s_lut_iq3[((q2_u >> 8) << 3) | lut_rep];
+                const uint4 e_vec = gguf_cuda::PackBf16Mag8Sign8ToBf16x2(make_uint4(g1.x, g1.y, g2.x, g2.y), sg, dbg);
+                const uint4 o_vec = gguf_cuda::PackBf16Mag8Sign8ToBf16x2(make_uint4(u1.x, u1.y, u2.x, u2.y), su, dbu);
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                  g_vals[j] = ((sg & (1u << j)) ? -dbg : dbg) * static_cast<float>(static_cast<uint8_t>(g1 >> (8 * j)));
-                  g_vals[j + 4] = ((sg & (1u << (j + 4))) ? -dbg : dbg) * static_cast<float>(static_cast<uint8_t>(g2 >> (8 * j)));
-                  u_vals[j] = ((su & (1u << j)) ? -dbu : dbu) * static_cast<float>(static_cast<uint8_t>(u1 >> (8 * j)));
-                  u_vals[j + 4] = ((su & (1u << (j + 4))) ? -dbu : dbu) * static_cast<float>(static_cast<uint8_t>(u2 >> (8 * j)));
+                for (int ms = 0; ms < MS; ++ms) {
+                  if (MS == 1 || ms < num_ms) {
+                    gguf_cuda::MmaBf16(acc[m][ms], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[ms][q].x, b_vecs[ms][q].y);
+                    gguf_cuda::MmaBf16(acc[m][ms], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[ms][q].z, b_vecs[ms][q].w);
+                  }
                 }
-                const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
-                const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
-                gguf_cuda::MmaBf16(acc[m], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[q].x, b_vecs[q].y);
-                gguf_cuda::MmaBf16(acc[m], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[q].z, b_vecs[q].w);
               }
             } else if constexpr (kGateUpType == kGgmlTypeIQ4_XS) {
               const uint8_t* g_blk = gate_ptrs[m] + static_cast<int64_t>(sb256) * 136;
@@ -634,16 +666,23 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
 #pragma unroll
               for (int q = 0; q < 4; ++q) {
                 const int ib = ip * 4 + q;
-                const int g_ls = static_cast<int>(((g_sl2 >> (4 * q)) & 0xFu) | (((g_sh >> (2 * ib)) & 3u) << 4)) - 32;
-                const int u_ls = static_cast<int>(((u_sl2 >> (4 * q)) & 0xFu) | (((u_sh >> (2 * ib)) & 3u) << 4)) - 32;
+                const uint32_t g_ls_u = (((g_sl2 >> (4 * q)) & 0xFu) | (((g_sh >> (2 * ib)) & 3u) << 4));
+                const uint32_t u_ls_u = (((u_sl2 >> (4 * q)) & 0xFu) | (((u_sh >> (2 * ib)) & 3u) << 4));
+                const float g_ls_f = __fadd_rn(__uint_as_float(0x4B000000u | g_ls_u), -8388640.0f);
+                const float u_ls_f = __fadd_rn(__uint_as_float(0x4B000000u | u_ls_u), -8388640.0f);
                 const uint32_t gq0 = gguf_cuda::ReadU32Unaligned2BDev(g_blk + 8 + ib * 16 + off);
                 const uint32_t gq1 = gguf_cuda::ReadU32Unaligned2BDev(g_blk + 12 + ib * 16 + off);
                 const uint32_t uq0 = gguf_cuda::ReadU32Unaligned2BDev(u_blk + 8 + ib * 16 + off);
                 const uint32_t uq1 = gguf_cuda::ReadU32Unaligned2BDev(u_blk + 12 + ib * 16 + off);
-                const uint4 e_vec = gguf_cuda::PackIq4NlWordsToBf16x2(gq0, gq1, shift, dg * static_cast<float>(g_ls));
-                const uint4 o_vec = gguf_cuda::PackIq4NlWordsToBf16x2(uq0, uq1, shift, du * static_cast<float>(u_ls));
-                gguf_cuda::MmaBf16(acc[m], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[q].x, b_vecs[q].y);
-                gguf_cuda::MmaBf16(acc[m], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[q].z, b_vecs[q].w);
+                const uint4 e_vec = gguf_cuda::PackIq4NlWordsToBf16x2(gq0, gq1, shift, dg * g_ls_f);
+                const uint4 o_vec = gguf_cuda::PackIq4NlWordsToBf16x2(uq0, uq1, shift, du * u_ls_f);
+#pragma unroll
+                for (int ms = 0; ms < MS; ++ms) {
+                  if (MS == 1 || ms < num_ms) {
+                    gguf_cuda::MmaBf16(acc[m][ms], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[ms][q].x, b_vecs[ms][q].y);
+                    gguf_cuda::MmaBf16(acc[m][ms], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[ms][q].z, b_vecs[ms][q].w);
+                  }
+                }
               }
             } else {
               const uint8_t* g_blk = gate_ptrs[m] + static_cast<int64_t>(sb256) * 82;
@@ -658,33 +697,45 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
               const uint32_t u_sc4 = static_cast<uint32_t>(__ldg(u_sc16)) | (static_cast<uint32_t>(__ldg(u_sc16 + 1)) << 16);
               const uint32_t g_qh4 = static_cast<uint32_t>(__ldg(g_qh16)) | (static_cast<uint32_t>(__ldg(g_qh16 + 1)) << 16);
               const uint32_t u_qh4 = static_cast<uint32_t>(__ldg(u_qh16)) | (static_cast<uint32_t>(__ldg(u_qh16 + 1)) << 16);
+              const auto* gq16 = reinterpret_cast<const uint16_t*>(g_blk + 2 + 16 * ip + 4 * t);
+              const auto* uq16 = reinterpret_cast<const uint16_t*>(u_blk + 2 + 16 * ip + 4 * t);
+              const auto* gs16 = reinterpret_cast<const uint16_t*>(g_blk + 34 + 16 * ip + 4 * t);
+              const auto* us16 = reinterpret_cast<const uint16_t*>(u_blk + 34 + 16 * ip + 4 * t);
+              const uint32_t my_gq4 = static_cast<uint32_t>(__ldg(gq16)) | (static_cast<uint32_t>(__ldg(gq16 + 1)) << 16);
+              const uint32_t my_uq4 = static_cast<uint32_t>(__ldg(uq16)) | (static_cast<uint32_t>(__ldg(uq16 + 1)) << 16);
+              const uint32_t my_gs4 = static_cast<uint32_t>(__ldg(gs16)) | (static_cast<uint32_t>(__ldg(gs16 + 1)) << 16);
+              const uint32_t my_us4 = static_cast<uint32_t>(__ldg(us16)) | (static_cast<uint32_t>(__ldg(us16 + 1)) << 16);
               const int sc_nibble_shift = 4 * (t >> 1);
               const int qh_shift_l = 8 - 2 * t;
+              const int byte_shift = 8 * t;
 #pragma unroll
               for (int q = 0; q < 4; ++q) {
-                const int ib = ip * 4 + q;
                 const uint8_t g_sc = static_cast<uint8_t>((g_sc4 >> (8 * q)) & 0xFFu);
                 const uint8_t u_sc = static_cast<uint8_t>((u_sc4 >> (8 * q)) & 0xFFu);
                 const uint8_t g_qh = static_cast<uint8_t>((g_qh4 >> (8 * q)) & 0xFFu);
                 const uint8_t u_qh = static_cast<uint8_t>((u_qh4 >> (8 * q)) & 0xFFu);
-                const float dbg = dg * (0.5f + static_cast<float>((g_sc >> sc_nibble_shift) & 0xFu));
-                const float dbu = du * (0.5f + static_cast<float>((u_sc >> sc_nibble_shift) & 0xFu));
-                const int g_idx = static_cast<int>(__ldg(g_blk + 2 + 4 * ib + t)) | ((static_cast<int>(g_qh) << qh_shift_l) & 0x300);
-                const int u_idx = static_cast<int>(__ldg(u_blk + 2 + 4 * ib + t)) | ((static_cast<int>(u_qh) << qh_shift_l) & 0x300);
-                const uint64_t gg64 = s_lut[g_idx];
-                const uint64_t ug64 = s_lut[u_idx];
-                const uint8_t sg = __ldg(g_blk + 34 + 4 * ib + t);
-                const uint8_t su = __ldg(u_blk + 34 + 4 * ib + t);
-                float g_vals[8], u_vals[8];
+                const float dbg = dg * __fadd_rn(__uint_as_float(0x4B000000u | ((g_sc >> sc_nibble_shift) & 0xFu)), -8388607.5f);
+                const float dbu = du * __fadd_rn(__uint_as_float(0x4B000000u | ((u_sc >> sc_nibble_shift) & 0xFu)), -8388607.5f);
+                const uint32_t gq_w = __shfl_sync(0xFFFFFFFFu, my_gq4, q, 4);
+                const uint32_t uq_w = __shfl_sync(0xFFFFFFFFu, my_uq4, q, 4);
+                const uint32_t gs_w = __shfl_sync(0xFFFFFFFFu, my_gs4, q, 4);
+                const uint32_t us_w = __shfl_sync(0xFFFFFFFFu, my_us4, q, 4);
+                const int g_idx = static_cast<int>((gq_w >> byte_shift) & 0xFFu) | ((static_cast<int>(g_qh) << qh_shift_l) & 0x300);
+                const int u_idx = static_cast<int>((uq_w >> byte_shift) & 0xFFu) | ((static_cast<int>(u_qh) << qh_shift_l) & 0x300);
+                const uint4* s_lut_iq2s = reinterpret_cast<const uint4*>(s_lut);
+                const uint4 gg_mag = s_lut_iq2s[g_idx];
+                const uint4 ug_mag = s_lut_iq2s[u_idx];
+                const uint32_t sg = (gs_w >> byte_shift) & 0xFFu;
+                const uint32_t su = (us_w >> byte_shift) & 0xFFu;
+                const uint4 e_vec = gguf_cuda::PackBf16Mag8Sign8ToBf16x2(gg_mag, sg, dbg);
+                const uint4 o_vec = gguf_cuda::PackBf16Mag8Sign8ToBf16x2(ug_mag, su, dbu);
 #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                  g_vals[j] = ((sg & (1u << j)) ? -dbg : dbg) * static_cast<float>(static_cast<uint8_t>(gg64 >> (8 * j)));
-                  u_vals[j] = ((su & (1u << j)) ? -dbu : dbu) * static_cast<float>(static_cast<uint8_t>(ug64 >> (8 * j)));
+                for (int ms = 0; ms < MS; ++ms) {
+                  if (MS == 1 || ms < num_ms) {
+                    gguf_cuda::MmaBf16(acc[m][ms], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[ms][q].x, b_vecs[ms][q].y);
+                    gguf_cuda::MmaBf16(acc[m][ms], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[ms][q].z, b_vecs[ms][q].w);
+                  }
                 }
-                const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
-                const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
-                gguf_cuda::MmaBf16(acc[m], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[q].x, b_vecs[q].y);
-                gguf_cuda::MmaBf16(acc[m], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[q].z, b_vecs[q].w);
               }
             }
           }
@@ -693,11 +744,14 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
     } else {
       const int num_sb32 = p.hidden_size >> 5;
       for (int sb32_idx = warp; sb32_idx < num_sb32; sb32_idx += KW) {
-        const uint4 b_vec = x_valid
-                                ? gguf_cuda::LoadU4Dev(x_row + sb32_idx * 32 + t * 8)
-                                : make_uint4(0u, 0u, 0u, 0u);
-        uint32_t s_lut_unrep_dummy = 0;
-        (void)s_lut_unrep_dummy;
+        uint4 b_vecs[MS];
+#pragma unroll
+        for (int ms = 0; ms < MS; ++ms) {
+          if (MS == 1 || ms < num_ms) {
+            b_vecs[ms] = x_valid_arr[ms] ? gguf_cuda::LoadU4Dev(x_rows[ms] + sb32_idx * 32 + t * 8)
+                                         : make_uint4(0u, 0u, 0u, 0u);
+          }
+        }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           if (valid_rows[m]) {
@@ -707,8 +761,13 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
             gguf_cuda::DecodeGgufSubBlock8Tpl<kGateUpType>(up_ptrs[m], p.up_type, sb32_idx, t, u_vals);
             const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
             const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
-            gguf_cuda::MmaBf16(acc[m], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-            gguf_cuda::MmaBf16(acc[m], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+#pragma unroll
+            for (int ms = 0; ms < MS; ++ms) {
+              if (MS == 1 || ms < num_ms) {
+                gguf_cuda::MmaBf16(acc[m][ms], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[ms].x, b_vecs[ms].y);
+                gguf_cuda::MmaBf16(acc[m][ms], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[ms].z, b_vecs[ms].w);
+              }
+            }
           }
         }
       }
@@ -716,9 +775,14 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
   } else {
     const int num_sb32 = p.hidden_size >> 5;
     for (int sb32_idx = warp; sb32_idx < num_sb32; sb32_idx += KW) {
-      const uint4 b_vec = x_valid
-                              ? gguf_cuda::LoadU4Dev(x_row + sb32_idx * 32 + t * 8)
-                              : make_uint4(0u, 0u, 0u, 0u);
+      uint4 b_vecs[MS];
+#pragma unroll
+      for (int ms = 0; ms < MS; ++ms) {
+        if (MS == 1 || ms < num_ms) {
+          b_vecs[ms] = x_valid_arr[ms] ? gguf_cuda::LoadU4Dev(x_rows[ms] + sb32_idx * 32 + t * 8)
+                                       : make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
         if (valid_rows[m]) {
@@ -730,8 +794,13 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
               up_ptrs[m], p.up_type, sb32_idx, t, s_lut, u_vals);
           const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
           const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
-          gguf_cuda::MmaBf16(acc[m], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-          gguf_cuda::MmaBf16(acc[m], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+#pragma unroll
+          for (int ms = 0; ms < MS; ++ms) {
+            if (MS == 1 || ms < num_ms) {
+              gguf_cuda::MmaBf16(acc[m][ms], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vecs[ms].x, b_vecs[ms].y);
+              gguf_cuda::MmaBf16(acc[m][ms], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vecs[ms].z, b_vecs[ms].w);
+            }
+          }
         }
       }
     }
@@ -739,14 +808,20 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
 
 #pragma unroll
   for (int m = 0; m < MT; ++m) {
-    s_red[warp][m * 16 + g][2 * t + 0] = acc[m][0];
-    s_red[warp][m * 16 + g][2 * t + 1] = acc[m][1];
-    s_red[warp][m * 16 + g + 8][2 * t + 0] = acc[m][2];
-    s_red[warp][m * 16 + g + 8][2 * t + 1] = acc[m][3];
+#pragma unroll
+    for (int ms = 0; ms < MS; ++ms) {
+      if (MS == 1 || ms < num_ms) {
+        s_red[warp][m * 16 + g][ms * 8 + 2 * t + 0] = acc[m][ms][0];
+        s_red[warp][m * 16 + g][ms * 8 + 2 * t + 1] = acc[m][ms][1];
+        s_red[warp][m * 16 + g + 8][ms * 8 + 2 * t + 0] = acc[m][ms][2];
+        s_red[warp][m * 16 + g + 8][ms * 8 + 2 * t + 1] = acc[m][ms][3];
+      }
+    }
   }
   __syncthreads();
 
-  for (int idx = tid; idx < MT * 8 * 8; idx += kThreads) {
+  const int total_out = MT * 8 * (num_ms * 8);
+  for (int idx = tid; idx < total_out; idx += kThreads) {
     const int col = idx / (MT * 8);
     const int ch = idx - col * (MT * 8);
     const int j_out = cta_ch_base + ch;
@@ -774,7 +849,7 @@ __global__ __launch_bounds__(KW * 32) void MoEPackedFc1DecodeWarpKSplitKernel(
 // across up to kMaxSubTiles * 8 routes (8 routes in decode, 32 routes in prefill).
 // 8 warps per CTA = 64 inter_size channels per CTA.
 template <int kMaxSubTiles, int kGateUpType>
-__global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1SwiGLUBf16TcKernel(
+__global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256, (kMaxSubTiles >= 8 && kGateUpType >= 0) ? 3 : 2) void MoEPackedFc1SwiGLUBf16TcKernel(
     const __nv_bfloat16* __restrict__ input,
     const uint8_t* __restrict__ gate_weights,
     const uint8_t* __restrict__ up_weights,
@@ -788,10 +863,10 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
 
   constexpr int kWarps = (kMaxSubTiles == 1) ? 4 : 8;
   constexpr int kThreads = kWarps * 32;
-  constexpr int kChunkK = 512;
-  constexpr int kChunkU4 = kChunkK / 8;         // 64
-  constexpr int kRowStrideU4 = kChunkU4 + 4;    // 68 (bank-conflict-free for LDS.128)
-  constexpr int kMaxRoutes = kMaxSubTiles * 8;  // 8 or 32
+  constexpr int kChunkK = (kMaxSubTiles >= 8) ? 256 : 512;
+  constexpr int kChunkU4 = kChunkK / 8;         // 32 or 64
+  constexpr int kRowStrideU4 = kChunkU4 + 4;    // 36 or 68 (bank-conflict-free for LDS.128)
+  constexpr int kMaxRoutes = kMaxSubTiles * 8;  // 8, 32, or 64
   using namespace onnxruntime::contrib::gguf_quant;
   constexpr int kLutU64Count = (kGateUpType == kGgmlTypeIQ2_S)
                                    ? 1024
@@ -799,7 +874,7 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
                                           ? 512
                                           : ((kGateUpType == kGgmlTypeIQ2_XXS)
                                                  ? 256
-                                                 : ((kGateUpType == kGgmlTypeIQ3_XXS) ? 128 : 1)));
+                                                 : ((kGateUpType == kGgmlTypeIQ3_XXS) ? 512 : 1)));
 
   __shared__ uint4 s_x_u4[kMaxRoutes * kRowStrideU4];
   __shared__ uint64_t s_lut[kLutU64Count];
@@ -833,7 +908,11 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
   } else if constexpr (kGateUpType == kGgmlTypeIQ3_XXS) {
     uint32_t* s_lut32 = reinterpret_cast<uint32_t*>(s_lut);
     for (int i = tid; i < 256; i += kThreads) {
-      s_lut32[i] = __ldg(iq3xxs_grid + i);
+      const uint32_t v = __ldg(iq3xxs_grid + i);
+      s_lut32[i * 4 + 0] = v;
+      s_lut32[i * 4 + 1] = v;
+      s_lut32[i * 4 + 2] = v;
+      s_lut32[i * 4 + 3] = v;
     }
   }
   __syncthreads();
@@ -848,6 +927,9 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
   const int64_t exp_row_idx = static_cast<int64_t>(expert) * p.inter_size + (valid_row ? j_out : 0);
   const uint8_t* gate_row_ptr = gate_weights + exp_row_idx * p.gate_row_bytes;
   const uint8_t* up_row_ptr = up_weights + exp_row_idx * p.up_row_bytes;
+  const bool aligned_2b = ((reinterpret_cast<uintptr_t>(gate_weights) & 1u) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(up_weights) & 1u) == 0) &&
+                          ((p.gate_row_bytes & 1) == 0) && ((p.up_row_bytes & 1) == 0);
 
   float acc[kMaxSubTiles][4];
 #pragma unroll
@@ -864,10 +946,12 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
     const int actual_chunk_u4 = actual_chunk_k >> 3;
     const int total_u4 = padded_routes * actual_chunk_u4;
 
-    if (actual_chunk_u4 == 64) {
+    if (actual_chunk_u4 == kChunkU4) {
+      constexpr int kShift = (kChunkU4 == 32) ? 5 : 6;
+      constexpr int kMask = kChunkU4 - 1;
       for (int idx = tid; idx < total_u4; idx += kThreads) {
-        const int m = idx >> 6;
-        const int u4_col = idx & 63;
+        const int m = idx >> kShift;
+        const int u4_col = idx & kMask;
         uint4 val = make_uint4(0u, 0u, 0u, 0u);
         if (m < count) {
           const int token_row = s_token_rows[m];
@@ -894,22 +978,189 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
     __syncthreads();
 
     if (valid_row) {
-      const int sb32_base = k_base >> 5;
-      const int num_sb32 = actual_chunk_k >> 5;
-      for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
-        const int sb32_idx = sb32_base + sb_local;
-        float g_vals[8];
-        float u_vals[8];
-        gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kGateUpType>(gate_row_ptr, p.gate_type, sb32_idx, t, s_lut, g_vals);
-        gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kGateUpType>(up_row_ptr, p.up_type, sb32_idx, t, s_lut, u_vals);
-        const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
-        const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
+      if constexpr (kGateUpType == kGgmlTypeIQ3_XXS || kGateUpType == kGgmlTypeIQ2_S ||
+                    kGateUpType == kGgmlTypeIQ4_XS) {
+        if (aligned_2b && ((actual_chunk_k & 127) == 0)) {
+          const int half_base = k_base >> 7;
+          const int num_halves = actual_chunk_k >> 7;
+          for (int half_local = 0; half_local < num_halves; ++half_local) {
+            const int half_idx = half_base + half_local;
+            const int sb256 = half_idx >> 1;
+            const int ip = half_idx & 1;
+            if constexpr (kGateUpType == kGgmlTypeIQ3_XXS) {
+              const uint32_t* s_lut32 = reinterpret_cast<const uint32_t*>(s_lut);
+              const uint8_t* g_blk = gate_row_ptr + static_cast<int64_t>(sb256) * 98;
+              const uint8_t* u_blk = up_row_ptr + static_cast<int64_t>(sb256) * 98;
+              const float dg = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(g_blk))) * 0.5f;
+              const float du = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(u_blk))) * 0.5f;
+              const int my_ib = ip * 4 + t;
+              const auto* ag16 = reinterpret_cast<const uint16_t*>(g_blk + 66 + 4 * my_ib);
+              const auto* au16 = reinterpret_cast<const uint16_t*>(u_blk + 66 + 4 * my_ib);
+              const uint32_t my_aux_g = static_cast<uint32_t>(__ldg(ag16)) | (static_cast<uint32_t>(__ldg(ag16 + 1)) << 16);
+              const uint32_t my_aux_u = static_cast<uint32_t>(__ldg(au16)) | (static_cast<uint32_t>(__ldg(au16 + 1)) << 16);
+#pragma unroll 1
+              for (int q = 0; q < 4; ++q) {
+                const int ib = ip * 4 + q;
+                const uint32_t aux_g = __shfl_sync(0xFFFFFFFFu, my_aux_g, q, 4);
+                const uint32_t aux_u = __shfl_sync(0xFFFFFFFFu, my_aux_u, q, 4);
+                const float dbg = dg * __fadd_rn(__uint_as_float(0x4B000000u | (aux_g >> 28)), -8388607.5f);
+                const float dbu = du * __fadd_rn(__uint_as_float(0x4B000000u | (aux_u >> 28)), -8388607.5f);
+                const uint32_t sg = gguf_cuda::Iq2xsSignsDev(aux_g >> (7 * t));
+                const uint32_t su = gguf_cuda::Iq2xsSignsDev(aux_u >> (7 * t));
+                const uint16_t q2_g = __ldg(reinterpret_cast<const uint16_t*>(g_blk + 2 + 8 * ib + 2 * t));
+                const uint16_t q2_u = __ldg(reinterpret_cast<const uint16_t*>(u_blk + 2 + 8 * ib + 2 * t));
+                const uint32_t g1 = s_lut32[(q2_g & 0xFFu) * 4 + t];
+                const uint32_t g2 = s_lut32[(q2_g >> 8) * 4 + t];
+                const uint32_t u1 = s_lut32[(q2_u & 0xFFu) * 4 + t];
+                const uint32_t u2 = s_lut32[(q2_u >> 8) * 4 + t];
+                const uint4 e_vec = gguf_cuda::PackIqBytesSign8ToBf16x2(g1, g2, sg, dbg);
+                const uint4 o_vec = gguf_cuda::PackIqBytesSign8ToBf16x2(u1, u2, su, dbu);
+                const int u4_off = (half_local * 4 + q) * 4 + t;
 #pragma unroll
-        for (int st = 0; st < kMaxSubTiles; ++st) {
-          if (st < num_subtiles) {
-            const uint4 b_vec = s_x_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
-            gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-            gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+                for (int st = 0; st < kMaxSubTiles; ++st) {
+                  if (st < num_subtiles) {
+                    const uint4 b_vec = s_x_u4[(st * 8 + g) * kRowStrideU4 + u4_off];
+                    gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                    gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+                  }
+                }
+              }
+            } else if constexpr (kGateUpType == kGgmlTypeIQ4_XS) {
+              const uint8_t* g_blk = gate_row_ptr + static_cast<int64_t>(sb256) * 136;
+              const uint8_t* u_blk = up_row_ptr + static_cast<int64_t>(sb256) * 136;
+              const float dg = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(g_blk)));
+              const float du = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(u_blk)));
+              const uint16_t g_sh = __ldg(reinterpret_cast<const uint16_t*>(g_blk + 2));
+              const uint16_t u_sh = __ldg(reinterpret_cast<const uint16_t*>(u_blk + 2));
+              const uint16_t g_sl2 = __ldg(reinterpret_cast<const uint16_t*>(g_blk + 4 + 2 * ip));
+              const uint16_t u_sl2 = __ldg(reinterpret_cast<const uint16_t*>(u_blk + 4 + 2 * ip));
+              const int shift = (t >> 1) * 4;
+              const int off = (t & 1) * 8;
+#pragma unroll 1
+              for (int q = 0; q < 4; ++q) {
+                const int ib = ip * 4 + q;
+                const uint32_t g_ls_u = (((g_sl2 >> (4 * q)) & 0xFu) | (((g_sh >> (2 * ib)) & 3u) << 4));
+                const uint32_t u_ls_u = (((u_sl2 >> (4 * q)) & 0xFu) | (((u_sh >> (2 * ib)) & 3u) << 4));
+                const float g_ls_f = __fadd_rn(__uint_as_float(0x4B000000u | g_ls_u), -8388640.0f);
+                const float u_ls_f = __fadd_rn(__uint_as_float(0x4B000000u | u_ls_u), -8388640.0f);
+                const uint32_t gq0 = gguf_cuda::ReadU32Unaligned2BDev(g_blk + 8 + ib * 16 + off);
+                const uint32_t gq1 = gguf_cuda::ReadU32Unaligned2BDev(g_blk + 12 + ib * 16 + off);
+                const uint32_t uq0 = gguf_cuda::ReadU32Unaligned2BDev(u_blk + 8 + ib * 16 + off);
+                const uint32_t uq1 = gguf_cuda::ReadU32Unaligned2BDev(u_blk + 12 + ib * 16 + off);
+                const uint4 e_vec = gguf_cuda::PackIq4NlWordsToBf16x2(gq0, gq1, shift, dg * g_ls_f);
+                const uint4 o_vec = gguf_cuda::PackIq4NlWordsToBf16x2(uq0, uq1, shift, du * u_ls_f);
+                const int u4_off = (half_local * 4 + q) * 4 + t;
+#pragma unroll
+                for (int st = 0; st < kMaxSubTiles; ++st) {
+                  if (st < num_subtiles) {
+                    const uint4 b_vec = s_x_u4[(st * 8 + g) * kRowStrideU4 + u4_off];
+                    gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                    gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+                  }
+                }
+              }
+            } else {
+              const uint8_t* g_blk = gate_row_ptr + static_cast<int64_t>(sb256) * 82;
+              const uint8_t* u_blk = up_row_ptr + static_cast<int64_t>(sb256) * 82;
+              const float dg = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(g_blk))) * 0.25f;
+              const float du = gguf_cuda::Fp16ToFloatDev(__ldg(reinterpret_cast<const uint16_t*>(u_blk))) * 0.25f;
+              const auto* g_sc16 = reinterpret_cast<const uint16_t*>(g_blk + 74 + 4 * ip);
+              const auto* u_sc16 = reinterpret_cast<const uint16_t*>(u_blk + 74 + 4 * ip);
+              const auto* g_qh16 = reinterpret_cast<const uint16_t*>(g_blk + 66 + 4 * ip);
+              const auto* u_qh16 = reinterpret_cast<const uint16_t*>(u_blk + 66 + 4 * ip);
+              const uint32_t g_sc4 = static_cast<uint32_t>(__ldg(g_sc16)) | (static_cast<uint32_t>(__ldg(g_sc16 + 1)) << 16);
+              const uint32_t u_sc4 = static_cast<uint32_t>(__ldg(u_sc16)) | (static_cast<uint32_t>(__ldg(u_sc16 + 1)) << 16);
+              const uint32_t g_qh4 = static_cast<uint32_t>(__ldg(g_qh16)) | (static_cast<uint32_t>(__ldg(g_qh16 + 1)) << 16);
+              const uint32_t u_qh4 = static_cast<uint32_t>(__ldg(u_qh16)) | (static_cast<uint32_t>(__ldg(u_qh16 + 1)) << 16);
+              const auto* gq16 = reinterpret_cast<const uint16_t*>(g_blk + 2 + 16 * ip + 4 * t);
+              const auto* uq16 = reinterpret_cast<const uint16_t*>(u_blk + 2 + 16 * ip + 4 * t);
+              const auto* gs16 = reinterpret_cast<const uint16_t*>(g_blk + 34 + 16 * ip + 4 * t);
+              const auto* us16 = reinterpret_cast<const uint16_t*>(u_blk + 34 + 16 * ip + 4 * t);
+              const uint32_t my_gq4 = static_cast<uint32_t>(__ldg(gq16)) | (static_cast<uint32_t>(__ldg(gq16 + 1)) << 16);
+              const uint32_t my_uq4 = static_cast<uint32_t>(__ldg(uq16)) | (static_cast<uint32_t>(__ldg(uq16 + 1)) << 16);
+              const uint32_t my_gs4 = static_cast<uint32_t>(__ldg(gs16)) | (static_cast<uint32_t>(__ldg(gs16 + 1)) << 16);
+              const uint32_t my_us4 = static_cast<uint32_t>(__ldg(us16)) | (static_cast<uint32_t>(__ldg(us16 + 1)) << 16);
+              const int sc_nibble_shift = 4 * (t >> 1);
+              const int qh_shift_l = 8 - 2 * t;
+              const int byte_shift = 8 * t;
+#pragma unroll 1
+              for (int q = 0; q < 4; ++q) {
+                const uint8_t g_sc = static_cast<uint8_t>((g_sc4 >> (8 * q)) & 0xFFu);
+                const uint8_t u_sc = static_cast<uint8_t>((u_sc4 >> (8 * q)) & 0xFFu);
+                const uint8_t g_qh = static_cast<uint8_t>((g_qh4 >> (8 * q)) & 0xFFu);
+                const uint8_t u_qh = static_cast<uint8_t>((u_qh4 >> (8 * q)) & 0xFFu);
+                const float dbg = dg * __fadd_rn(__uint_as_float(0x4B000000u | ((g_sc >> sc_nibble_shift) & 0xFu)), -8388607.5f);
+                const float dbu = du * __fadd_rn(__uint_as_float(0x4B000000u | ((u_sc >> sc_nibble_shift) & 0xFu)), -8388607.5f);
+                const uint32_t gq_w = __shfl_sync(0xFFFFFFFFu, my_gq4, q, 4);
+                const uint32_t uq_w = __shfl_sync(0xFFFFFFFFu, my_uq4, q, 4);
+                const uint32_t gs_w = __shfl_sync(0xFFFFFFFFu, my_gs4, q, 4);
+                const uint32_t us_w = __shfl_sync(0xFFFFFFFFu, my_us4, q, 4);
+                const int g_idx = static_cast<int>((gq_w >> byte_shift) & 0xFFu) | ((static_cast<int>(g_qh) << qh_shift_l) & 0x300);
+                const int u_idx = static_cast<int>((uq_w >> byte_shift) & 0xFFu) | ((static_cast<int>(u_qh) << qh_shift_l) & 0x300);
+                const uint64_t gg64 = s_lut[g_idx];
+                const uint64_t ug64 = s_lut[u_idx];
+                const uint32_t sg = (gs_w >> byte_shift) & 0xFFu;
+                const uint32_t su = (us_w >> byte_shift) & 0xFFu;
+                const uint4 e_vec = gguf_cuda::PackIqBytesSign8ToBf16x2(
+                    static_cast<uint32_t>(gg64), static_cast<uint32_t>(gg64 >> 32), sg, dbg);
+                const uint4 o_vec = gguf_cuda::PackIqBytesSign8ToBf16x2(
+                    static_cast<uint32_t>(ug64), static_cast<uint32_t>(ug64 >> 32), su, dbu);
+                const int u4_off = (half_local * 4 + q) * 4 + t;
+#pragma unroll
+                for (int st = 0; st < kMaxSubTiles; ++st) {
+                  if (st < num_subtiles) {
+                    const uint4 b_vec = s_x_u4[(st * 8 + g) * kRowStrideU4 + u4_off];
+                    gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                    gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+                  }
+                }
+              }
+            }
+          }
+        } else {
+          const int sb32_base = k_base >> 5;
+          const int num_sb32 = actual_chunk_k >> 5;
+          for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
+            const int sb32_idx = sb32_base + sb_local;
+            float g_vals[8];
+            float u_vals[8];
+            if constexpr (kGateUpType == kGgmlTypeIQ3_XXS) {
+              gguf_cuda::DecodeGgufSubBlock8Tpl<kGateUpType>(gate_row_ptr, p.gate_type, sb32_idx, t, g_vals);
+              gguf_cuda::DecodeGgufSubBlock8Tpl<kGateUpType>(up_row_ptr, p.up_type, sb32_idx, t, u_vals);
+            } else {
+              gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kGateUpType>(gate_row_ptr, p.gate_type, sb32_idx, t, s_lut, g_vals);
+              gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kGateUpType>(up_row_ptr, p.up_type, sb32_idx, t, s_lut, u_vals);
+            }
+            const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
+            const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
+#pragma unroll
+            for (int st = 0; st < kMaxSubTiles; ++st) {
+              if (st < num_subtiles) {
+                const uint4 b_vec = s_x_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
+                gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+              }
+            }
+          }
+        }
+      } else {
+        const int sb32_base = k_base >> 5;
+        const int num_sb32 = actual_chunk_k >> 5;
+        for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
+          const int sb32_idx = sb32_base + sb_local;
+          float g_vals[8];
+          float u_vals[8];
+          gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kGateUpType>(gate_row_ptr, p.gate_type, sb32_idx, t, s_lut, g_vals);
+          gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kGateUpType>(up_row_ptr, p.up_type, sb32_idx, t, s_lut, u_vals);
+          const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(g_vals);
+          const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(u_vals);
+#pragma unroll
+          for (int st = 0; st < kMaxSubTiles; ++st) {
+            if (st < num_subtiles) {
+              const uint4 b_vec = s_x_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
+              gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+              gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+            }
           }
         }
       }
@@ -943,36 +1194,43 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc1S
 
 // Tensor-Core BF16 FC2 kernel (mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32).
 // Each warp (32 threads) computes 16 hidden_size channels across up to kMaxSubTiles * 8 routes.
-// 4 warps per CTA (64 hidden_size channels) in decode (kMaxSubTiles == 1), 8 warps per CTA (128 channels) in prefill.
+// 4 warps per CTA (64 hidden_size channels) in decode (kMaxSubTiles <= 2), 8 warps per CTA (128 channels) in prefill.
 template <int kMaxSubTiles, int kDownType>
-__global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2Bf16TcKernel(
-    const __nv_bfloat16* __restrict__ fc1_out,
-    const uint8_t* __restrict__ down_weights,
-    const int* __restrict__ sorted_routes,
-    const MoEPackedTile* __restrict__ tiles,
-    const int* __restrict__ d_num_tiles,
-    MoEPackedParams p,
-    __nv_bfloat16* __restrict__ fc2_out) {
+__global__ __launch_bounds__(
+    (kMaxSubTiles <= 2) ? 128 : 256,
+    (kMaxSubTiles == 1 && kDownType == gguf_quant::kGgmlTypeIQ4_NL)
+        ? 8
+        : ((kMaxSubTiles == 2 && kDownType == gguf_quant::kGgmlTypeIQ4_NL)
+               ? 6
+               : ((kMaxSubTiles >= 8 && kDownType >= 0) ? 3 : 2))) void MoEPackedFc2Bf16TcKernel(const __nv_bfloat16* __restrict__ fc1_out,
+                                                                                                 const uint8_t* __restrict__ down_weights,
+                                                                                                 const int* __restrict__ sorted_routes,
+                                                                                                 const MoEPackedTile* __restrict__ tiles,
+                                                                                                 const int* __restrict__ d_num_tiles,
+                                                                                                 MoEPackedParams p,
+                                                                                                 __nv_bfloat16* __restrict__ fc2_out) {
   const int tile_idx = static_cast<int>(blockIdx.y);
   if (tile_idx >= __ldg(d_num_tiles)) return;
 
-  constexpr int kWarps = (kMaxSubTiles == 1) ? 4 : 8;
+  constexpr int kWarps = (kMaxSubTiles <= 2) ? 4 : 8;
   constexpr int kThreads = kWarps * 32;
-  constexpr int kChunkK = 640;
-  constexpr int kChunkU4 = kChunkK / 8;         // 80
-  constexpr int kRowStrideU4 = kChunkU4 + 4;    // 84 (bank-conflict-free for LDS.128)
-  constexpr int kMaxRoutes = kMaxSubTiles * 8;  // 8 or 32
-  constexpr int kSmemActSize = (kMaxSubTiles == 1) ? 1 : (kMaxRoutes * kRowStrideU4);
+  constexpr int kChunkK = (kMaxSubTiles >= 8) ? 320 : 640;
+  constexpr int kChunkU4 = kChunkK / 8;         // 40 or 80
+  constexpr int kRowStrideU4 = kChunkU4 + 4;    // 44 or 84 (bank-conflict-free for LDS.128)
+  constexpr int kMaxRoutes = kMaxSubTiles * 8;  // 8, 16, 32, or 64
+  constexpr int kSmemActSize = (kMaxSubTiles <= 2) ? 1 : (kMaxRoutes * kRowStrideU4);
   using namespace onnxruntime::contrib::gguf_quant;
-  constexpr int kLutU64Count = (kMaxSubTiles != 1)
-                                   ? 1
-                                   : ((kDownType == kGgmlTypeIQ2_S)
-                                          ? 1024
-                                          : ((kDownType == kGgmlTypeIQ2_XS)
-                                                 ? 512
-                                                 : ((kDownType == kGgmlTypeIQ2_XXS)
-                                                        ? 256
-                                                        : ((kDownType == kGgmlTypeIQ3_XXS) ? 128 : 1))));
+  constexpr int kLutU64Count = (kDownType == kGgmlTypeIQ4_NL)
+                                   ? 256
+                                   : ((kDownType == kGgmlTypeIQ3_XXS)
+                                          ? 128
+                                          : ((kDownType == kGgmlTypeIQ2_XXS)
+                                                 ? 256
+                                                 : ((kMaxSubTiles > 2)
+                                                        ? 1
+                                                        : ((kDownType == kGgmlTypeIQ2_S)
+                                                               ? 1024
+                                                               : ((kDownType == kGgmlTypeIQ2_XS) ? 512 : 1)))));
 
   __shared__ uint4 s_act_u4[kSmemActSize];
   __shared__ uint64_t s_lut[kLutU64Count];
@@ -988,16 +1246,21 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2B
   if (tid < kMaxRoutes) {
     s_routes[tid] = (tid < count) ? __ldg(&sorted_routes[tile.start_route + tid]) : 0;
   }
-  if constexpr (kMaxSubTiles == 1) {
-    if constexpr (kDownType == kGgmlTypeIQ2_XXS) {
-      for (int i = tid; i < 256; i += kThreads) s_lut[i] = __ldg(iq2xxs_grid + i);
-    } else if constexpr (kDownType == kGgmlTypeIQ2_XS) {
+  if constexpr (kDownType == kGgmlTypeIQ4_NL) {
+    float* s_iq4_32bank = reinterpret_cast<float*>(s_lut);
+    for (int i = tid; i < 512; i += kThreads) {
+      s_iq4_32bank[i] = static_cast<float>(kvalues_iq4nl[i >> 5]);
+    }
+  } else if constexpr (kDownType == kGgmlTypeIQ2_XXS) {
+    for (int i = tid; i < 256; i += kThreads) s_lut[i] = __ldg(iq2xxs_grid + i);
+  } else if constexpr (kDownType == kGgmlTypeIQ3_XXS) {
+    uint32_t* s_lut32 = reinterpret_cast<uint32_t*>(s_lut);
+    for (int i = tid; i < 256; i += kThreads) s_lut32[i] = __ldg(iq3xxs_grid + i);
+  } else if constexpr (kMaxSubTiles <= 2) {
+    if constexpr (kDownType == kGgmlTypeIQ2_XS) {
       for (int i = tid; i < 512; i += kThreads) s_lut[i] = __ldg(iq2xs_grid + i);
     } else if constexpr (kDownType == kGgmlTypeIQ2_S) {
       for (int i = tid; i < 1024; i += kThreads) s_lut[i] = __ldg(iq2s_grid + i);
-    } else if constexpr (kDownType == kGgmlTypeIQ3_XXS) {
-      uint32_t* s_lut32 = reinterpret_cast<uint32_t*>(s_lut);
-      for (int i = tid; i < 256; i += kThreads) s_lut32[i] = __ldg(iq3xxs_grid + i);
     }
   }
   __syncthreads();
@@ -1012,10 +1275,6 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2B
   const bool valid_lo = (r_lo < p.hidden_size);
   const bool valid_hi = (r_hi < p.hidden_size);
 
-  const int64_t exp_base = static_cast<int64_t>(expert) * p.hidden_size;
-  const uint8_t* down_row_lo = down_weights + (exp_base + (valid_lo ? r_lo : 0)) * p.down_row_bytes;
-  const uint8_t* down_row_hi = down_weights + (exp_base + (valid_hi ? r_hi : 0)) * p.down_row_bytes;
-
   float acc[kMaxSubTiles][4];
 #pragma unroll
   for (int st = 0; st < kMaxSubTiles; ++st) {
@@ -1025,42 +1284,58 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2B
     }
   }
 
-  if constexpr (kMaxSubTiles == 1) {
-    if (valid_lo) {
-      const bool route_valid = (g < count);
-      const __nv_bfloat16* fc1_row =
-          fc1_out + static_cast<int64_t>(route_valid ? s_routes[g] : 0) * p.inter_size;
+  if constexpr (kMaxSubTiles <= 2) {
+    if (n_out_base < p.hidden_size) {
+      const int64_t exp_base = static_cast<int64_t>(expert) * p.hidden_size;
+      const uint8_t* down_row_lo = down_weights + (exp_base + (valid_lo ? r_lo : 0)) * p.down_row_bytes;
+      const uint8_t* down_row_hi = down_weights + (exp_base + (valid_hi ? r_hi : 0)) * p.down_row_bytes;
+      bool route_valid_arr[kMaxSubTiles];
+      const __nv_bfloat16* fc1_rows[kMaxSubTiles];
+#pragma unroll
+      for (int st = 0; st < kMaxSubTiles; ++st) {
+        const int rm = st * 8 + g;
+        route_valid_arr[st] = (rm < count);
+        fc1_rows[st] = fc1_out + static_cast<int64_t>(route_valid_arr[st] ? s_routes[rm] : 0) * p.inter_size;
+      }
       if constexpr (kDownType == kGgmlTypeIQ4_NL) {
         if ((reinterpret_cast<uintptr_t>(down_weights) & 3u) == 0 &&
             (p.down_row_bytes & 3) == 0 &&
             (p.inter_size & 63) == 0 &&
             (reinterpret_cast<uintptr_t>(fc1_out) & 15u) == 0) {
+          const float* s_iq4_32bank = reinterpret_cast<const float*>(s_lut);
           const int num_pairs = p.inter_size >> 6;
           for (int pair_idx = 0; pair_idx < num_pairs; ++pair_idx) {
-            const uint4 b_vec0 = route_valid
-                                     ? __ldg(reinterpret_cast<const uint4*>(fc1_row + pair_idx * 64 + t * 8))
-                                     : make_uint4(0u, 0u, 0u, 0u);
-            const uint4 b_vec1 = route_valid
-                                     ? __ldg(reinterpret_cast<const uint4*>(fc1_row + pair_idx * 64 + 32 + t * 8))
-                                     : make_uint4(0u, 0u, 0u, 0u);
-            uint4 e0, e1;
-            uint4 o0 = make_uint4(0u, 0u, 0u, 0u);
-            uint4 o1 = o0;
-            gguf_cuda::DecodeIq4NlPair64AlignedBf16x2(down_row_lo + pair_idx * 36, t, e0, e1);
-            if (valid_hi) {
-              gguf_cuda::DecodeIq4NlPair64AlignedBf16x2(down_row_hi + pair_idx * 36, t, o0, o1);
+            uint4 b0_arr[kMaxSubTiles];
+            uint4 b1_arr[kMaxSubTiles];
+#pragma unroll
+            for (int st = 0; st < kMaxSubTiles; ++st) {
+              if (kMaxSubTiles == 1 || st < num_subtiles) {
+                b0_arr[st] = route_valid_arr[st]
+                                 ? __ldg(reinterpret_cast<const uint4*>(fc1_rows[st] + pair_idx * 64 + t * 8))
+                                 : make_uint4(0u, 0u, 0u, 0u);
+                b1_arr[st] = route_valid_arr[st]
+                                 ? __ldg(reinterpret_cast<const uint4*>(fc1_rows[st] + pair_idx * 64 + 32 + t * 8))
+                                 : make_uint4(0u, 0u, 0u, 0u);
+              }
             }
-            gguf_cuda::MmaBf16(acc[0], e0.x, o0.x, e0.y, o0.y, b_vec0.x, b_vec0.y);
-            gguf_cuda::MmaBf16(acc[0], e0.z, o0.z, e0.w, o0.w, b_vec0.z, b_vec0.w);
-            gguf_cuda::MmaBf16(acc[0], e1.x, o1.x, e1.y, o1.y, b_vec1.x, b_vec1.y);
-            gguf_cuda::MmaBf16(acc[0], e1.z, o1.z, e1.w, o1.w, b_vec1.z, b_vec1.w);
+            uint4 e0, e1, o0, o1;
+            gguf_cuda::DecodeIq4NlPair64BankFreeBf16x2(down_row_lo + pair_idx * 36, lane, s_iq4_32bank, e0, e1);
+            gguf_cuda::DecodeIq4NlPair64BankFreeBf16x2(down_row_hi + pair_idx * 36, lane, s_iq4_32bank, o0, o1);
+            if (!valid_lo) e0 = e1 = make_uint4(0u, 0u, 0u, 0u);
+            if (!valid_hi) o0 = o1 = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+            for (int st = 0; st < kMaxSubTiles; ++st) {
+              if (kMaxSubTiles == 1 || st < num_subtiles) {
+                gguf_cuda::MmaBf16(acc[st], e0.x, o0.x, e0.y, o0.y, b0_arr[st].x, b0_arr[st].y);
+                gguf_cuda::MmaBf16(acc[st], e0.z, o0.z, e0.w, o0.w, b0_arr[st].z, b0_arr[st].w);
+                gguf_cuda::MmaBf16(acc[st], e1.x, o1.x, e1.y, o1.y, b1_arr[st].x, b1_arr[st].y);
+                gguf_cuda::MmaBf16(acc[st], e1.z, o1.z, e1.w, o1.w, b1_arr[st].z, b1_arr[st].w);
+              }
+            }
           }
-        } else {
+        } else if (valid_lo) {
           const int num_sb32 = p.inter_size >> 5;
           for (int sb32_idx = 0; sb32_idx < num_sb32; ++sb32_idx) {
-            const uint4 b_vec = route_valid
-                                    ? __ldg(reinterpret_cast<const uint4*>(fc1_row + sb32_idx * 32 + t * 8))
-                                    : make_uint4(0u, 0u, 0u, 0u);
             float d_lo[8];
             float d_hi[8] = {};
             gguf_cuda::DecodeGgufSubBlock8Impl<kGgmlTypeIQ4_NL>(down_row_lo, sb32_idx, t, d_lo);
@@ -1069,16 +1344,21 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2B
             }
             const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
             const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
-            gguf_cuda::MmaBf16(acc[0], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-            gguf_cuda::MmaBf16(acc[0], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+#pragma unroll
+            for (int st = 0; st < kMaxSubTiles; ++st) {
+              if (kMaxSubTiles == 1 || st < num_subtiles) {
+                const uint4 b_vec = route_valid_arr[st]
+                                        ? gguf_cuda::LoadU4Dev(fc1_rows[st] + sb32_idx * 32 + t * 8)
+                                        : make_uint4(0u, 0u, 0u, 0u);
+                gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+              }
+            }
           }
         }
-      } else {
+      } else if (valid_lo) {
         const int num_sb32 = p.inter_size >> 5;
         for (int sb32_idx = 0; sb32_idx < num_sb32; ++sb32_idx) {
-          const uint4 b_vec = route_valid
-                                  ? __ldg(reinterpret_cast<const uint4*>(fc1_row + sb32_idx * 32 + t * 8))
-                                  : make_uint4(0u, 0u, 0u, 0u);
           float d_lo[8];
           float d_hi[8];
           gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, s_lut, d_lo);
@@ -1090,54 +1370,150 @@ __global__ __launch_bounds__((kMaxSubTiles == 1) ? 128 : 256) void MoEPackedFc2B
           }
           const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
           const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
-          gguf_cuda::MmaBf16(acc[0], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-          gguf_cuda::MmaBf16(acc[0], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+#pragma unroll
+          for (int st = 0; st < kMaxSubTiles; ++st) {
+            if (kMaxSubTiles == 1 || st < num_subtiles) {
+              const uint4 b_vec = route_valid_arr[st]
+                                      ? gguf_cuda::LoadU4Dev(fc1_rows[st] + sb32_idx * 32 + t * 8)
+                                      : make_uint4(0u, 0u, 0u, 0u);
+              gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+              gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+            }
+          }
         }
       }
     }
   } else {
+    const bool aligned_iq4 = ((reinterpret_cast<uintptr_t>(down_weights) & 3u) == 0) &&
+                             ((p.down_row_bytes & 3) == 0);
     for (int k_base = 0; k_base < p.inter_size; k_base += kChunkK) {
       const int rem_k = p.inter_size - k_base;
       const int actual_chunk_k = rem_k < kChunkK ? rem_k : kChunkK;
       const int actual_chunk_u4 = actual_chunk_k >> 3;
       const int total_u4 = padded_routes * actual_chunk_u4;
 
-      for (int idx = tid; idx < total_u4; idx += kThreads) {
-        const int m = idx / actual_chunk_u4;
-        const int u4_col = idx - m * actual_chunk_u4;
-        uint4 val = make_uint4(0u, 0u, 0u, 0u);
-        if (m < count) {
-          const int route = s_routes[m];
-          const __nv_bfloat16* src_ptr =
-              fc1_out + static_cast<int64_t>(route) * p.inter_size + k_base + (u4_col << 3);
-          val = __ldg(reinterpret_cast<const uint4*>(src_ptr));
+      if (actual_chunk_u4 == kChunkU4) {
+        for (int idx = tid; idx < total_u4; idx += kThreads) {
+          const int m = idx / kChunkU4;
+          const int u4_col = idx - m * kChunkU4;
+          uint4 val = make_uint4(0u, 0u, 0u, 0u);
+          if (m < count) {
+            const int route = s_routes[m];
+            const __nv_bfloat16* src_ptr =
+                fc1_out + static_cast<int64_t>(route) * p.inter_size + k_base + (u4_col << 3);
+            val = __ldg(reinterpret_cast<const uint4*>(src_ptr));
+          }
+          s_act_u4[m * kRowStrideU4 + u4_col] = val;
         }
-        s_act_u4[m * kRowStrideU4 + u4_col] = val;
+      } else {
+        for (int idx = tid; idx < total_u4; idx += kThreads) {
+          const int m = idx / actual_chunk_u4;
+          const int u4_col = idx - m * actual_chunk_u4;
+          uint4 val = make_uint4(0u, 0u, 0u, 0u);
+          if (m < count) {
+            const int route = s_routes[m];
+            const __nv_bfloat16* src_ptr =
+                fc1_out + static_cast<int64_t>(route) * p.inter_size + k_base + (u4_col << 3);
+            val = __ldg(reinterpret_cast<const uint4*>(src_ptr));
+          }
+          s_act_u4[m * kRowStrideU4 + u4_col] = val;
+        }
       }
       __syncthreads();
 
-      if (valid_lo) {
-        const int sb32_base = k_base >> 5;
-        const int num_sb32 = actual_chunk_k >> 5;
-        for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
-          const int sb32_idx = sb32_base + sb_local;
-          float d_lo[8];
-          float d_hi[8];
-          gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, d_lo);
-          if (valid_hi) {
-            gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_hi, p.down_type, sb32_idx, t, d_hi);
-          } else {
+      if (n_out_base < p.hidden_size) {
+        const int64_t exp_base = static_cast<int64_t>(expert) * p.hidden_size;
+        const uint8_t* down_row_lo = down_weights + (exp_base + (valid_lo ? r_lo : 0)) * p.down_row_bytes;
+        const uint8_t* down_row_hi = down_weights + (exp_base + (valid_hi ? r_hi : 0)) * p.down_row_bytes;
+        if constexpr (kDownType == kGgmlTypeIQ4_NL) {
+          if (aligned_iq4 && ((actual_chunk_k & 63) == 0)) {
+            const float* s_iq4_32bank = reinterpret_cast<const float*>(s_lut);
+            const int pair_base = k_base >> 6;
+            const int num_pairs = actual_chunk_k >> 6;
+#pragma unroll 1
+            for (int pair_local = 0; pair_local < num_pairs; ++pair_local) {
+              const int pair_idx = pair_base + pair_local;
+              uint4 e0, e1, o0, o1;
+              gguf_cuda::DecodeIq4NlPair64BankFreeBf16x2(down_row_lo + pair_idx * 36, lane, s_iq4_32bank, e0, e1);
+              gguf_cuda::DecodeIq4NlPair64BankFreeBf16x2(down_row_hi + pair_idx * 36, lane, s_iq4_32bank, o0, o1);
+              if (!valid_lo) e0 = e1 = make_uint4(0u, 0u, 0u, 0u);
+              if (!valid_hi) o0 = o1 = make_uint4(0u, 0u, 0u, 0u);
+              const int u4_off0 = pair_local * 8 + t;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) d_hi[j] = 0.0f;
+              for (int st = 0; st < kMaxSubTiles; ++st) {
+                if (st < num_subtiles) {
+                  const uint4 b_vec0 = s_act_u4[(st * 8 + g) * kRowStrideU4 + u4_off0];
+                  gguf_cuda::MmaBf16(acc[st], e0.x, o0.x, e0.y, o0.y, b_vec0.x, b_vec0.y);
+                  gguf_cuda::MmaBf16(acc[st], e0.z, o0.z, e0.w, o0.w, b_vec0.z, b_vec0.w);
+                }
+              }
+              const int u4_off1 = pair_local * 8 + 4 + t;
+#pragma unroll
+              for (int st = 0; st < kMaxSubTiles; ++st) {
+                if (st < num_subtiles) {
+                  const uint4 b_vec1 = s_act_u4[(st * 8 + g) * kRowStrideU4 + u4_off1];
+                  gguf_cuda::MmaBf16(acc[st], e1.x, o1.x, e1.y, o1.y, b_vec1.x, b_vec1.y);
+                  gguf_cuda::MmaBf16(acc[st], e1.z, o1.z, e1.w, o1.w, b_vec1.z, b_vec1.w);
+                }
+              }
+            }
+          } else if (valid_lo) {
+            const int sb32_base = k_base >> 5;
+            const int num_sb32 = actual_chunk_k >> 5;
+#pragma unroll 1
+            for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
+              const int sb32_idx = sb32_base + sb_local;
+              float d_lo[8];
+              float d_hi[8] = {};
+              gguf_cuda::DecodeGgufSubBlock8Impl<kGgmlTypeIQ4_NL>(down_row_lo, sb32_idx, t, d_lo);
+              if (valid_hi) {
+                gguf_cuda::DecodeGgufSubBlock8Impl<kGgmlTypeIQ4_NL>(down_row_hi, sb32_idx, t, d_hi);
+              }
+              const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
+              const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
+#pragma unroll
+              for (int st = 0; st < kMaxSubTiles; ++st) {
+                if (st < num_subtiles) {
+                  const uint4 b_vec = s_act_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
+                  gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                  gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+                }
+              }
+            }
           }
-          const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
-          const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
+        } else if (valid_lo) {
+          const int sb32_base = k_base >> 5;
+          const int num_sb32 = actual_chunk_k >> 5;
+          for (int sb_local = 0; sb_local < num_sb32; ++sb_local) {
+            const int sb32_idx = sb32_base + sb_local;
+            float d_lo[8];
+            float d_hi[8];
+            if constexpr (kDownType == kGgmlTypeIQ2_XXS || kDownType == kGgmlTypeIQ3_XXS) {
+              gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, s_lut, d_lo);
+              if (valid_hi) {
+                gguf_cuda::DecodeGgufSubBlock8SmemLutTpl<kDownType>(down_row_hi, p.down_type, sb32_idx, t, s_lut, d_hi);
+              } else {
 #pragma unroll
-          for (int st = 0; st < kMaxSubTiles; ++st) {
-            if (st < num_subtiles) {
-              const uint4 b_vec = s_act_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
-              gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-              gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+                for (int j = 0; j < 8; ++j) d_hi[j] = 0.0f;
+              }
+            } else {
+              gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_lo, p.down_type, sb32_idx, t, d_lo);
+              if (valid_hi) {
+                gguf_cuda::DecodeGgufSubBlock8Tpl<kDownType>(down_row_hi, p.down_type, sb32_idx, t, d_hi);
+              } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) d_hi[j] = 0.0f;
+              }
+            }
+            const uint4 e_vec = gguf_cuda::PackFloat8ToBf16x2(d_lo);
+            const uint4 o_vec = gguf_cuda::PackFloat8ToBf16x2(d_hi);
+#pragma unroll
+            for (int st = 0; st < kMaxSubTiles; ++st) {
+              if (st < num_subtiles) {
+                const uint4 b_vec = s_act_u4[(st * 8 + g) * kRowStrideU4 + sb_local * 4 + t];
+                gguf_cuda::MmaBf16(acc[st], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
+                gguf_cuda::MmaBf16(acc[st], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+              }
             }
           }
         }
@@ -1428,6 +1804,7 @@ size_t AlignUpWorkspace(size_t count, size_t element_bytes = 1) {
   return bytes;
 }
 
+template <int MS = 1>
 void LaunchMoEPackedFc1DecodeBf16TcDispatch(
     cudaStream_t stream,
     dim3 grid,
@@ -1446,46 +1823,46 @@ void LaunchMoEPackedFc1DecodeBf16TcDispatch(
   if (params.gate_type == params.up_type) {
     switch (params.gate_type) {
       case kGgmlTypeIQ2_XXS:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ2_XXS><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ2_XXS, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeIQ2_XS:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ2_XS><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ2_XS, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeIQ2_S:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ2_S><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ2_S, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeIQ3_XXS:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ3_XXS><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ3_XXS, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeIQ4_XS:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ4_XS><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ4_XS, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeIQ4_NL:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ4_NL><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeIQ4_NL, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeQ2_0:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeQ2_0><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeQ2_0, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeQ5_0:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeQ5_0><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeQ5_0, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       case kGgmlTypeQ8_0:
-        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeQ8_0><<<grid, kBlock, 0, stream>>>(
+        MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, kGgmlTypeQ8_0, MS><<<grid, kBlock, 0, stream>>>(
             input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
         return;
       default:
         break;
     }
   }
-  MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, -1><<<grid, kBlock, 0, stream>>>(
+  MoEPackedFc1DecodeWarpKSplitKernel<KW, MT, -1, MS><<<grid, kBlock, 0, stream>>>(
       input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
 }
 
@@ -1561,7 +1938,7 @@ void LaunchMoEPackedFc2Bf16TcDispatch(
     const MoEPackedParams& params,
     __nv_bfloat16* fc2_out) {
   using namespace onnxruntime::contrib::gguf_quant;
-  constexpr unsigned int kBlock = (kMaxSubTiles == 1) ? 128u : 256u;
+  constexpr unsigned int kBlock = (kMaxSubTiles <= 2) ? 128u : 256u;
   switch (params.down_type) {
     case kGgmlTypeQ2_0:
       MoEPackedFc2Bf16TcKernel<kMaxSubTiles, kGgmlTypeQ2_0><<<grid, kBlock, 0, stream>>>(
@@ -1897,18 +2274,37 @@ Status DispatchMoEPackedCuda(
   const int total_routes = params.num_rows * params.k;
   constexpr bool kIsBf16 = std::is_same<CudaT, __nv_bfloat16>::value;
   const bool use_tensor_cores = kIsBf16 && params.bf16_tc_supported;
-  const bool use_prefill_tiles = use_tensor_cores && (total_routes > 128);
-  const bool use_relu_iq2_prefill_64 =
-      use_prefill_tiles && params.relu_squared &&
+  const bool is_relu_iq2 =
+      params.relu_squared &&
       params.gate_type == gguf_quant::kGgmlTypeIQ2_XXS &&
       params.down_type == gguf_quant::kGgmlTypeIQ2_XXS;
-  const int max_tiles = use_relu_iq2_prefill_64
-                            ? ((total_routes + 63) / 64 + params.num_experts)
-                            : (use_prefill_tiles
-                                   ? ((total_routes + 31) / 32 + params.num_experts)
-                                   : ((total_routes <= 128) ? total_routes : ((total_routes + 7) / 8 + params.num_experts)));
-  // Compact tile descriptors each contain at least one route. Keep workspace offsets unchanged.
-  const int launch_tiles = std::min(max_tiles, total_routes);
+  constexpr int kMoEPackedMaxDecodeTileRoutes = 640;
+  const int decode_route_cap = is_relu_iq2 ? 128 : kMoEPackedMaxDecodeTileRoutes;
+  const bool use_prefill_tiles = use_tensor_cores && (total_routes > decode_route_cap);
+#if defined(COMPILE_HOPPER_TMA_GEMMS)
+  cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+  const bool stream_capturing =
+      (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess) &&
+      (capture_status != cudaStreamCaptureStatusNone);
+  const bool use_sm90_wgmma_prefill =
+      use_prefill_tiles && !params.relu_squared && params.sm90_wgmma_supported &&
+      !stream_capturing && (params.hidden_size % 128) == 0 && (params.inter_size % 128) == 0;
+#else
+  constexpr bool use_sm90_wgmma_prefill = false;
+#endif
+  // At E=512, total_routes <= 640 (B <= 8) has <= 1.25 routes/expert on average, so 8-route MS=1 tiles
+  // maximize occupancy without empty second-subtile overhead or register-clamp spills.
+  constexpr bool use_decode_ms2 = false;
+  const int tile_routes =
+      use_sm90_wgmma_prefill ? 128 : (use_prefill_tiles ? 64 : (use_decode_ms2 ? 16 : 8));
+  const int max_tiles = use_prefill_tiles
+                            ? ((total_routes + tile_routes - 1) / tile_routes + params.num_experts)
+                            : ((total_routes <= 128) ? total_routes : ((total_routes + 7) / 8 + params.num_experts));
+  // Compact tile descriptors each contain at least one route; tighten launch_tiles by active-expert pigeonhole bound.
+  const int active_experts_cap = std::min(params.num_experts, total_routes);
+  const int launch_tiles = std::min(
+      max_tiles,
+      std::min(total_routes, (total_routes + (tile_routes - 1) * active_experts_cap) / tile_routes));
 
   uint8_t* ws_ptr = static_cast<uint8_t*>(workspace);
   float* topk_scales = reinterpret_cast<float*>(ws_ptr);
@@ -1959,12 +2355,15 @@ Status DispatchMoEPackedCuda(
   }
   ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
 
-  // 2. Build expert-grouped tiles (8 routes/tile in decode, 64 for IQ2 ReLU2 prefill, 32 otherwise)
-  if (use_relu_iq2_prefill_64) {
-    BuildMoEPackedTilesKernel<64><<<1, 512, 0, stream>>>(
+  // 2. Build expert-grouped tiles (8 or 16 routes/tile in decode, 64 or 128 routes/tile in prefill)
+  if (use_sm90_wgmma_prefill) {
+    BuildMoEPackedTilesKernel<128><<<1, 512, 0, stream>>>(
         topk_indices, total_routes, params.num_experts, sorted_routes, tiles, d_num_tiles);
   } else if (use_prefill_tiles) {
-    BuildMoEPackedTilesKernel<32><<<1, 512, 0, stream>>>(
+    BuildMoEPackedTilesKernel<64><<<1, 512, 0, stream>>>(
+        topk_indices, total_routes, params.num_experts, sorted_routes, tiles, d_num_tiles);
+  } else if (use_decode_ms2) {
+    BuildMoEPackedTilesKernel<16><<<1, 512, 0, stream>>>(
         topk_indices, total_routes, params.num_experts, sorted_routes, tiles, d_num_tiles);
   } else {
     BuildMoEPackedTilesKernel<8><<<1, 512, 0, stream>>>(
@@ -2047,33 +2446,52 @@ Status DispatchMoEPackedCuda(
           ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
         }
       } else {
-        // 3. Tensor-Core FC1 (64 inter_size channels/CTA in prefill, 16 inter_size channels/CTA Warp-K-Split in decode)
-        if (use_prefill_tiles) {
-          const dim3 fc1_grid(static_cast<unsigned int>((params.inter_size + 63) / 64),
-                              static_cast<unsigned int>(launch_tiles));
-          LaunchMoEPackedFc1Bf16TcDispatch<4>(
-              stream, fc1_grid, input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
-        } else {
-          const dim3 fc1_grid(static_cast<unsigned int>((params.inter_size + 15) / 16),
-                              static_cast<unsigned int>(launch_tiles));
-          LaunchMoEPackedFc1DecodeBf16TcDispatch(
-              stream, fc1_grid, input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
-        }
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
+#if defined(COMPILE_HOPPER_TMA_GEMMS)
+        if (use_sm90_wgmma_prefill) {
+          ORT_RETURN_IF_ERROR(CUDA_CALL(LaunchMoEPackedSm90WgmmaPrefillCuda(
+              stream, launch_tiles, input, gate_weights, up_weights, down_weights,
+              sorted_routes, tiles, d_num_tiles, params, fc1_out, fc2_out)));
+        } else
+#endif
+        {
+          // 3. Tensor-Core FC1 (64 inter_size channels/CTA in prefill, 16 inter_size channels/CTA Warp-K-Split in decode)
+          if (use_prefill_tiles) {
+            const dim3 fc1_grid(static_cast<unsigned int>((params.inter_size + 63) / 64),
+                                static_cast<unsigned int>(launch_tiles));
+            LaunchMoEPackedFc1Bf16TcDispatch<8>(
+                stream, fc1_grid, input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
+          } else if (use_decode_ms2) {
+            const dim3 fc1_grid(static_cast<unsigned int>((params.inter_size + 15) / 16),
+                                static_cast<unsigned int>(launch_tiles));
+            LaunchMoEPackedFc1DecodeBf16TcDispatch<2>(
+                stream, fc1_grid, input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
+          } else {
+            const dim3 fc1_grid(static_cast<unsigned int>((params.inter_size + 15) / 16),
+                                static_cast<unsigned int>(launch_tiles));
+            LaunchMoEPackedFc1DecodeBf16TcDispatch<1>(
+                stream, fc1_grid, input, gate_weights, up_weights, sorted_routes, tiles, d_num_tiles, params, fc1_out);
+          }
+          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
 
-        // 4. Tensor-Core FC2 (128 hidden_size channels/CTA in prefill, 64 hidden_size channels/CTA in decode)
-        if (use_prefill_tiles) {
-          const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 127) / 128),
-                              static_cast<unsigned int>(launch_tiles));
-          LaunchMoEPackedFc2Bf16TcDispatch<4>(
-              stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
-        } else {
-          const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 63) / 64),
-                              static_cast<unsigned int>(launch_tiles));
-          LaunchMoEPackedFc2Bf16TcDispatch<1>(
-              stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
+          // 4. Tensor-Core FC2 (128 hidden_size channels/CTA in prefill, 64 hidden_size channels/CTA in decode)
+          if (use_prefill_tiles) {
+            const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 127) / 128),
+                                static_cast<unsigned int>(launch_tiles));
+            LaunchMoEPackedFc2Bf16TcDispatch<8>(
+                stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
+          } else if (use_decode_ms2) {
+            const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 63) / 64),
+                                static_cast<unsigned int>(launch_tiles));
+            LaunchMoEPackedFc2Bf16TcDispatch<2>(
+                stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
+          } else {
+            const dim3 fc2_grid(static_cast<unsigned int>((params.hidden_size + 63) / 64),
+                                static_cast<unsigned int>(launch_tiles));
+            LaunchMoEPackedFc2Bf16TcDispatch<1>(
+                stream, fc2_grid, fc1_out, down_weights, sorted_routes, tiles, d_num_tiles, params, fc2_out);
+          }
+          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
         }
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
       }
     }
   } else {
@@ -2594,7 +3012,7 @@ Status GetMoEPackedWorkspaceBytes(const MoEPackedParams& params, size_t elem_byt
   return Status::OK();
 }
 
-Status GetMoEPackedBf16KernelSupport(int device_id, bool& supported) {
+Status GetMoEPackedBf16KernelSupport(int device_id, bool& supported, bool* sm90_wgmma_supported) {
   int previous_device = -1;
   CUDA_RETURN_IF_ERROR(cudaGetDevice(&previous_device));
   auto restore_device = gsl::finally([previous_device, device_id]() {
@@ -2610,6 +3028,22 @@ Status GetMoEPackedBf16KernelSupport(int device_id, bool& supported) {
   CUDA_RETURN_IF_ERROR(cudaFuncGetAttributes(&attributes, MoEPackedFc1DecodeWarpKSplitKernel<4, 2, -1>));
   // binaryVersion can be >= 80 after JIT of compute_75 PTX, whose MMA body is still unsupported.
   supported = attributes.ptxVersion >= 80;
+  if (sm90_wgmma_supported != nullptr) {
+    *sm90_wgmma_supported = false;
+#if defined(COMPILE_HOPPER_TMA_GEMMS)
+    if (supported) {
+      int major = 0;
+      int minor = 0;
+      if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id) == cudaSuccess &&
+          cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id) == cudaSuccess &&
+          major == 9 && minor == 0) {
+        if (InitMoEPackedSm90WgmmaKernels() == cudaSuccess) {
+          *sm90_wgmma_supported = true;
+        }
+      }
+    }
+#endif
+  }
   return Status::OK();
 }
 
