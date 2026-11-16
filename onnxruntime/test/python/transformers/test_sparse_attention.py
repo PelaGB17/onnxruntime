@@ -8,9 +8,11 @@ Parity test and benchmark performance of SparseAttention. Requires Nvidia GPU of
 """
 
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -25,7 +27,6 @@ from onnxruntime.transformers.io_binding_helper import CudaSession
 if os.path.dirname(__file__) not in sys.path:
     sys.path.insert(0, os.path.dirname(__file__))
 
-from cuda_plugin_ep_helper import resolve_cuda_plugin_ep
 from gqa_test_helper import (
     AttentionConfig,
     GroupQueryAttentionConfig,
@@ -860,6 +861,48 @@ class TestSparseAttention(unittest.TestCase):
 class TestPackedSparseAttentionIndexerTensorCore(unittest.TestCase):
     """Parity tests for QsaScoreTileTopKTcKernel and QsaRaggedPrefillScoreTcKernel."""
 
+    def _run_qsa(self, model_bytes, feeds_list, tc_flag):
+        # The native dispatch flag is cached on first use, so each backend needs a fresh process.
+        script = """
+import sys
+from pathlib import Path
+import numpy as np
+from onnxruntime import InferenceSession, SessionOptions
+from cuda_plugin_ep_helper import resolve_cuda_plugin_ep
+
+directory = Path(sys.argv[1])
+options = SessionOptions()
+options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+ep = resolve_cuda_plugin_ep("CUDAExecutionProvider")
+session = InferenceSession(str(directory / "model.onnx"), options, providers=[ep])
+for i in range(int(sys.argv[2])):
+    with np.load(directory / f"inputs_{i}.npz") as feeds:
+        outputs = session.run(None, dict(feeds))
+    np.savez(directory / f"outputs_{i}.npz", *outputs)
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            (directory / "model.onnx").write_bytes(model_bytes)
+            for i, feeds in enumerate(feeds_list):
+                np.savez(directory / f"inputs_{i}.npz", **feeds)
+            env = os.environ.copy()
+            env["ORT_PACKED_SPARSE_INDEXER_TC"] = tc_flag
+            env["PYTHONPATH"] = os.pathsep.join([str(Path(__file__).resolve().parent), *sys.path])
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(directory), str(len(feeds_list))],
+                check=False,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            outputs = []
+            for i in range(len(feeds_list)):
+                with np.load(directory / f"outputs_{i}.npz") as data:
+                    outputs.append([data[f"arr_{j}"] for j in range(len(data.files))])
+            return outputs
+
     def _build_qsa_model(self, state_capacity: int, token_budget: int = 128):
         node = helper.make_node(
             "PackedSparseAttentionIndexer",
@@ -948,14 +991,7 @@ class TestPackedSparseAttentionIndexerTensorCore(unittest.TestCase):
             "past_state_lengths": past_state_lengths,
         }
         model_bytes = self._build_qsa_model(cap)
-        ep = resolve_cuda_plugin_ep("CUDAExecutionProvider")
-        results = {}
-        for tc_flag in ("0", "1"):
-            with patch.dict(os.environ, {"ORT_PACKED_SPARSE_INDEXER_TC": tc_flag}):
-                opts = SessionOptions()
-                opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-                sess = InferenceSession(model_bytes, opts, providers=[ep])
-                results[tc_flag] = sess.run(None, feeds)
+        results = {tc_flag: self._run_qsa(model_bytes, [feeds], tc_flag)[0] for tc_flag in ("0", "1")}
 
         np.testing.assert_array_equal(results["1"][1], results["0"][1])
         idx_ref, idx_tc, counts = results["0"][0], results["1"][0], results["0"][1]
@@ -1014,36 +1050,29 @@ class TestPackedSparseAttentionIndexerTensorCore(unittest.TestCase):
             "past_state_lengths": past_st_lens.copy(),
         }
         model_bytes = self._build_qsa_model(cap, token_budget=2048)
-        ep = resolve_cuda_plugin_ep("CUDAExecutionProvider")
-        cuda_opts = SessionOptions()
-        cuda_opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-        cuda_out = InferenceSession(model_bytes, cuda_opts, providers=[ep]).run(None, feeds)
+        cuda_out = self._run_qsa(model_bytes, [feeds], "1")[0]
 
-        with patch.dict(os.environ, {"ORT_PACKED_SPARSE_INDEXER_TC": "0"}):
-            ref_sess = InferenceSession(model_bytes, cuda_opts, providers=[ep])
-            ref_indices, ref_counts = [], []
-            for b in range(batch):
-                s0, s1 = cu_seqlens[b], cu_seqlens[b + 1]
-                sub_out = ref_sess.run(
-                    None,
-                    {
-                        "query": query[s0:s1],
-                        "key": key[s0:s1],
-                        "query_norm_weight": q_norm,
-                        "key_norm_weight": k_norm,
-                        "cos_cache": cos_c,
-                        "sin_cache": sin_c,
-                        "cumulative_sequence_lengths": np.array([0, s1 - s0], dtype=np.int32),
-                        "past_sequence_lengths": np.array([past_lens[b]], dtype=np.int32),
-                        "past_key_state": past_key_state[b : b + 1].copy(),
-                        "past_kv_buffer": past_kv_buf[b : b + 1].copy(),
-                        "past_state_lengths": past_st_lens[b : b + 1].copy(),
-                    },
-                )
-                ref_indices.append(sub_out[0])
-                ref_counts.append(sub_out[1])
-        ref_idx = np.concatenate(ref_indices, axis=0)
-        ref_cnt = np.concatenate(ref_counts, axis=0)
+        ref_feeds = []
+        for b in range(batch):
+            s0, s1 = cu_seqlens[b], cu_seqlens[b + 1]
+            ref_feeds.append(
+                {
+                    "query": query[s0:s1],
+                    "key": key[s0:s1],
+                    "query_norm_weight": q_norm,
+                    "key_norm_weight": k_norm,
+                    "cos_cache": cos_c,
+                    "sin_cache": sin_c,
+                    "cumulative_sequence_lengths": np.array([0, s1 - s0], dtype=np.int32),
+                    "past_sequence_lengths": np.array([past_lens[b]], dtype=np.int32),
+                    "past_key_state": past_key_state[b : b + 1].copy(),
+                    "past_kv_buffer": past_kv_buf[b : b + 1].copy(),
+                    "past_state_lengths": past_st_lens[b : b + 1].copy(),
+                }
+            )
+        ref_outputs = self._run_qsa(model_bytes, ref_feeds, "0")
+        ref_idx = np.concatenate([output[0] for output in ref_outputs], axis=0)
+        ref_cnt = np.concatenate([output[1] for output in ref_outputs], axis=0)
 
         np.testing.assert_array_equal(cuda_out[1], ref_cnt)
         for row in range(total_t):

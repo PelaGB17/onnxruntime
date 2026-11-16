@@ -287,7 +287,7 @@ __global__ __launch_bounds__(128, 4) void MatMulPackedBf16Sm90WgmmaKernel(
             const float s_lo = has_scale ? acc[st][0][h] * scale : acc[st][0][h];
             const float s_hi = has_scale ? acc[st][1][h] * scale : acc[st][1][h];
             __nv_bfloat16* dst = y + static_cast<int64_t>(m_tok) * p.n + r_lo;
-            if (valid_hi && ((p.n & 1) == 0) && p.activation_type == 0) {
+            if (valid_hi && (reinterpret_cast<uintptr_t>(dst) & 3u) == 0 && p.activation_type == 0) {
               *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(s_lo, s_hi);
             } else {
               dst[0] = ApplySm90ActivationBf16(__float2bfloat16_rn(s_lo), p.activation_type);

@@ -4105,21 +4105,19 @@ TEST(MoETest, QMoETest_Int3AndMixedWidthCudaPrefillParity) {
 }
 
 #if defined(ENABLE_BF16)
-// The BF16 decode GEMVs switch to tensor-core kernels once at least 33 rows are routed:
-//   - INT4 (moe_gemv_tc.cuh): block size 32, hidden % 512 == 0, inter % 128 == 0, inter >= 512, at most 80 routes.
-//   - INT3 (qmoe_int3_tc.cuh): block size 64, hidden % 512 == 0, inter % 128 == 0, at most 256 routes. From 16 tokens
-//     on (ORT_INT3_PREFILL_MIN_ROWS) the prefill kernels run instead, hence 12 tokens x top-4 = 48 routes for decode
-//     and 20 tokens x top-4 = 80 routes for prefill (or 80-route kCompact80 in INT4).
+// BF16 Tensor Core decode requires block size 32 for INT4 and 64 for INT3, hidden % 512 == 0, inter % 128 == 0.
+// Prepacked INT3 decode supports up to 640 routes; raw INT3 switches to prefill at 16 tokens by default.
 // The kernel choice is not observable through the op, so each case is compared with a host reference that rounds
 // every dequantized weight to BF16 and accumulates in FP32, which the kernels match up to the summation order.
-// INT2 also rounds FC1 projections to BF16 before activation.
+// INT2 and INT3 prefill round FC1 projections to BF16 before activation; INT3 decode keeps them in FP32.
 // fc1_scale_exp and fc2_scale_exp multiply the FC1 and FC2 scales by 2^exp (power-of-two scaling is exact in BF16),
 // the input is divided by 2^fc1_scale_exp so the FC1 results are unchanged, and the output is 2^fc2_scale_exp times the
 // unscaled one, which the tolerance follows. int3_tc_min_routes, when set, is ep.cuda.qmoe_int3_tc_min_routes.
 static void RunQMoEBf16TensorCoreGemvParityCase(int64_t bits, int64_t block_size, int64_t hidden_size,
                                                 int64_t inter_size, const char* disable_tc = nullptr,
                                                 int fc1_scale_exp = 0, int fc2_scale_exp = 0,
-                                                int64_t num_rows = 12, const char* int3_tc_min_routes = nullptr) {
+                                                int64_t num_rows = 12, const char* int3_tc_min_routes = nullptr,
+                                                bool int3_prefill = false) {
   constexpr int64_t num_experts = 8;
   constexpr int64_t top_k = 4;
   // Experts picked by each token. For 12 tokens they are used by {12, 1, 12, 9, 8, 4, 2, 0} rows: groups of 8 rows of
@@ -4210,7 +4208,7 @@ static void RunQMoEBf16TensorCoreGemvParityCase(int64_t bits, int64_t block_size
           gate += x[c] * gate_w[c];
           up += x[c] * up_w[c];
         }
-        if (bits == 2 || (bits == 3 && num_rows >= 16)) {
+        if (bits == 2 || int3_prefill) {
           gate = round_bf16(gate);
           up = round_bf16(up);
         }
@@ -4308,8 +4306,8 @@ TEST(MoETest, QMoETest_Bf16Int4TensorCoreGemvParity) {
 #endif  // !ORT_QUICK_BUILD
 
 // FC2 consumes K in super-steps of 512 followed by (inter / 128) % 4 chunks of 128, so inter = 384, 512, 640 and 768
-// cover tails of 3, 0, 1 and 2 chunks. num_rows = 12 exercises Int3TcCoalescedKernel (decode) and num_rows = 20
-// exercises RepackPrepackedInt3ToSm80Int4ActiveExpertsKernel + TransposeScalesActiveExpertsVec8Kernel<T, true> (prefill).
+// cover tails of 3, 0, 1 and 2 chunks. An explicit threshold of 33 disables prepacking, so 20 tokens also cover
+// the raw-weight prefill path, whose FC1 projections are rounded before SwiGLU.
 TEST(MoETest, QMoETest_Bf16Int3TensorCoreGemvParity) {
   if (!HasCudaEnvironment(800)) {
     GTEST_SKIP() << "CUDA device with compute capability 8.0 or newer is required.";
@@ -4322,7 +4320,19 @@ TEST(MoETest, QMoETest_Bf16Int3TensorCoreGemvParity) {
                               std::pair<int64_t, int64_t>{1024, 640}}) {
       RunQMoEBf16TensorCoreGemvParityCase(/*bits=*/3, /*block_size=*/64, shape.first, shape.second, nullptr, 0, 0,
                                           rows);
+      RunQMoEBf16TensorCoreGemvParityCase(/*bits=*/3, /*block_size=*/64, shape.first, shape.second, nullptr, 0, 0,
+                                          rows, /*int3_tc_min_routes=*/"33", /*int3_prefill=*/rows >= 16);
     }
+  }
+}
+
+TEST(MoETest, QMoETest_Bf16Int3TensorCoreGemvMultiSlotParity) {
+  if (!HasCudaEnvironment(800)) {
+    GTEST_SKIP() << "CUDA device with compute capability 8.0 or newer is required.";
+  }
+  for (int64_t rows : {int64_t{80}, int64_t{160}, int64_t{161}}) {
+    RunQMoEBf16TensorCoreGemvParityCase(/*bits=*/3, /*block_size=*/64, 512, 512, nullptr, 0, 0, rows,
+                                        /*int3_tc_min_routes=*/nullptr, /*int3_prefill=*/rows > 160);
   }
 }
 

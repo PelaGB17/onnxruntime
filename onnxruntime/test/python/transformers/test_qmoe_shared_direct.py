@@ -507,10 +507,11 @@ class TestQMoESharedDirect(unittest.TestCase):
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             self.skipTest("CUDAExecutionProvider is not available")
         for bits in [2, 3, 4]:
-            fixture = _fixture(bits, TensorProto.BFLOAT16, hidden=512, inter=512, experts=16, block=32)
+            block = 64 if bits == 3 else 32
+            fixture = _fixture(bits, TensorProto.BFLOAT16, hidden=512, inter=512, experts=16, block=block)
             for rows in [16, 32, 64]:
                 self._run(fixture, rows, top_k=10, providers=["CUDAExecutionProvider"])
-            boundary_fixture = _fixture(bits, TensorProto.BFLOAT16, hidden=128, inter=128, experts=16, block=32)
+            boundary_fixture = _fixture(bits, TensorProto.BFLOAT16, hidden=128, inter=128, experts=16, block=block)
             self._run(boundary_fixture, 65, top_k=10, providers=["CUDAExecutionProvider"])
 
     def test_cuda_profile_has_no_bank_conversion(self):

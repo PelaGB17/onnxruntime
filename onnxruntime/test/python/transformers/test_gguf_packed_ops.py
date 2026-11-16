@@ -2648,8 +2648,8 @@ class TestGgufPackedOps(unittest.TestCase):
                     ):
                         np.testing.assert_array_equal(got[:8].view(np.uint32), got8.view(np.uint32))
 
-        # Also verify unaligned device buffers on both WarpKSplit (n=65) and SM90 WGMMA (n=16403) at m=16, 56.
-        for n_unaligned in (65, 16403):
+        # Even N with Y+2 must use scalar stores in SM90 WGMMA, just like odd N.
+        for n_unaligned in (65, 16400, 16403):
             raw_q6 = _make_synthetic_gguf_rows(rng, n_unaligned, 256, 14, 256, 210, quant_scale=2**-8)
             w_q6 = _round_to_dtype(_dequantize_weights(raw_q6, 256, 14), dtype)
             bound_sess = _session(
