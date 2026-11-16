@@ -236,6 +236,22 @@ struct QMoESessionLandingRing {
 
   common::Status Ensure(int dev_id, size_t landing_needed, size_t pinned_needed, size_t waves) {
     device_id = dev_id;
+    int prev_dev = -1;
+    const bool restore_dev = (dev_id >= 0 && cudaGetDevice(&prev_dev) == cudaSuccess && prev_dev != dev_id);
+    if (restore_dev) {
+      cudaError_t set_err = cudaSetDevice(dev_id);
+      if (set_err != cudaSuccess) {
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "QMoEOffload landing cudaSetDevice failed: ",
+                               cudaGetErrorString(set_err));
+      }
+    }
+    struct RestoreGuard {
+      int prev{-1};
+      bool active{false};
+      ~RestoreGuard() {
+        if (active) static_cast<void>(cudaSetDevice(prev));
+      }
+    } restore_guard{prev_dev, restore_dev};
     if (!copy_stream) {
       cudaError_t err = cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking);
       if (err != cudaSuccess) {
@@ -321,7 +337,7 @@ struct QMoESessionLandingRing {
         return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "QMoEOffload landing pinned budget reservation failed: ", ex.what());
       }
       uint8_t* new_pinned = nullptr;
-      cudaError_t err = cudaHostAlloc(reinterpret_cast<void**>(&new_pinned), pinned_needed, cudaHostAllocDefault);
+      cudaError_t err = cudaHostAlloc(reinterpret_cast<void**>(&new_pinned), pinned_needed, cudaHostAllocPortable);
       if (err != cudaSuccess) {
         return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "QMoEOffload landing cudaHostAlloc failed: ", cudaGetErrorString(err));
       }
@@ -646,6 +662,27 @@ class QMoESessionController {
   std::shared_ptr<QMoESessionLandingRing> LandingRing() const { return landing_ring_; }
   const std::shared_ptr<CudaDeviceMemoryBudget>& PinnedBudget() const noexcept { return pinned_budget_; }
   int DeviceId() const noexcept { return device_id_; }
+
+  // Computes the auto-sized per-device MoE working-buffer pool for full-model (>= 24 layers, >= 15 GiB VRAM) and
+  // pipeline-split stages (>= 4 layers, >= 10 GiB VRAM), honoring explicit `device_working_bytes` when set.
+  static constexpr uint64_t AutoDeviceWorkingBytesForStage(
+      size_t num_layers,
+      uint64_t total_vram,
+      uint64_t total_full_gpu_bytes,
+      uint64_t current_working_bytes,
+      bool explicit_working_bytes) noexcept {
+    if (explicit_working_bytes) {
+      return current_working_bytes;
+    }
+    const bool qualifies =
+        (num_layers >= 24 && total_vram >= (15ULL << 30) && total_full_gpu_bytes >= (8ULL << 30)) ||
+        (num_layers >= 4 && total_vram >= (10ULL << 30) && total_full_gpu_bytes >= (2ULL << 30));
+    if (!qualifies) {
+      return current_working_bytes;
+    }
+    const uint64_t target_working_bytes = (total_vram >= (15ULL << 30)) ? (560ULL << 20) : (384ULL << 20);
+    return current_working_bytes < target_working_bytes ? target_working_bytes : current_working_bytes;
+  }
   uint64_t CurrentRunId() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return current_run_id_;
@@ -669,7 +706,7 @@ class QMoESessionController {
               return nullptr;
             }
             void* pointer = nullptr;
-            if (cudaHostAlloc(&pointer, size, cudaHostAllocDefault) != cudaSuccess || !pointer) {
+            if (cudaHostAlloc(&pointer, size, cudaHostAllocPortable) != cudaSuccess || !pointer) {
               static_cast<void>(cudaGetLastError());
               return nullptr;
             }
@@ -1248,10 +1285,11 @@ class QMoESessionController {
       }
     }
 
-    if (num_layers >= 24 && total_vram >= (15ULL << 30) && total_full_gpu_bytes >= (8ULL << 30)) {
-      if (!policy.device_working_bytes_explicit && policy.device_working_bytes < (560ULL << 20)) {
-        policy.device_working_bytes = 560ULL << 20;
-      }
+    if ((num_layers >= 24 && total_vram >= (15ULL << 30) && total_full_gpu_bytes >= (8ULL << 30)) ||
+        (num_layers >= 4 && total_vram >= (10ULL << 30) && total_full_gpu_bytes >= (2ULL << 30))) {
+      policy.device_working_bytes = AutoDeviceWorkingBytesForStage(
+          num_layers, total_vram, total_full_gpu_bytes,
+          policy.device_working_bytes, policy.device_working_bytes_explicit);
       uint64_t auto_pinned_target = 192ULL << 20;
       bool has_sufficient_ram = true;
 #if defined(_WIN32)

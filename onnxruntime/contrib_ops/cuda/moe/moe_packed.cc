@@ -625,7 +625,22 @@ struct MoEPackedSharedPrefillWaveStaging {
     }
   }
 
+  Status SwitchToOwningDevice(int& prev_dev, bool& restore_dev) const {
+    prev_dev = -1;
+    restore_dev = (device_id >= 0 && cudaGetDevice(&prev_dev) == cudaSuccess && prev_dev != device_id);
+    if (restore_dev) {
+      ORT_RETURN_IF_ERROR(CUDA_CALL(cudaSetDevice(device_id)));
+    }
+    return Status::OK();
+  }
+
   Status EnsureStreamAndEvents() {
+    int prev_dev = -1;
+    bool restore_dev = false;
+    ORT_RETURN_IF_ERROR(SwitchToOwningDevice(prev_dev, restore_dev));
+    auto restore_guard = gsl::finally([prev_dev, restore_dev]() {
+      if (restore_dev) static_cast<void>(cudaSetDevice(prev_dev));
+    });
     if (!copy_stream) {
       ORT_RETURN_IF_ERROR(CUDA_CALL(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking)));
     }
@@ -647,6 +662,12 @@ struct MoEPackedSharedPrefillWaveStaging {
       size_t max_routes,
       bool needs_streaming = true,
       std::shared_ptr<CudaDeviceMemoryBudget> sess_pinned = nullptr) {
+    int prev_dev = -1;
+    bool restore_dev = false;
+    ORT_RETURN_IF_ERROR(SwitchToOwningDevice(prev_dev, restore_dev));
+    auto restore_guard = gsl::finally([prev_dev, restore_dev]() {
+      if (restore_dev) static_cast<void>(cudaSetDevice(prev_dev));
+    });
     ORT_RETURN_IF_ERROR(EnsureStreamAndEvents());
     const bool need_pinned =
         (max_routes == 0 && pinned_route_cap > 0) ||
@@ -680,15 +701,15 @@ struct MoEPackedSharedPrefillWaveStaging {
             FreePinnedRouteBuffers();
           }
         });
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_topk_idx), max_routes * sizeof(int32_t), cudaHostAllocDefault)));
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_topk_scales), max_routes * sizeof(float), cudaHostAllocDefault)));
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_res_sorted_routes), max_routes * sizeof(int32_t), cudaHostAllocDefault)));
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_res_tiles), tile_bytes, cudaHostAllocDefault)));
-        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_res_num_tiles), sizeof(int32_t), cudaHostAllocDefault)));
+        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_topk_idx), max_routes * sizeof(int32_t), cudaHostAllocPortable)));
+        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_topk_scales), max_routes * sizeof(float), cudaHostAllocPortable)));
+        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_res_sorted_routes), max_routes * sizeof(int32_t), cudaHostAllocPortable)));
+        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_res_tiles), tile_bytes, cudaHostAllocPortable)));
+        ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_res_num_tiles), sizeof(int32_t), cudaHostAllocPortable)));
         for (int b = 0; b < 2; ++b) {
-          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_sorted_routes[b]), max_routes * sizeof(int32_t), cudaHostAllocDefault)));
-          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_tiles[b]), tile_bytes, cudaHostAllocDefault)));
-          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_num_tiles[b]), sizeof(int32_t), cudaHostAllocDefault)));
+          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_sorted_routes[b]), max_routes * sizeof(int32_t), cudaHostAllocPortable)));
+          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_tiles[b]), tile_bytes, cudaHostAllocPortable)));
+          ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_num_tiles[b]), sizeof(int32_t), cudaHostAllocPortable)));
         }
         if (sess_res.Active()) sess_res.Commit();
         if (host_res.Active()) host_res.Commit();
@@ -719,6 +740,12 @@ struct MoEPackedSharedPrefillWaveStaging {
   Status EnsureBankCapacity(
       size_t required_bank_bytes,
       std::shared_ptr<CudaDeviceMemoryBudget> sess_pinned = nullptr) {
+    int prev_dev = -1;
+    bool restore_dev = false;
+    ORT_RETURN_IF_ERROR(SwitchToOwningDevice(prev_dev, restore_dev));
+    auto restore_guard = gsl::finally([prev_dev, restore_dev]() {
+      if (restore_dev) static_cast<void>(cudaSetDevice(prev_dev));
+    });
     if (required_bank_bytes == 0) {
       if (bank_bytes > 0) {
         ORT_RETURN_IF_ERROR(WaitForBanks());
@@ -749,7 +776,7 @@ struct MoEPackedSharedPrefillWaveStaging {
       }
     });
     for (int b = 0; b < 2; ++b) {
-      ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_bank[b]), required_bank_bytes, cudaHostAllocDefault)));
+      ORT_RETURN_IF_ERROR(CUDA_CALL(cudaHostAlloc(reinterpret_cast<void**>(&pinned_bank[b]), required_bank_bytes, cudaHostAllocPortable)));
       ORT_RETURN_IF_ERROR(CUDA_CALL(cudaMalloc(reinterpret_cast<void**>(&gpu_bank[b]), required_bank_bytes)));
     }
     if (sess_res.Active()) sess_res.Commit();
@@ -920,8 +947,18 @@ struct MoEPackedOffloadState {
     } catch (const std::exception&) {
       return Status::OK();
     }
+    int prev_dev = -1;
+    const int target_dev = session_controller ? session_controller->DeviceId() : -1;
+    const bool restore_dev = (target_dev >= 0 && cudaGetDevice(&prev_dev) == cudaSuccess && prev_dev != target_dev);
+    if (restore_dev) {
+      ORT_RETURN_IF_ERROR(CUDA_CALL(cudaSetDevice(target_dev)));
+    }
+    auto restore_guard = gsl::finally([prev_dev, restore_dev]() {
+      if (restore_dev) static_cast<void>(cudaSetDevice(prev_dev));
+    });
     MoEPackedDecodePinned* h_ptr = nullptr;
-    cudaError_t err = cudaHostAlloc(reinterpret_cast<void**>(&h_ptr), kDecodePinnedBytes, cudaHostAllocMapped);
+    cudaError_t err = cudaHostAlloc(reinterpret_cast<void**>(&h_ptr), kDecodePinnedBytes,
+                                    cudaHostAllocMapped | cudaHostAllocPortable);
     if (err != cudaSuccess) {
       return CUDA_CALL(err);
     }

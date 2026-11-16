@@ -586,6 +586,44 @@ TEST(QMoEOffloadAdmissionTest, LargeBoundedHostCapStaysWithinLimitOnLowRamHost) 
   }
 }
 
+TEST(QMoEOffloadAdmissionTest, AutoWorkingBytesScalesForFullAndPipelineSplitStages) {
+  constexpr uint64_t kDefaultWorking = 256ULL << 20;
+
+  // Full 48-layer model on a 16 GiB GPU -> 560 MiB working pool.
+  EXPECT_EQ(QMoESessionController::AutoDeviceWorkingBytesForStage(
+                /*num_layers=*/48, /*total_vram=*/16ULL << 30, /*total_full_gpu_bytes=*/20ULL << 30,
+                kDefaultWorking, /*explicit_working_bytes=*/false),
+            560ULL << 20);
+
+  // Two-GPU pipeline split Stage 1 (24 layers) on a 16 GiB GPU -> 560 MiB working pool.
+  EXPECT_EQ(QMoESessionController::AutoDeviceWorkingBytesForStage(
+                /*num_layers=*/24, /*total_vram=*/16ULL << 30, /*total_full_gpu_bytes=*/10ULL << 30,
+                kDefaultWorking, /*explicit_working_bytes=*/false),
+            560ULL << 20);
+
+  // Two-GPU pipeline split Stage 0 (24 layers) on a 12 GiB GPU (e.g. RTX 3060) -> 384 MiB working pool.
+  EXPECT_EQ(QMoESessionController::AutoDeviceWorkingBytesForStage(
+                /*num_layers=*/24, /*total_vram=*/12ULL << 30, /*total_full_gpu_bytes=*/10ULL << 30,
+                kDefaultWorking, /*explicit_working_bytes=*/false),
+            384ULL << 20);
+
+  // Explicit working bytes override is always preserved verbatim.
+  EXPECT_EQ(QMoESessionController::AutoDeviceWorkingBytesForStage(
+                /*num_layers=*/24, /*total_vram=*/12ULL << 30, /*total_full_gpu_bytes=*/10ULL << 30,
+                192ULL << 20, /*explicit_working_bytes=*/true),
+            192ULL << 20);
+
+  // Small unit-test / toy graphs (< 4 layers or < 2 GiB full expert weights) keep the default working bytes.
+  EXPECT_EQ(QMoESessionController::AutoDeviceWorkingBytesForStage(
+                /*num_layers=*/2, /*total_vram=*/16ULL << 30, /*total_full_gpu_bytes=*/10ULL << 30,
+                kDefaultWorking, /*explicit_working_bytes=*/false),
+            kDefaultWorking);
+  EXPECT_EQ(QMoESessionController::AutoDeviceWorkingBytesForStage(
+                /*num_layers=*/8, /*total_vram=*/12ULL << 30, /*total_full_gpu_bytes=*/512ULL << 20,
+                kDefaultWorking, /*explicit_working_bytes=*/false),
+            kDefaultWorking);
+}
+
 #if defined(__linux__)
 namespace {
 

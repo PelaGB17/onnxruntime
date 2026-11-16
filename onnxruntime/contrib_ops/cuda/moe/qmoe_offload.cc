@@ -1861,7 +1861,7 @@ bool TryPrepareQMoEPrefillDmaLayer(
       }
       for (int b = 0; b < 2; ++b) {
         void* hptr = nullptr;
-        if (cudaHostAlloc(&hptr, host_pass_bytes, cudaHostAllocDefault) == cudaSuccess) {
+        if (cudaHostAlloc(&hptr, host_pass_bytes, cudaHostAllocPortable) == cudaSuccess) {
           state.host_staging[b] = static_cast<uint8_t*>(hptr);
         }
       }
