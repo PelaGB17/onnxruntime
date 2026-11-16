@@ -27,6 +27,7 @@ async function processVerboseLog() {
   let currentShaderCode = null;
   let currentShaderStartLineNumber = null;
   let lineNumber = 0;
+  let inconsistentShaderCount = 0;
 
   for await (const line of rl) {
     lineNumber++;
@@ -68,7 +69,8 @@ async function processVerboseLog() {
       ]);
       if (shaderMap.has(comparisonKey)) {
         if (shaderMap.get(comparisonKey) !== currentShaderCode) {
-          throw new Error(`Line ${lineNumber}: Found inconsistent shader code for key "${currentShaderKey}" (configuration ${JSON.stringify(currentShaderConfiguration)}, shader started at line ${currentShaderStartLineNumber}).
+          inconsistentShaderCount++;
+          console.error(`Line ${lineNumber}: Found inconsistent shader code for key "${currentShaderKey}" (configuration ${JSON.stringify(currentShaderConfiguration)}, shader started at line ${currentShaderStartLineNumber}).
 === Previous Shader Start ===
 ${shaderMap.get(comparisonKey)}
 === Previous Shader End ===
@@ -107,6 +109,12 @@ ${currentShaderCode}
 
   if (shaderMap.size === 0) {
     throw new Error("No shader code found.");
+  }
+
+  if (inconsistentShaderCount > 0) {
+    throw new Error(
+      `Found ${inconsistentShaderCount} inconsistent shader code occurrences across ${shaderMap.size} shader keys.`
+    );
   }
 
   console.log(
