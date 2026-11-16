@@ -137,11 +137,12 @@ struct GroupQueryAttentionData {
 
   // Past sequence length for each batch (i.e., the offset to append new tokens). Shape [batch_size].
   // For first prompt: past_seq_lens[b] = 0
-  // For token generation or subsequent prompt: past_seq_lens[b] = total_seq_lens[b] - sequence_length
+  // Otherwise: total_seq_lens[b] minus the valid query length (query_seqlens[b], when provided).
   int* past_seq_lens = nullptr;
 
   // Padded sequence length for each batch. Shape [batch_size].
-  // Only used for first prompt: padded_seq_lens[b] = sequence_length
+  // Causal key length: P + S for first prompts and right-padded chunks, T for unpadded continuations.
+  // Windowed calls use the bounded cache-relative append offset plus S instead of absolute P.
   int* padded_seq_lens = nullptr;
 
   // Cache-relative sequence lengths, used when parameters.is_windowed_kv_cache is set. Shape [batch_size].
@@ -179,6 +180,11 @@ struct GroupQueryAttentionData {
   U* present_key = nullptr;
   U* present_value = nullptr;
 
+  // Explicit query lengths make the first-chunk classification device-only.
+  // See DequantizeFlashAttentionFallback.
+  bool has_query_seqlens = false;
+  const int* query_seqlens = nullptr;  // [batch_size], device lengths; physical query stride remains S.
+
   // Kernel Flags
   bool use_flash_attention = false;
   bool use_memory_efficient_attention = false;
@@ -212,6 +218,7 @@ struct GroupQueryAttentionData {
   // cuDNN SDPA path: temp-space allocator and cuDNN handle (stored as void* to avoid pulling the
   // cuDNN headers into this file; cast to cudnnHandle_t in the .cu runner).
   AllocatorPtr allocator = nullptr;
+  std::function<IAllocatorUniquePtr<void>(size_t)> scratch_allocator;
   void* cudnn_handle = nullptr;
 };
 
@@ -307,6 +314,9 @@ struct PagedAttentionData {
 
   // Kernel Flags
   bool use_flash_attention = false;
+  bool use_int8_paged_prefill = false;
+  bool use_int8_vectorized_gather = false;
+  bool use_int8_tiled_prefill = false;
   bool use_memory_efficient_attention = false;
   // Paged decode kernel: reads the paged cache in place and dequantizes inside the kernel, so it
   // needs neither the dense staging buffers nor FlashAttention's page-alignment constraint.

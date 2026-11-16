@@ -328,6 +328,15 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         "GroupQueryAttention (CUDA): q_norm_weight and k_norm_weight must be provided together.");
   }
 
+  // query_seqlens (input 16) is the number of valid rows in each right-padded query chunk. Its values
+  // stay on the device and are clamped there, so only its shape and the structural requirements are
+  // checked on the host (in CheckInputs).
+  const Tensor* query_seqlens = (context->InputCount() > 16) ? context->Input<Tensor>(16) : nullptr;
+  if (query_seqlens != nullptr && !is_unidirectional_) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
+                           "GroupQueryAttention (CUDA): query_seqlens requires causal=1.");
+  }
+
   if (k_quant_type_ != KVQuantizationType::NONE) {
     if (k_scale == nullptr) {
       return ORT_MAKE_STATUS(
@@ -398,7 +407,13 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                                                                 device_prop.maxThreadsPerBlock,
                                                                 /*kv_cache_extra_bits=*/0,
                                                                 sliding_window_cache_,
-                                                                local_window_size_));
+                                                                local_window_size_,
+                                                                query_seqlens));
+
+  // Explicit lengths also distinguish idle (Q=0) from active (Q=1) single-token entries.
+  const int* query_seqlens_data = query_seqlens != nullptr ? query_seqlens->Data<int>() : nullptr;
+  data.has_query_seqlens = query_seqlens_data != nullptr;
+  data.query_seqlens = query_seqlens_data;
 
   // The CUDA kernel evicts the minimum number of positions on every step, so the cache it produces
   // is always full at min(T, C). That equals the resident range the operator specifies only when
@@ -609,6 +624,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   workspace_problem.do_rotary = parameters.do_rotary;
   workspace_problem.is_packed_qkv = parameters.is_packed_qkv;
   workspace_problem.use_qk_norm = parameters.use_qk_norm;
+  workspace_problem.has_query_seqlens = data.has_query_seqlens;
   workspace_problem.requires_separate_past_buffer = past_key_shared != past_value_shared;
   const Tensor* shared_past = past_key_shared ? past_key : past_value;
   workspace_problem.past_kv_cache_capacity =
@@ -684,7 +700,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         parameters.batch_size, parameters.kv_num_heads,
         /*src_capacity=*/windowed_cache_capacity, /*dst_capacity=*/staged_cache_capacity,
         /*rows=*/windowed_cache_capacity, /*src_offsets=*/nullptr,
-        static_cast<int>(dense_head_size * sizeof(U)), Stream(context)));
+        static_cast<int>(dense_head_size * sizeof(U)), Stream(context), query_seqlens_data));
 
     data.past_key = reinterpret_cast<const CudaU*>(staged_key);
     data.past_value = reinterpret_cast<const CudaU*>(staged_value);
@@ -745,7 +761,8 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   xqa_inputs.v_quant_type = v_quant_type_;
 
   // Phase and actual past/present buffer aliasing are per-Run facts, not partition-time inputs.
-  const bool xqa_phase_ok = !parameters.is_first_prompt &&
+  // XQA assumes one new token per entry and cannot represent an idle query.
+  const bool xqa_phase_ok = query_seqlens_data == nullptr && !parameters.is_first_prompt &&
                             parameters.sequence_length == 1 &&
                             parameters.kv_sequence_length > 0;  // Shared KV (kv_seq=0) has no new K/V to append
   if (xqa_phase_ok && parameters.past_present_share_buffer && IsGQAXqaEligibleSeqFree<U>(xqa_inputs)) {
@@ -830,7 +847,12 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   // and no sliding window. Rotary and packed QKV are handled by PrepareQKV before the kernel runs;
   // cuDNN handles grouped-query attention natively. Keep this path bias-free because an arbitrary
   // attention bias cannot be composed with cuDNN's fused bottom-right causal mask.
-  bool use_cudnn_sdpa = !data.use_xqa &&
+  // cuDNN only receives valid Q lengths for the first prompt, not for right-padded chunks (query_seqlens).
+  // In auto mode, short shared-buffer steps (decode and speculative verify, R <= 16) prefer FlashAttention.
+  bool use_cudnn_sdpa = !data.use_xqa && query_seqlens_data == nullptr &&
+                        (enable_cudnn_flash_attention_ ||
+                         !parameters.past_present_share_buffer ||
+                         parameters.sequence_length > 16) &&
                         IsGQACudnnSdpaCoreEligibleSeqFree<T, U>(
                             has_attention_bias,
                             is_inputs_quantized,
@@ -850,6 +872,19 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                                                               parameters.sequence_length,          // seq_len_q
                                                               parameters.seqlen_present_kv_cache,  // seq_len_kv (capacity)
                                                               parameters.is_unidirectional);
+  // cuDNN plan building is not capturable, but executing a cached plan is. During CUDA graph capture keep SDPA
+  // only when an earlier run on this thread built the plan (the usual warm-up runs do), so replays use the same
+  // kernel as the warm-up; otherwise fall back like the paged path. Arguments must match CudnnSdpaAttention's run().
+  if (use_cudnn_sdpa && onnxruntime::llm::common::isCapturing(Stream(context))) {
+    const float scale = parameters.scale == 0.0f ? 1.f / std::sqrt(static_cast<float>(parameters.head_size))
+                                                 : parameters.scale;
+    use_cudnn_sdpa = onnxruntime::cudnn_sdpa::has_cached_graph(
+        parameters.batch_size, parameters.num_heads, parameters.kv_num_heads, parameters.head_size,
+        parameters.head_size, parameters.sequence_length, parameters.seqlen_present_kv_cache, scale,
+        parameters.is_unidirectional, std::is_same<T, BFloat16>::value, /*has_attn_bias=*/false,
+        /*broadcast_attn_bias_dim_0=*/false, /*broadcast_attn_bias_dim_1=*/false, /*has_padding_mask=*/true,
+        /*sliding_window=*/0, AttentionQkvFormat::Q_K_V_BSNH_BNSH_BNSH, TryGetCudnnHandle(context));
+  }
   data.use_cudnn_sdpa = use_cudnn_sdpa;
 
 #if USE_FLASH_ATTENTION
@@ -871,7 +906,14 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
   // LaunchGetSequenceLengths to derive P = T - sequence_length.
   // It is also disabled for a windowed KV cache: the kernel derives both the absolute RoPE position
   // and the cache append offset from a single seqlens_k value, which those two no longer share.
-  data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt && parameters.sequence_length == 1 && parameters.kv_sequence_length > 0 && parameters.past_present_share_buffer && !is_inputs_quantized && !parameters.use_qk_norm && !parameters.is_windowed_kv_cache;
+  // Explicit RoPE positions may differ from cache offsets and require position-aware PrepareQKV.
+  // Explicit query lengths need PrepareQKV as well, since an idle entry must not append a token.
+  data.use_flash_attention_fast_decode = use_flash_attention && !disable_flash_decode_ && !parameters.is_first_prompt &&
+                                         query_seqlens_data == nullptr &&
+                                         parameters.sequence_length == 1 && parameters.kv_sequence_length > 0 &&
+                                         parameters.past_present_share_buffer && !is_inputs_quantized &&
+                                         !parameters.use_qk_norm && !parameters.is_windowed_kv_cache &&
+                                         (!parameters.do_rotary || data.position_ids == nullptr);
 
   if (use_flash_attention) {
     // Flash-specific buffer sizes (softmax LSE and the optional split accumulators) come from the
@@ -950,6 +992,8 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
                                                  parameters.total_sequence_length,
                                                  parameters.kv_cache_capacity,
                                                  parameters.kv_cache_real_capacity,
+                                                 original_present_kv_cache_capacity,
+                                                 query_seqlens_data,
                                                  cuda_stream,
                                                  device_prop.maxThreadsPerBlock));
     DUMP_TENSOR_INIT();
@@ -1045,6 +1089,9 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
     data.unfused_q_bnsh = reinterpret_cast<CudaT*>(base + recipe.q_bnsh_offset_bytes);
     data.unfused_y_bnsh = reinterpret_cast<CudaT*>(base + recipe.y_bnsh_offset_bytes);
     data.unfused_workspace = reinterpret_cast<void*>(base + recipe.qk_offset_bytes);
+    if (recipe.v_scratch_bytes != 0) {
+      data.v = reinterpret_cast<CudaT*>(base + recipe.v_scratch_offset_bytes);
+    }
   }
 
   last_compute_planned_regions_.store(planned_regions, std::memory_order_relaxed);
@@ -1120,6 +1167,10 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
 
   if (data.use_cudnn_sdpa) {
     ORT_RETURN_IF_ERROR(context->GetTempSpaceAllocator(&data.allocator));
+    auto* compute_stream = GetComputeStream(context);
+    data.scratch_allocator = [this, compute_stream](size_t bytes) {
+      return this->GetScratchBuffer<void>(bytes, compute_stream);
+    };
     data.cudnn_handle = static_cast<void*>(GetCudnnHandle(context));
   }
 
@@ -1128,7 +1179,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
 
   if (windowed_present_key != nullptr) {
     // Attention ran against the staging cache; keep only the entries the sliding window can still
-    // reach. evict_counts[b] = max(0, min(P, C) + S - C) is exactly where that tail starts. The rows
+    // reach. evict_counts[b] = max(0, min(P, C) + Q_valid - C) is where that tail starts. The rows
     // are already in their final (possibly quantized) form.
     const int row_bytes = static_cast<int>(dense_head_size * sizeof(U));
     ORT_RETURN_IF_ERROR(LaunchCopyKvCacheWindow(
@@ -1136,7 +1187,7 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
         parameters.batch_size, parameters.kv_num_heads,
         /*src_capacity=*/staged_cache_capacity, /*dst_capacity=*/windowed_cache_capacity,
         /*rows=*/windowed_cache_capacity, /*src_offsets=*/data.evict_counts,
-        row_bytes, Stream(context)));
+        row_bytes, Stream(context), query_seqlens_data));
   }
   return Status::OK();
 }
