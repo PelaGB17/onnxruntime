@@ -162,7 +162,8 @@ for row in comparisons:
         f"residual={row['residual']:+.3f}"
     )
 print(f"Saved: {destination}")
-PY
+PYconda activate ort-flops-cuda
+python -m pip install "nvidia-cudnn-cu13==9.28.1.4"
 - Supported 2/4/8-bit weights, B=32/64/128, bias and zero-point variants.
 - Actual fused, mixed-weight GEMV/GEMM, mixed-row-chunk and materialized-dequantization/GEMM routes.
 
