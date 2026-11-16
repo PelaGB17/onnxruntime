@@ -51,10 +51,12 @@ constexpr int kMaxFusedHidden = kMaxVecIters * kThreads * 8;
 constexpr int kMaxFusedRank = 512;
 constexpr int kMaxFusedBranches = 8;
 
+// expf(-|v|) is the argument both branches of the textbook form pass to expf (-v for v >= 0, v for v < 0), so one expf and
+// one division give the bit-identical result (verified over all 2^32 fp32 bit patterns) without the divergent two-way
+// branch, which executed both paths in nearly every warp of the prefill pre-mix.
 __device__ __forceinline__ float SigmoidF32(float v) {
-  if (v >= 0.0f) return 1.0f / (1.0f + expf(-v));
-  const float e = expf(v);
-  return e / (1.0f + e);
+  const float e = expf(-fabsf(v));
+  return (v >= 0.0f ? 1.0f : e) / (1.0f + e);
 }
 
 template <typename T>
@@ -143,6 +145,20 @@ __device__ __forceinline__ void CpWaitAll() {
 #endif
 }
 
+__device__ __forceinline__ void HcMma16816Bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+  (void)d;
+  (void)a;
+  (void)b0;
+  (void)b1;
+#endif
+}
+
 struct DownParams {
   int64_t rows;
   int branches;
@@ -180,12 +196,18 @@ __device__ __forceinline__ int64_t RowIdx(int64_t row0, int r, int64_t total_row
 // z * ROWS ... z * ROWS + ROWS - 1, which share every weight read.
 // j < ceil(R / 16) owns down columns [16 j, 16 j + 16); the last j owns the C inject columns.
 template <typename T, bool kPost, int ROWS>
-__global__ void __launch_bounds__(kThreads, ROWS >= 4 ? 4 : 5)
+__global__ void __launch_bounds__(kThreads, ROWS >= 8 ? 2 : (ROWS >= 4 ? 4 : 5))
     HcDownKernel(const T* __restrict__ streams, const T* __restrict__ prev_out, const T* __restrict__ prev_gate,
                  const T* __restrict__ norm_w, const T* __restrict__ w_down, const T* __restrict__ w_inject,
                  T* __restrict__ streams_out, float* __restrict__ partial, float* __restrict__ inv_rms_out,
                  DownParams p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || __CUDA_ARCH__ < 900)
+  // On 100-164 KB smem/SM GPUs (e.g. SM 12.0/12.1 with 100 KB/SM), 5 async weight slots keep
+  // HcDownKernel shared memory at 30.8 KB (ROWS=4) / 23.1 KB (ROWS=1), fitting 3-4 CTAs/SM instead of 2.
+  constexpr int kLocalAsyncWeightSlots = 5;
+#else
   constexpr int kLocalAsyncWeightSlots = ROWS >= 4 ? 8 : kAsyncWeightSlots;
+#endif
   const int j = blockIdx.x;
   const int s = blockIdx.y;
   const int64_t row0 = static_cast<int64_t>(blockIdx.z) * ROWS;
@@ -226,6 +248,29 @@ __global__ void __launch_bounds__(kThreads, ROWS >= 4 ? 4 : 5)
     for (int q = tid; q < chunks; q += kThreads) CpAsync16(&wsm[q], w_inject + k0 * branches + q * 8);
   }
   CpCommit();
+
+  uint4 w_reg5 = make_uint4(0u, 0u, 0u, 0u);
+  uint4 w_reg6 = make_uint4(0u, 0u, 0u, 0u);
+  uint4 w_reg7 = make_uint4(0u, 0u, 0u, 0u);
+  uint4 w_reg8 = make_uint4(0u, 0u, 0u, 0u);
+  uint4 w_reg9 = make_uint4(0u, 0u, 0u, 0u);
+  if constexpr (ROWS < 8) {
+    if (!is_inject && col < p.rank) {
+      const T* base = w_down + k0 * p.rank + col;
+      if constexpr (kLocalAsyncWeightSlots <= 5) {
+        const int row5 = rp + 128 * 5;
+        if (row5 < len) w_reg5 = __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row5) * p.rank));
+        const int row6 = rp + 128 * 6;
+        if (row6 < len) w_reg6 = __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row6) * p.rank));
+        const int row7 = rp + 128 * 7;
+        if (row7 < len) w_reg7 = __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row7) * p.rank));
+      }
+      const int row8 = rp + 128 * 8;
+      if (row8 < len) w_reg8 = __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row8) * p.rank));
+      const int row9 = rp + 128 * 9;
+      if (row9 < len) w_reg9 = __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row9) * p.rank));
+    }
+  }
 
   // Norm weights for the 8 consecutive features of the slice this thread normalizes below.
   const bool norm_active = tid * 8 < len;
@@ -328,9 +373,14 @@ __global__ void __launch_bounds__(kThreads, ROWS >= 4 ? 4 : 5)
         const int row = rp + 128 * i;
         if (row < len) {
           float wf[8];
-          const uint4 w_vec = (i < kLocalAsyncWeightSlots)
-                                  ? wsm[i * kThreads + tid]
-                                  : __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row) * p.rank));
+          uint4 w_vec;
+          if (i < kLocalAsyncWeightSlots) {
+            w_vec = wsm[i * kThreads + tid];
+          } else if constexpr (ROWS >= 8) {
+            w_vec = __ldcg(reinterpret_cast<const uint4*>(base + static_cast<int64_t>(row) * p.rank));
+          } else {
+            w_vec = (i == 5 ? w_reg5 : (i == 6 ? w_reg6 : (i == 7 ? w_reg7 : (i == 8 ? w_reg8 : w_reg9))));
+          }
           Unpack8<T>(w_vec, wf);
 #pragma unroll
           for (int r = 0; r < ROWS; ++r) {
@@ -418,12 +468,19 @@ __global__ void __launch_bounds__(kThreads, ROWS >= 4 ? 4 : 5)
 
 // CTA (hb, 0, z) owns features [16 hb, 16 hb + 16) of every branch for ROWS rows.
 template <typename T, int ROWS, int BRANCHES = 0, int RANK = 0>
-__global__ void __launch_bounds__(kThreads, 5)
+__global__ void __launch_bounds__(kThreads, ROWS >= 8 ? 2 : ((BRANCHES == 4 && RANK == 320 && ROWS >= 4) ? 3 : 5))
     HcUpPreKernel(const T* __restrict__ streams, const T* __restrict__ norm_w, const T* __restrict__ w_up,
                   const float* __restrict__ partial, const float* __restrict__ inv_rms_in,
                   T* __restrict__ pre_out, T* __restrict__ gate_out, UpParams p) {
-  static_assert(ROWS <= 2, "the cross-warp gate reduction below assumes ROWS * 16 * branches <= kThreads");
+  static_assert(ROWS <= 8 && (ROWS <= 4 || (BRANCHES == 4 && RANK == 320)),
+                "ROWS > 4 requires the specialized BRANCHES=4, RANK=320 epilogue");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || __CUDA_ARCH__ < 900)
+  // On 100 KB smem/SM GPUs (SM 12.0/12.1), 5 weight slots keep HcUpPreKernel shared memory at
+  // 23.6 KB, fitting 4 CTAs/SM instead of 2.
+  constexpr int kLocalWeightSlots = 5;
+#else
   constexpr int kLocalWeightSlots = kWeightSlots;
+#endif
   const int hb = blockIdx.x;
   const int64_t row0 = static_cast<int64_t>(blockIdx.z) * ROWS;
   const int tid = threadIdx.x;
@@ -445,7 +502,8 @@ __global__ void __launch_bounds__(kThreads, 5)
 
   __shared__ __align__(16) uint4 wsm[kLocalWeightSlots * kThreads];
   __shared__ __align__(16) float sf[ROWS][RANK == 0 ? kMaxFusedRank : RANK];
-  __shared__ float sg[ROWS][kBranchStorage * kUpTile];
+  __shared__ float sg[(BRANCHES == 4 && RANK == 320) ? 1 : ROWS]
+                     [(BRANCHES == 4 && RANK == 320) ? 1 : kBranchStorage * kUpTile];
 
   // Prefetch the first chunk of up weights before waiting for the down kernel.
   const T* wbase = w_up + static_cast<int64_t>(c) * hidden + col;
@@ -458,9 +516,61 @@ __global__ void __launch_bounds__(kThreads, 5)
   }
   CpCommit();
 
+  constexpr bool kFastEp4x320 = (BRANCHES == 4 && RANK == 320);
+  constexpr int kEpIters = (kFastEp4x320 && ROWS > 4) ? 2 : 1;
+  float nw_pre[kFastEp4x320 ? 1 : kBranchStorage];
+#pragma unroll
+  for (int b = 0; b < (kFastEp4x320 ? 1 : kBranchStorage); ++b) nw_pre[b] = 0.0f;
+  const int r_ep = kFastEp4x320 ? (tid >> 6) : (tid / kUpTile);
+  const int hl_ep = kFastEp4x320 ? ((tid >> 2) & 15) : (tid % kUpTile);
+  const int b_ep = tid & 3;
+  const bool ep_col_valid = (h0 + hl_ep) < hidden;
+  const bool ep_valid = (tid < (kFastEp4x320 ? (min(ROWS, 4) * 64) : (ROWS * kUpTile))) &&
+                        ep_col_valid && RowOk(row0, r_ep, p.rows);
+  if constexpr (kFastEp4x320) {
+    if (ep_col_valid) {
+      nw_pre[0] = to_float<T>(__ldg(norm_w + static_cast<int64_t>(b_ep) * hidden + h0 + hl_ep));
+    }
+  } else if (ep_valid) {
+#pragma unroll
+    for (int b = 0; b < kBranchStorage; ++b) {
+      if (b < branches) nw_pre[b] = to_float<T>(__ldg(norm_w + static_cast<int64_t>(b) * hidden + h0 + hl_ep));
+    }
+  }
+
   // The next block's down kernel may start (and prefetch its weights) while this kernel waits.
   GridTrigger();
   GridWait();
+
+  float xv_pre[kFastEp4x320 ? kEpIters : kBranchStorage];
+  float inv_pre[kFastEp4x320 ? kEpIters : kBranchStorage];
+#pragma unroll
+  for (int b = 0; b < (kFastEp4x320 ? kEpIters : kBranchStorage); ++b) {
+    xv_pre[b] = 0.0f;
+    inv_pre[b] = 0.0f;
+  }
+  if constexpr (kFastEp4x320) {
+#pragma unroll
+    for (int ep_it = 0; ep_it < kEpIters; ++ep_it) {
+      const int r_cur = r_ep + ep_it * 4;
+      if (r_cur < ROWS && ep_col_valid && RowOk(row0, r_cur, p.rows)) {
+        const int64_t r_idx_ep = RowIdx(row0, r_cur, p.rows);
+        xv_pre[ep_it] = BitsToFloat<T>(__ldcg(reinterpret_cast<const uint16_t*>(
+            streams + r_idx_ep * K + static_cast<int64_t>(b_ep) * hidden + h0 + hl_ep)));
+        inv_pre[ep_it] = __ldcg(inv_rms_in + r_idx_ep * 4 + b_ep);
+      }
+    }
+  } else if (ep_valid) {
+    const int64_t r_idx_ep = RowIdx(row0, r_ep, p.rows);
+#pragma unroll
+    for (int b = 0; b < kBranchStorage; ++b) {
+      if (b < branches) {
+        xv_pre[b] = BitsToFloat<T>(__ldcg(reinterpret_cast<const uint16_t*>(
+            streams + r_idx_ep * K + static_cast<int64_t>(b) * hidden + h0 + hl_ep)));
+        inv_pre[b] = __ldcg(inv_rms_in + r_idx_ep * branches + b);
+      }
+    }
+  }
 
   // Fixed-order reduction of the K-split partial sums, then ScaledSiLU; four columns per thread.
   const int nq = rank / 4;
@@ -469,16 +579,27 @@ __global__ void __launch_bounds__(kThreads, 5)
     const int cq = (idx % nq) * 4;
     const int64_t r_idx = RowIdx(row0, r, p.rows);
     float4 va = make_float4(0.f, 0.f, 0.f, 0.f);
-    for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
+    const float* p_base = partial + r_idx * p.splits * p.partial_stride + cq;
+    if (p.splits == 8) {
 #pragma unroll
       for (int u = 0; u < 8; ++u) {
-        if (sp0 + u < p.splits) {
-          const float4 q = __ldcg(reinterpret_cast<const float4*>(
-              partial + (r_idx * p.splits + sp0 + u) * p.partial_stride + cq));
-          va.x += q.x;
-          va.y += q.y;
-          va.z += q.z;
-          va.w += q.w;
+        const float4 q = __ldcg(reinterpret_cast<const float4*>(p_base + u * p.partial_stride));
+        va.x += q.x;
+        va.y += q.y;
+        va.z += q.z;
+        va.w += q.w;
+      }
+    } else {
+      for (int sp0 = 0; sp0 < p.splits; sp0 += 8) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          if (sp0 + u < p.splits) {
+            const float4 q = __ldcg(reinterpret_cast<const float4*>(p_base + (sp0 + u) * p.partial_stride));
+            va.x += q.x;
+            va.y += q.y;
+            va.z += q.z;
+            va.w += q.w;
+          }
         }
       }
     }
@@ -491,13 +612,24 @@ __global__ void __launch_bounds__(kThreads, 5)
     }
     *reinterpret_cast<float4*>(&sf[r][cq]) = make_float4(out[0], out[1], out[2], out[3]);
   }
-  if (hb == 0 && tid < branches * ROWS) {
-    const int r = tid / branches;
-    const int t = tid % branches;
+  const int rem_sf = (ROWS * nq) % kThreads;
+  const int gt_base = (rem_sf > 0 && (kThreads - rem_sf) >= branches * ROWS) ? rem_sf : 0;
+  const int gt = tid - gt_base;
+  if (hb == 0 && gt >= 0 && gt < branches * ROWS) {
+    const int r = gt / branches;
+    const int t = gt % branches;
     const int64_t r_idx = RowIdx(row0, r, p.rows);
     float v = 0.0f;
-    for (int sp = 0; sp < p.splits; ++sp) {
-      v += __ldcg(partial + (r_idx * p.splits + sp) * p.partial_stride + rank + t);
+    const float* p_base = partial + r_idx * p.splits * p.partial_stride + rank + t;
+    if (p.splits == 8) {
+#pragma unroll
+      for (int sp = 0; sp < 8; ++sp) {
+        v += __ldcg(p_base + sp * p.partial_stride);
+      }
+    } else {
+      for (int sp = 0; sp < p.splits; ++sp) {
+        v += __ldcg(p_base + sp * p.partial_stride);
+      }
     }
     const float inject = Rnd<T>(v);
     const float u = Rnd<T>(SigmoidF32(Rnd<T>(inject / p.gate_div)));
@@ -556,37 +688,55 @@ __global__ void __launch_bounds__(kThreads, 5)
     }
   }
   __syncthreads();
-  // The up kernel runs with at most 2 rows, so ROWS * groups * 8 = 16 * ROWS * branches <= kThreads (branches <= 8).
+  // With ROWS <= 4, ROWS * groups * 8 = 16 * ROWS * branches <= kThreads (branches <= 4 for ROWS=4, <= 8 for ROWS<=2).
   const int g8 = groups * 8;
-  if (tid < ROWS * g8) {
-    const int r = tid / g8;
-    const int idx = tid % g8;
-    float v = 0.0f;
+  if constexpr (kFastEp4x320) {
 #pragma unroll
-    for (int q = 0; q < 8; ++q) v += red[(q * ROWS + r) * g8 + idx];
-    const int gg = idx >> 3;
-    const int local = (gg & 1) * 8 + (idx & 7);
-    sg[r][(gg >> 1) * kUpTile + local] = Rnd<T>(SigmoidF32(Rnd<T>(v)));
-  }
-  __syncthreads();
-  if (tid < ROWS * kUpTile) {
-    const int r = tid / kUpTile;
-    const int hl = tid % kUpTile;
-    const int64_t r_idx = RowIdx(row0, r, p.rows);
-    if ((h0 + hl) < hidden && RowOk(row0, r, p.rows)) {
+    for (int ep_it = 0; ep_it < kEpIters; ++ep_it) {
+      const int r_cur = r_ep + ep_it * 4;
+      if (r_cur < ROWS) {
+        const int idx = (b_ep * 2 + (hl_ep >> 3)) * 8 + (hl_ep & 7);
+        float v = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 8; ++q) v += red[(q * ROWS + r_cur) * g8 + idx];
+        const float my_s = Rnd<T>(SigmoidF32(Rnd<T>(v)));
+        const float my_n = Rnd<T>(xv_pre[ep_it] * inv_pre[ep_it] * nw_pre[0]);
+        float sum = 0.0f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const float nb = __shfl_sync(0xffffffffu, my_n, b, 4);
+          const float sb = __shfl_sync(0xffffffffu, my_s, b, 4);
+          sum = fmaf(nb, sb, sum);
+        }
+        if (b_ep == 0 && ep_col_valid && RowOk(row0, r_cur, p.rows)) {
+          const int64_t r_idx = RowIdx(row0, r_cur, p.rows);
+          pre_out[r_idx * hidden + h0 + hl_ep] = from_float<T>(sum * p.reduction_scale);
+        }
+      }
+    }
+  } else {
+    if (tid < ROWS * g8) {
+      const int r = tid / g8;
+      const int idx = tid % g8;
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) v += red[(q * ROWS + r) * g8 + idx];
+      const int gg = idx >> 3;
+      const int local = (gg & 1) * 8 + (idx & 7);
+      sg[r][(gg >> 1) * kUpTile + local] = Rnd<T>(SigmoidF32(Rnd<T>(v)));
+    }
+    __syncthreads();
+    if (ep_valid) {
+      const int64_t r_idx = RowIdx(row0, r_ep, p.rows);
       float sum = 0.0f;
 #pragma unroll
       for (int b = 0; b < kBranchStorage; ++b) {
         if (b < branches) {
-          const float nw = to_float<T>(norm_w[static_cast<int64_t>(b) * hidden + h0 + hl]);
-          const float xv = BitsToFloat<T>(__ldcg(reinterpret_cast<const uint16_t*>(
-              streams + r_idx * K + static_cast<int64_t>(b) * hidden + h0 + hl)));
-          const float inv = __ldcg(inv_rms_in + r_idx * branches + b);
-          const float n = Rnd<T>(xv * inv * nw);
-          sum = fmaf(n, sg[r][b * kUpTile + hl], sum);
+          const float n = Rnd<T>(xv_pre[b] * inv_pre[b] * nw_pre[b]);
+          sum = fmaf(n, sg[r_ep][b * kUpTile + hl_ep], sum);
         }
       }
-      pre_out[r_idx * hidden + h0 + hl] = from_float<T>(sum * p.reduction_scale);
+      pre_out[r_idx * hidden + h0 + hl_ep] = from_float<T>(sum * p.reduction_scale);
     }
   }
 }
@@ -655,6 +805,57 @@ __global__ void NormVec8Kernel(const T* __restrict__ streams, const T* __restric
       hnp[qi] = Pack8<T>(out);
     }
   }
+}
+
+// Specialized prefill norm kernel for hidden=2560 (320 uint4s/branch): 320 threads (10 warps, 1 uint4/thread)
+// eliminate the 75%-idle second iteration of NormVec8Kernel while keeping per-thread state at 8 floats.
+// The minimum block count must stay within the smallest per-SM thread limit (1536 on SM 8.6/8.9/12.x).
+template <typename T, bool kPost>
+__global__ void __launch_bounds__(320, 4)
+    NormVec8H2560Kernel(const T* __restrict__ streams, const T* __restrict__ prev_out,
+                        const T* __restrict__ prev_gate, const T* __restrict__ norm_w,
+                        T* __restrict__ hn, T* __restrict__ streams_out, int branches, float epsilon) {
+  constexpr int kHidden = 2560;
+  __shared__ float sq_red[10];
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int64_t group = blockIdx.x;
+  const int64_t row = group / branches;
+  const int c = static_cast<int>(group - row * branches);
+  const int64_t base = group * kHidden;
+
+  float v_reg[8];
+  Unpack8<T>(__ldg(reinterpret_cast<const uint4*>(streams + base) + tid), v_reg);
+  if constexpr (kPost) {
+    const float gate_c = to_float<T>(__ldg(prev_gate + group));
+    float b[8];
+    Unpack8<T>(__ldg(reinterpret_cast<const uint4*>(prev_out + row * kHidden) + tid), b);
+#pragma unroll
+    for (int m = 0; m < 8; ++m) v_reg[m] = Rnd<T>(fmaf(gate_c, b[m], v_reg[m]));
+    if (streams_out != nullptr) {
+      reinterpret_cast<uint4*>(streams_out + base)[tid] = Pack8<T>(v_reg);
+    }
+  }
+
+  float sum_sq = 0.0f;
+#pragma unroll
+  for (int m = 0; m < 8; ++m) sum_sq += v_reg[m] * v_reg[m];
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum_sq += __shfl_xor_sync(0xffffffffu, sum_sq, off);
+  if ((tid & 31) == 0) sq_red[tid >> 5] = sum_sq;
+  __syncthreads();
+
+  float total = 0.0f;
+#pragma unroll
+  for (int w = 0; w < 10; ++w) total += sq_red[w];
+  const float inv_rms = rsqrtf(total * (1.0f / static_cast<float>(kHidden)) + epsilon);
+
+  float nw[8];
+  Unpack8<T>(__ldg(reinterpret_cast<const uint4*>(norm_w + static_cast<int64_t>(c) * kHidden) + tid), nw);
+  float out[8];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) out[m] = v_reg[m] * inv_rms * nw[m];
+  reinterpret_cast<uint4*>(hn + base)[tid] = Pack8<T>(out);
 }
 
 template <typename T, bool kPost>
@@ -745,6 +946,78 @@ __global__ void PreMixKernel(const T* __restrict__ hn, const T* __restrict__ up,
     sum = fmaf(to_float<T>(hn[idx]), gate, sum);
   }
   pre[i] = from_float<T>(sum * reduction_scale);
+}
+
+template <typename T>
+__global__ void __launch_bounds__(320, 4)
+    FusedPreMixInjectPostGateB4H2560Kernel(const T* __restrict__ hn, const T* __restrict__ up,
+                                           const T* __restrict__ w_inject, T* __restrict__ pre_out,
+                                           T* __restrict__ gate_out, int64_t rows, float reduction_scale,
+                                           float gate_div, float gate_mul) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) return;
+  const int tid = threadIdx.x;
+  constexpr int kHidden = 2560;
+  constexpr int64_t K = 4 * kHidden;
+  const int h = tid * 8;
+  const T* hn_row = hn + row * K;
+  const T* up_row = up + row * K;
+
+  float sum[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    const int k_base = b * kHidden + h;
+    float hn_v[8], up_v[8];
+    Unpack8<T>(__ldg(reinterpret_cast<const uint4*>(hn_row + k_base)), hn_v);
+    Unpack8<T>(__ldg(reinterpret_cast<const uint4*>(up_row + k_base)), up_v);
+    const uint4* w_ptr = reinterpret_cast<const uint4*>(w_inject + k_base * 4);
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {
+      const float gate = Rnd<T>(SigmoidF32(up_v[m]));
+      sum[m] = fmaf(hn_v[m], gate, sum[m]);
+    }
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      float wf[8];
+      Unpack8<T>(__ldg(w_ptr + p), wf);
+      const float xv0 = hn_v[2 * p];
+      const float xv1 = hn_v[2 * p + 1];
+      acc[0] = fmaf(xv0, wf[0], acc[0]);
+      acc[1] = fmaf(xv0, wf[1], acc[1]);
+      acc[2] = fmaf(xv0, wf[2], acc[2]);
+      acc[3] = fmaf(xv0, wf[3], acc[3]);
+      acc[0] = fmaf(xv1, wf[4], acc[0]);
+      acc[1] = fmaf(xv1, wf[5], acc[1]);
+      acc[2] = fmaf(xv1, wf[6], acc[2]);
+      acc[3] = fmaf(xv1, wf[7], acc[3]);
+    }
+  }
+
+  float out[8];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    out[m] = sum[m] * reduction_scale;
+  }
+  *reinterpret_cast<uint4*>(pre_out + row * kHidden + h) = Pack8<T>(out);
+
+  __shared__ float smem[10][4];
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc[b] += __shfl_down_sync(0xffffffffu, acc[b], off);
+    if ((tid & 31) == 0) smem[tid >> 5][b] = acc[b];
+  }
+  __syncthreads();
+  if (tid < 4) {
+    float v = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 10; ++w) v += smem[w][tid];
+    const float t = Rnd<T>(Rnd<T>(v) / gate_div);
+    const float u = Rnd<T>(SigmoidF32(t));
+    gate_out[row * 4 + tid] = from_float<T>(u * gate_mul);
+  }
 }
 
 template <typename T, int ROWS_PER_CTA = 4>
@@ -976,8 +1249,10 @@ bool IsProgrammaticLaunchAvailable() {
     };
     available = available && image_has_griddepcontrol(HcDownKernel<T, true, DOWN_ROWS>) &&
                 image_has_griddepcontrol(HcDownKernel<T, false, DOWN_ROWS>) &&
-                image_has_griddepcontrol(HcUpPreKernel<T, UP_ROWS>) &&
                 image_has_griddepcontrol(HcUpPreKernel<T, UP_ROWS, 4, 320>);
+    if constexpr (UP_ROWS <= 2) {
+      available = available && image_has_griddepcontrol(HcUpPreKernel<T, UP_ROWS>);
+    }
     (void)cudaGetLastError();
     cached_device = device;
     cached_available = available;
@@ -1002,9 +1277,11 @@ Status LaunchFusedRows(bool use_pdl, cudaStream_t stream, const HyperConnectionL
     (void)cudaFuncSetAttribute(HcUpPreKernel<T, UP_ROWS, 4, 320>,
                                cudaFuncAttributePreferredSharedMemoryCarveout,
                                cudaSharedmemCarveoutMaxShared);
-    (void)cudaFuncSetAttribute(HcUpPreKernel<T, UP_ROWS>,
-                               cudaFuncAttributePreferredSharedMemoryCarveout,
-                               cudaSharedmemCarveoutMaxShared);
+    if constexpr (UP_ROWS <= 2) {
+      (void)cudaFuncSetAttribute(HcUpPreKernel<T, UP_ROWS>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+    }
     (void)cudaGetLastError();
     return true;
   }();
@@ -1027,14 +1304,516 @@ Status LaunchFusedRows(bool use_pdl, cudaStream_t stream, const HyperConnectionL
   }
 
   const T* up_streams = tensors.prev_block_output != nullptr ? tensors.streams_out : tensors.streams;
-  if (config.branches == 4 && config.rank == 320) {
+  if constexpr (UP_ROWS > 2) {
     return LaunchWithProgrammaticSerialization(use_pdl, HcUpPreKernel<T, UP_ROWS, 4, 320>, up_grid, dim3(kThreads),
                                                stream, up_streams, tensors.norm_scale, tensors.up_weight,
                                                static_cast<const float*>(partial),
                                                static_cast<const float*>(inv_rms), tensors.pre_output,
                                                tensors.post_gate, up);
+  } else {
+    if (config.branches == 4 && config.rank == 320) {
+      return LaunchWithProgrammaticSerialization(use_pdl, HcUpPreKernel<T, UP_ROWS, 4, 320>, up_grid, dim3(kThreads),
+                                                 stream, up_streams, tensors.norm_scale, tensors.up_weight,
+                                                 static_cast<const float*>(partial),
+                                                 static_cast<const float*>(inv_rms), tensors.pre_output,
+                                                 tensors.post_gate, up);
+    }
+    return LaunchWithProgrammaticSerialization(use_pdl, HcUpPreKernel<T, UP_ROWS>, up_grid, dim3(kThreads), stream,
+                                               up_streams, tensors.norm_scale, tensors.up_weight,
+                                               static_cast<const float*>(partial),
+                                               static_cast<const float*>(inv_rms), tensors.pre_output,
+                                               tensors.post_gate, up);
   }
-  return LaunchWithProgrammaticSerialization(use_pdl, HcUpPreKernel<T, UP_ROWS>, up_grid, dim3(kThreads), stream,
+}
+
+// Single-wave Tensor-Core (m16n8k16) fused HyperConnectionLowRankMix kernels for rows=8, branches=4, hidden=2560,
+// rank=320 (BF16). HcDownTc8Kernel launches grid=(6, 8, 1) = 48 CTAs (64 rank cols/CTA + 1 inject CTA), cutting
+// redundant norm passes by 3.5x and replacing 64 scalar FMAs with one m16n8k16 MMA. HcUpPreTc8Kernel launches
+// grid=(80, 1, 1) = 80 CTAs (32 features x 4 branches = 128 cols/CTA) in a single resident wave on 48 SMs.
+template <bool kPost>
+__global__ void __launch_bounds__(kThreads, 2)
+    HcDownTc8Kernel(const __nv_bfloat16* __restrict__ streams, const __nv_bfloat16* __restrict__ prev_out,
+                    const __nv_bfloat16* __restrict__ prev_gate, const __nv_bfloat16* __restrict__ norm_w,
+                    const __nv_bfloat16* __restrict__ w_down, const __nv_bfloat16* __restrict__ w_inject,
+                    __nv_bfloat16* __restrict__ streams_out, float* __restrict__ partial,
+                    float* __restrict__ inv_rms_out, DownParams p) {
+  constexpr int kRows = 8;
+  constexpr int kBranches = 4;
+  constexpr int kHidden = 2560;
+  constexpr int kRank = 320;
+  constexpr int kLen = 1280;
+  constexpr int64_t K = static_cast<int64_t>(kBranches) * kHidden;
+
+  const int j = static_cast<int>(blockIdx.x);  // 0..4: 64 rank cols; 5: inject
+  const int s = static_cast<int>(blockIdx.y);  // 0..7
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int c = s >> 1;
+  const int piece = s & 1;
+  const int h0 = piece * kLen;
+  const int64_t k0 = static_cast<int64_t>(c) * kHidden + h0;
+  const bool is_inject = (j == 5);
+  const int col0 = j * 64 + g * 8;
+
+  __shared__ __align__(16) uint16_t xs[kRows][1288];
+  __shared__ __align__(16) uint4 wsm_inj[640];
+  __shared__ float sq_red[8][kRows];
+
+  GridTrigger();
+
+  uint4 wv_pre0[4] = {};
+  uint4 wv_pre1[4] = {};
+  if (!is_inject) {
+    const int r_k0 = warp * 16 + 2 * t;
+    const __nv_bfloat16* base0 = w_down + static_cast<int64_t>(k0 + r_k0) * kRank + col0;
+    wv_pre0[0] = __ldcg(reinterpret_cast<const uint4*>(base0));
+    wv_pre0[1] = __ldcg(reinterpret_cast<const uint4*>(base0 + kRank));
+    wv_pre0[2] = __ldcg(reinterpret_cast<const uint4*>(base0 + 8 * kRank));
+    wv_pre0[3] = __ldcg(reinterpret_cast<const uint4*>(base0 + 9 * kRank));
+
+    const __nv_bfloat16* base1 = base0 + 128 * kRank;
+    wv_pre1[0] = __ldcg(reinterpret_cast<const uint4*>(base1));
+    wv_pre1[1] = __ldcg(reinterpret_cast<const uint4*>(base1 + kRank));
+    wv_pre1[2] = __ldcg(reinterpret_cast<const uint4*>(base1 + 8 * kRank));
+    wv_pre1[3] = __ldcg(reinterpret_cast<const uint4*>(base1 + 9 * kRank));
+  } else {
+    for (int q = tid; q < 640; q += kThreads) {
+      CpAsync16(&wsm_inj[q], w_inject + k0 * kBranches + q * 8);
+    }
+  }
+  CpCommit();
+
+  const bool norm_active = tid * 8 < kLen;
+  uint4 wv = make_uint4(0u, 0u, 0u, 0u);
+  if (norm_active) wv = *reinterpret_cast<const uint4*>(norm_w + k0 + tid * 8);
+
+  GridWait();
+
+  constexpr int nvec = kHidden / 8;  // 320
+#pragma unroll
+  for (int r = 0; r < kRows; ++r) {
+    uint4 sv[2];
+    uint4 bv[2];
+    float gate_c = 0.0f;
+    const uint4* sp = reinterpret_cast<const uint4*>(streams + static_cast<int64_t>(r) * K + static_cast<int64_t>(c) * kHidden);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int qi = tid + kThreads * i;
+      sv[i] = qi < nvec ? __ldcg(sp + qi) : make_uint4(0u, 0u, 0u, 0u);
+    }
+    if constexpr (kPost) {
+      gate_c = BitsToFloat<__nv_bfloat16>(__ldcg(reinterpret_cast<const uint16_t*>(prev_gate + r * kBranches + c)));
+      const uint4* bp = reinterpret_cast<const uint4*>(prev_out + static_cast<int64_t>(r) * kHidden);
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        const int qi = tid + kThreads * i;
+        bv[i] = qi < nvec ? __ldcg(bp + qi) : make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int qi = tid + kThreads * i;
+      if (qi < nvec) {
+        const int h = qi * 8;
+        float v[8];
+        Unpack8<__nv_bfloat16>(sv[i], v);
+        if constexpr (kPost) {
+          float b[8];
+          Unpack8<__nv_bfloat16>(bv[i], b);
+#pragma unroll
+          for (int m = 0; m < 8; ++m) v[m] = Rnd<__nv_bfloat16>(fmaf(gate_c, b[m], v[m]));
+        }
+#pragma unroll
+        for (int m = 0; m < 8; ++m) sum_sq += v[m] * v[m];
+        if (h >= h0 && h < h0 + kLen) {
+          const uint4 packed = Pack8<__nv_bfloat16>(v);
+          *reinterpret_cast<uint4*>(&xs[r][h - h0]) = packed;
+          if constexpr (kPost) {
+            if (j == 0) {
+              *reinterpret_cast<uint4*>(streams_out + static_cast<int64_t>(r) * K + static_cast<int64_t>(c) * kHidden + h) =
+                  packed;
+            }
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum_sq += __shfl_xor_sync(0xffffffffu, sum_sq, off);
+    if (lane == 0) sq_red[warp][r] = sum_sq;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int r = 0; r < kRows; ++r) {
+    float total = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) total += sq_red[w][r];
+    const float inv_rms = rsqrtf(total / static_cast<float>(kHidden) + p.epsilon);
+    if (j == 0 && piece == 0 && tid == 0) {
+      inv_rms_out[r * kBranches + c] = inv_rms;
+    }
+    if (norm_active) {
+      float x[8], w[8];
+      Unpack8<__nv_bfloat16>(*reinterpret_cast<const uint4*>(&xs[r][tid * 8]), x);
+      Unpack8<__nv_bfloat16>(wv, w);
+#pragma unroll
+      for (int m = 0; m < 8; ++m) x[m] = x[m] * inv_rms * w[m];
+      *reinterpret_cast<uint4*>(&xs[r][tid * 8]) = Pack8<__nv_bfloat16>(x);
+    }
+  }
+  CpWaitAll();
+  __syncthreads();
+
+  if (!is_inject) {
+    float acc[4][4] = {};
+#pragma unroll
+    for (int it = 0; it < 10; ++it) {
+      const int r_k0 = (it * 8 + warp) * 16 + 2 * t;
+      uint4 wv0, wv1, wv2, wv3;
+      if (it == 0) {
+        wv0 = wv_pre0[0];
+        wv1 = wv_pre0[1];
+        wv2 = wv_pre0[2];
+        wv3 = wv_pre0[3];
+      } else if (it == 1) {
+        wv0 = wv_pre1[0];
+        wv1 = wv_pre1[1];
+        wv2 = wv_pre1[2];
+        wv3 = wv_pre1[3];
+      } else {
+        const __nv_bfloat16* base = w_down + static_cast<int64_t>(k0 + r_k0) * kRank + col0;
+        wv0 = __ldcg(reinterpret_cast<const uint4*>(base));
+        wv1 = __ldcg(reinterpret_cast<const uint4*>(base + kRank));
+        wv2 = __ldcg(reinterpret_cast<const uint4*>(base + 8 * kRank));
+        wv3 = __ldcg(reinterpret_cast<const uint4*>(base + 9 * kRank));
+      }
+      const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&xs[g][r_k0]);
+      const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&xs[g][r_k0 + 8]);
+#pragma unroll
+      for (int mma_j = 0; mma_j < 4; ++mma_j) {
+        const uint32_t v0 = (&wv0.x)[mma_j];
+        const uint32_t v1 = (&wv1.x)[mma_j];
+        const uint32_t v2 = (&wv2.x)[mma_j];
+        const uint32_t v3 = (&wv3.x)[mma_j];
+        const uint32_t a[4] = {__byte_perm(v0, v1, 0x5410), __byte_perm(v0, v1, 0x7632),
+                               __byte_perm(v2, v3, 0x5410), __byte_perm(v2, v3, 0x7632)};
+        HcMma16816Bf16(acc[mma_j], a, b0, b1);
+      }
+    }
+    __syncthreads();
+    float (*red)[kRows][64] = reinterpret_cast<float (*)[kRows][64]>(xs);
+#pragma unroll
+    for (int mma_j = 0; mma_j < 4; ++mma_j) {
+      const int c_local = g * 8 + 2 * mma_j;
+      red[warp][2 * t][c_local] = acc[mma_j][0];
+      red[warp][2 * t + 1][c_local] = acc[mma_j][1];
+      red[warp][2 * t][c_local + 1] = acc[mma_j][2];
+      red[warp][2 * t + 1][c_local + 1] = acc[mma_j][3];
+    }
+    __syncthreads();
+    const int r_out = warp;
+    const int c_out = lane * 2;
+    float v0 = 0.0f, v1 = 0.0f;
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+      v0 += red[q][r_out][c_out];
+      v1 += red[q][r_out][c_out + 1];
+    }
+    *reinterpret_cast<float2*>(partial + (r_out * 8 + s) * p.partial_stride + j * 64 + c_out) =
+        make_float2(v0, v1);
+  } else {
+    const __nv_bfloat16* wi = reinterpret_cast<const __nv_bfloat16*>(wsm_inj);
+    float a[kRows][kBranches] = {};
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+      const int k = tid + kThreads * i;
+      float wf[kBranches];
+#pragma unroll
+      for (int m = 0; m < kBranches; ++m) wf[m] = to_float<__nv_bfloat16>(wi[k * kBranches + m]);
+#pragma unroll
+      for (int r = 0; r < kRows; ++r) {
+        const float xv = BitsToFloat<__nv_bfloat16>(xs[r][k]);
+#pragma unroll
+        for (int m = 0; m < kBranches; ++m) a[r][m] = fmaf(xv, wf[m], a[r][m]);
+      }
+    }
+    __syncthreads();
+    float (*red)[kRows][kBranches] = reinterpret_cast<float (*)[kRows][kBranches]>(wsm_inj);
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+      for (int m = 0; m < kBranches; ++m) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) a[r][m] += __shfl_xor_sync(0xffffffffu, a[r][m], off);
+        if (lane == 0) red[warp][r][m] = a[r][m];
+      }
+    }
+    __syncthreads();
+    if (tid < kBranches * kRows) {
+      const int r = tid / kBranches;
+      const int b = tid % kBranches;
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) v += red[q][r][b];
+      partial[(r * 8 + s) * p.partial_stride + kRank + b] = v;
+    }
+  }
+}
+
+__global__ void __launch_bounds__(kThreads, 2)
+    HcUpPreTc8Kernel(const __nv_bfloat16* __restrict__ streams, const __nv_bfloat16* __restrict__ norm_w,
+                     const __nv_bfloat16* __restrict__ w_up, const float* __restrict__ partial,
+                     const float* __restrict__ inv_rms_in, __nv_bfloat16* __restrict__ pre_out,
+                     __nv_bfloat16* __restrict__ gate_out, UpParams p) {
+  constexpr int kRows = 8;
+  constexpr int kBranches = 4;
+  constexpr int kHidden = 2560;
+  constexpr int kRank = 320;
+  constexpr int64_t K = static_cast<int64_t>(kBranches) * kHidden;  // 10240
+
+  const int hb = static_cast<int>(blockIdx.x);  // 0..79
+  const int h0 = hb * 32;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid >> 5;
+  const int ti = warp >> 2;  // 0..1
+  const int wq = warp & 3;   // 0..3
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+
+  const int b_col = g >> 1;
+  const int half_col = g & 1;
+  const int col0 = b_col * kHidden + h0 + ti * 16 + half_col * 8;
+
+  __shared__ __align__(16) float red[2][4][kRows][64];
+  __shared__ __align__(16) uint16_t sf[kRows][328];
+
+  GridTrigger();
+
+  uint4 wp0[4], wp1[4], wp2[4];
+  {
+    const int r_k0 = wq * 16 + 2 * t;
+    const __nv_bfloat16* base0 = w_up + static_cast<int64_t>(r_k0) * K + col0;
+    wp0[0] = __ldcg(reinterpret_cast<const uint4*>(base0));
+    wp0[1] = __ldcg(reinterpret_cast<const uint4*>(base0 + K));
+    wp0[2] = __ldcg(reinterpret_cast<const uint4*>(base0 + 8 * K));
+    wp0[3] = __ldcg(reinterpret_cast<const uint4*>(base0 + 9 * K));
+
+    const __nv_bfloat16* base1 = base0 + 64 * K;
+    wp1[0] = __ldcg(reinterpret_cast<const uint4*>(base1));
+    wp1[1] = __ldcg(reinterpret_cast<const uint4*>(base1 + K));
+    wp1[2] = __ldcg(reinterpret_cast<const uint4*>(base1 + 8 * K));
+    wp1[3] = __ldcg(reinterpret_cast<const uint4*>(base1 + 9 * K));
+
+    const __nv_bfloat16* base2 = base0 + 128 * K;
+    wp2[0] = __ldcg(reinterpret_cast<const uint4*>(base2));
+    wp2[1] = __ldcg(reinterpret_cast<const uint4*>(base2 + K));
+    wp2[2] = __ldcg(reinterpret_cast<const uint4*>(base2 + 8 * K));
+    wp2[3] = __ldcg(reinterpret_cast<const uint4*>(base2 + 9 * K));
+  }
+
+  const int r_ep = tid >> 6;
+  const int hl_ep = (tid >> 2) & 15;
+  const int b_ep = tid & 3;
+  const float nw0 = to_float<__nv_bfloat16>(__ldg(norm_w + static_cast<int64_t>(b_ep) * kHidden + h0 + hl_ep));
+  const float nw1 = to_float<__nv_bfloat16>(__ldg(norm_w + static_cast<int64_t>(b_ep) * kHidden + h0 + 16 + hl_ep));
+
+  GridWait();
+
+  for (int idx = tid; idx < kRows * 80; idx += kThreads) {
+    const int r = idx / 80;
+    const int cq = (idx % 80) * 4;
+    float4 va = make_float4(0.f, 0.f, 0.f, 0.f);
+    const float* p_base = partial + static_cast<int64_t>(r) * 8 * p.partial_stride + cq;
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      const float4 q = __ldcg(reinterpret_cast<const float4*>(p_base + u * p.partial_stride));
+      va.x += q.x;
+      va.y += q.y;
+      va.z += q.z;
+      va.w += q.w;
+    }
+    const float v[4] = {va.x, va.y, va.z, va.w};
+    uint16_t b16[4];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+      const float z = Rnd<__nv_bfloat16>(Rnd<__nv_bfloat16>(v[m]) * p.silu_alpha);
+      b16[m] = FloatToBits<__nv_bfloat16>(z * Rnd<__nv_bfloat16>(SigmoidF32(z)));
+    }
+    *reinterpret_cast<uint2*>(&sf[r][cq]) =
+        make_uint2(static_cast<uint32_t>(b16[0]) | (static_cast<uint32_t>(b16[1]) << 16),
+                   static_cast<uint32_t>(b16[2]) | (static_cast<uint32_t>(b16[3]) << 16));
+  }
+
+  const int gt = tid - 128;
+  if (hb == 0 && gt >= 0 && gt < kBranches * kRows) {
+    const int r = gt / kBranches;
+    const int b = gt % kBranches;
+    float v = 0.0f;
+    const float* p_base = partial + static_cast<int64_t>(r) * 8 * p.partial_stride + kRank + b;
+#pragma unroll
+    for (int sp = 0; sp < 8; ++sp) {
+      v += __ldcg(p_base + sp * p.partial_stride);
+    }
+    const float inject = Rnd<__nv_bfloat16>(v);
+    const float u = Rnd<__nv_bfloat16>(SigmoidF32(Rnd<__nv_bfloat16>(inject / p.gate_div)));
+    gate_out[r * kBranches + b] = from_float<__nv_bfloat16>(u * p.gate_mul);
+  }
+  __syncthreads();
+
+  float acc[4][4] = {};
+#pragma unroll
+  for (int it = 0; it < 5; ++it) {
+    const int r_k0 = (it * 4 + wq) * 16 + 2 * t;
+    uint4 wv0, wv1, wv2, wv3;
+    if (it == 0) {
+      wv0 = wp0[0];
+      wv1 = wp0[1];
+      wv2 = wp0[2];
+      wv3 = wp0[3];
+    } else if (it == 1) {
+      wv0 = wp1[0];
+      wv1 = wp1[1];
+      wv2 = wp1[2];
+      wv3 = wp1[3];
+    } else if (it == 2) {
+      wv0 = wp2[0];
+      wv1 = wp2[1];
+      wv2 = wp2[2];
+      wv3 = wp2[3];
+    } else {
+      const __nv_bfloat16* base = w_up + static_cast<int64_t>(r_k0) * K + col0;
+      wv0 = __ldcg(reinterpret_cast<const uint4*>(base));
+      wv1 = __ldcg(reinterpret_cast<const uint4*>(base + K));
+      wv2 = __ldcg(reinterpret_cast<const uint4*>(base + 8 * K));
+      wv3 = __ldcg(reinterpret_cast<const uint4*>(base + 9 * K));
+    }
+    const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&sf[g][r_k0]);
+    const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&sf[g][r_k0 + 8]);
+#pragma unroll
+    for (int mma_j = 0; mma_j < 4; ++mma_j) {
+      const uint32_t v0 = (&wv0.x)[mma_j];
+      const uint32_t v1 = (&wv1.x)[mma_j];
+      const uint32_t v2 = (&wv2.x)[mma_j];
+      const uint32_t v3 = (&wv3.x)[mma_j];
+      const uint32_t a[4] = {__byte_perm(v0, v1, 0x5410), __byte_perm(v0, v1, 0x7632),
+                             __byte_perm(v2, v3, 0x5410), __byte_perm(v2, v3, 0x7632)};
+      HcMma16816Bf16(acc[mma_j], a, b0, b1);
+    }
+  }
+
+#pragma unroll
+  for (int mma_j = 0; mma_j < 4; ++mma_j) {
+    const int c_local = g * 8 + 2 * mma_j;
+    red[ti][wq][2 * t][c_local] = acc[mma_j][0];
+    red[ti][wq][2 * t + 1][c_local] = acc[mma_j][1];
+    red[ti][wq][2 * t][c_local + 1] = acc[mma_j][2];
+    red[ti][wq][2 * t + 1][c_local + 1] = acc[mma_j][3];
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int ti_it = 0; ti_it < 2; ++ti_it) {
+    const int h_col = h0 + ti_it * 16 + hl_ep;
+    const float nw = ti_it == 0 ? nw0 : nw1;
+#pragma unroll
+    for (int rh = 0; rh < 2; ++rh) {
+      const int r_cur = r_ep + rh * 4;
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        v += red[ti_it][q][r_cur][b_ep * 16 + hl_ep];
+      }
+      const float my_s = Rnd<__nv_bfloat16>(SigmoidF32(Rnd<__nv_bfloat16>(v)));
+      const float xv = BitsToFloat<__nv_bfloat16>(__ldcg(reinterpret_cast<const uint16_t*>(
+          streams + static_cast<int64_t>(r_cur) * K + static_cast<int64_t>(b_ep) * kHidden + h_col)));
+      const float inv = __ldcg(inv_rms_in + r_cur * kBranches + b_ep);
+      const float my_n = Rnd<__nv_bfloat16>(xv * inv * nw);
+      float sum = 0.0f;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        const float nb = __shfl_sync(0xffffffffu, my_n, b, 4);
+        const float sb = __shfl_sync(0xffffffffu, my_s, b, 4);
+        sum = fmaf(nb, sb, sum);
+      }
+      if (b_ep == 0) {
+        pre_out[static_cast<int64_t>(r_cur) * kHidden + h_col] =
+            from_float<__nv_bfloat16>(sum * p.reduction_scale);
+      }
+    }
+  }
+}
+
+bool IsTc8ProgrammaticLaunchAvailable() {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12030
+  static thread_local int cached_device = -1;
+  static thread_local bool cached_available = false;
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  if (device != cached_device) {
+    int driver_version = 0;
+    int sm_major = 0;
+    bool available = cudaDriverGetVersion(&driver_version) == cudaSuccess && driver_version >= 12030 &&
+                     cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+                     sm_major >= 9;
+    auto image_has_griddepcontrol = [](auto kernel) {
+      cudaFuncAttributes attributes{};
+      return cudaFuncGetAttributes(&attributes, kernel) == cudaSuccess && attributes.ptxVersion >= 90 &&
+             attributes.binaryVersion >= 90;
+    };
+    available = available && image_has_griddepcontrol(HcDownTc8Kernel<true>) &&
+                image_has_griddepcontrol(HcDownTc8Kernel<false>) &&
+                image_has_griddepcontrol(HcUpPreTc8Kernel);
+    (void)cudaGetLastError();
+    cached_device = device;
+    cached_available = available;
+  }
+  return cached_available;
+#else
+  return false;
+#endif
+}
+
+Status LaunchFusedTc8(bool use_pdl, cudaStream_t stream,
+                      const HyperConnectionLowRankMixTensors<__nv_bfloat16>& tensors,
+                      float* partial, float* inv_rms, const DownParams& down, const UpParams& up) {
+  static const bool carveout_set = []() {
+    (void)cudaFuncSetAttribute(HcDownTc8Kernel<true>,
+                               cudaFuncAttributePreferredSharedMemoryCarveout,
+                               cudaSharedmemCarveoutMaxShared);
+    (void)cudaFuncSetAttribute(HcDownTc8Kernel<false>,
+                               cudaFuncAttributePreferredSharedMemoryCarveout,
+                               cudaSharedmemCarveoutMaxShared);
+    (void)cudaFuncSetAttribute(HcUpPreTc8Kernel,
+                               cudaFuncAttributePreferredSharedMemoryCarveout,
+                               cudaSharedmemCarveoutMaxShared);
+    (void)cudaGetLastError();
+    return true;
+  }();
+  (void)carveout_set;
+  use_pdl = use_pdl && IsTc8ProgrammaticLaunchAvailable();
+  const dim3 down_grid(6, 8, 1);
+  const dim3 up_grid(80, 1, 1);
+  if (tensors.prev_block_output != nullptr) {
+    ORT_RETURN_IF_ERROR(LaunchWithProgrammaticSerialization(
+        use_pdl, HcDownTc8Kernel<true>, down_grid, dim3(kThreads), stream, tensors.streams,
+        tensors.prev_block_output, tensors.prev_post_gate, tensors.norm_scale, tensors.down_weight,
+        tensors.inject_weight, tensors.streams_out, partial, inv_rms, down));
+  } else {
+    ORT_RETURN_IF_ERROR(LaunchWithProgrammaticSerialization(
+        use_pdl, HcDownTc8Kernel<false>, down_grid, dim3(kThreads), stream, tensors.streams,
+        static_cast<const __nv_bfloat16*>(nullptr), static_cast<const __nv_bfloat16*>(nullptr), tensors.norm_scale,
+        tensors.down_weight, tensors.inject_weight, static_cast<__nv_bfloat16*>(nullptr), partial, inv_rms, down));
+  }
+  const __nv_bfloat16* up_streams = tensors.prev_block_output != nullptr ? tensors.streams_out : tensors.streams;
+  return LaunchWithProgrammaticSerialization(use_pdl, HcUpPreTc8Kernel, up_grid, dim3(kThreads), stream,
                                              up_streams, tensors.norm_scale, tensors.up_weight,
                                              static_cast<const float*>(partial),
                                              static_cast<const float*>(inv_rms), tensors.pre_output,
@@ -1096,7 +1875,27 @@ Status LaunchHyperConnectionLowRankMixFused(const cudaDeviceProp& device_prop, c
     if (config.rows == 1) {
       return LaunchFusedRows<T, 1>(use_pdl, stream, config, tensors, g, partial, inv_rms, down, up);
     }
-    // Fused row-group dispatch: rows == 1 -> 1x1, rows 2..7 -> 2x2, rows == 8 -> 4x2 (down x up rows per CTA).
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      if (config.rows == 8 && config.branches == 4 && config.hidden == 2560 && config.rank == 320 &&
+          g.splits == 8 && (g.partial_stride & 3) == 0 && (reinterpret_cast<uintptr_t>(partial) & 15u) == 0 &&
+          (reinterpret_cast<uintptr_t>(tensors.streams) & 15u) == 0 &&
+          (reinterpret_cast<uintptr_t>(tensors.norm_scale) & 15u) == 0 &&
+          (reinterpret_cast<uintptr_t>(tensors.down_weight) & 15u) == 0 &&
+          (reinterpret_cast<uintptr_t>(tensors.up_weight) & 15u) == 0 &&
+          (reinterpret_cast<uintptr_t>(tensors.inject_weight) & 15u) == 0 &&
+          (tensors.prev_block_output == nullptr ||
+           ((reinterpret_cast<uintptr_t>(tensors.prev_block_output) & 15u) == 0 &&
+            (reinterpret_cast<uintptr_t>(tensors.streams_out) & 15u) == 0))) {
+        cudaFuncAttributes tc8_attr{};
+        if (cudaFuncGetAttributes(&tc8_attr, HcDownTc8Kernel<true>) == cudaSuccess && tc8_attr.ptxVersion >= 80) {
+          return LaunchFusedTc8(use_pdl, stream, tensors, partial, inv_rms, down, up);
+        }
+        (void)cudaGetLastError();
+      }
+    }
+    if (config.rows >= 3 && config.branches == 4 && config.rank == 320) {
+      return LaunchFusedRows<T, 4, 4>(use_pdl, stream, config, tensors, g, partial, inv_rms, down, up);
+    }
     if (config.rows >= 8) {
       return LaunchFusedRows<T, 4, 2>(use_pdl, stream, config, tensors, g, partial, inv_rms, down, up);
     }
@@ -1124,7 +1923,11 @@ Status LaunchHyperConnectionLowRankMixUnfused(cublasHandle_t cublas, cudaStream_
         (tensors.streams_out == nullptr || (reinterpret_cast<uintptr_t>(tensors.streams_out) & 15u) == 0)));
   if (tensors.prev_block_output != nullptr) {
     if constexpr (sizeof(T) == 2) {
-      if (use_vec8_norm) {
+      if (use_vec8_norm && config.hidden == 2560 && groups > 0) {
+        NormVec8H2560Kernel<T, true><<<static_cast<int>(groups), 320, 0, stream>>>(
+            tensors.streams, tensors.prev_block_output, tensors.prev_post_gate, tensors.norm_scale, hn,
+            tensors.streams_out, config.branches, config.epsilon);
+      } else if (use_vec8_norm) {
         NormVec8Kernel<T, true><<<static_cast<int>(groups), kThreads, 0, stream>>>(
             tensors.streams, tensors.prev_block_output, tensors.prev_post_gate, tensors.norm_scale, hn,
             tensors.streams_out, config.branches, config.hidden, config.epsilon);
@@ -1140,7 +1943,10 @@ Status LaunchHyperConnectionLowRankMixUnfused(cublasHandle_t cublas, cudaStream_
     }
   } else {
     if constexpr (sizeof(T) == 2) {
-      if (use_vec8_norm) {
+      if (use_vec8_norm && config.hidden == 2560 && groups > 0) {
+        NormVec8H2560Kernel<T, false><<<static_cast<int>(groups), 320, 0, stream>>>(
+            tensors.streams, nullptr, nullptr, tensors.norm_scale, hn, nullptr, config.branches, config.epsilon);
+      } else if (use_vec8_norm) {
         NormVec8Kernel<T, false><<<static_cast<int>(groups), kThreads, 0, stream>>>(
             tensors.streams, nullptr, nullptr, tensors.norm_scale, hn, nullptr, config.branches, config.hidden,
             config.epsilon);
@@ -1169,6 +1975,19 @@ Status LaunchHyperConnectionLowRankMixUnfused(cublasHandle_t cublas, cudaStream_
       down, down_count, config.silu_alpha);
   ORT_RETURN_IF_ERROR(CUDA_CALL(cudaGetLastError()));
   ORT_RETURN_IF_ERROR(Gemm<T>(cublas, rows, K, config.rank, down, tensors.up_weight, up));
+
+  if constexpr (sizeof(T) == 2) {
+    if (config.branches == 4 && config.hidden == 2560 && rows <= std::numeric_limits<int>::max() &&
+        (reinterpret_cast<uintptr_t>(hn) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(up) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(tensors.pre_output) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(tensors.inject_weight) & 15u) == 0) {
+      FusedPreMixInjectPostGateB4H2560Kernel<T><<<static_cast<int>(rows), 320, 0, stream>>>(
+          hn, up, tensors.inject_weight, tensors.pre_output, tensors.post_gate, rows,
+          config.reduction_scale, config.gate_div, config.gate_mul);
+      return CUDA_CALL(cudaGetLastError());
+    }
+  }
 
   const int64_t pre_count = rows * config.hidden;
   if constexpr (sizeof(T) == 2) {

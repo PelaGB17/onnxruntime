@@ -165,6 +165,16 @@ MlasGetPreferredBufferAlignment(
     void
     );
 
+/**
+ * @brief Return whether the current CPU and OS support AVX-512 core features
+ *        (AVX512F, AVX512BW, AVX512DQ, AVX512VL) and F16C.
+ */
+bool
+MLASCALL
+MlasPlatformAvx512Supported(
+    void
+    );
+
 #ifdef MLAS_TARGET_AMD64_IX86
 
 /**
@@ -1226,6 +1236,31 @@ MlasComputeLogistic(
     const float* Input,
     float* Output,
     size_t N
+    );
+
+/**
+ * @brief Returns the maximum of Input[0..N). N must be positive.
+ */
+float
+MLASCALL
+MlasReduceMaximum(
+    const float* Input,
+    size_t N
+    );
+
+/**
+ * @brief Computes Output[i] = exp(Input[i] + NegativeMaximum) and returns their sum. Output may alias Input or be
+ *        nullptr when only the sum is needed. Building block for online (flash-style) softmax.
+ *        NegativeMaximum must be at most -max(Input), as with a softmax's running maximum: exponents above zero
+ *        are not range checked.
+ */
+float
+MLASCALL
+MlasComputeSumExp(
+    const float* Input,
+    float* Output,
+    size_t N,
+    float NegativeMaximum
     );
 
 template <typename T>
@@ -2549,6 +2584,10 @@ struct MlasFlashAttentionGQAArgs {
     // per-(batch, head, q_block) partitioning is used.
     float* flash_decoding_partials;
     int kv_chunk_count;
+
+    // Valid rows per batch for this invocation; sequence_length remains the physical
+    // Q-head/output/bias stride. Negative means all sequence_length rows are valid.
+    int valid_query_length = -1;
 };
 
 /**

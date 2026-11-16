@@ -99,7 +99,7 @@ containing `example_plugin_ep.dll`, use its command below:
 
 ```powershell
 dotnet test csharp\test\Microsoft.ML.OnnxRuntime.Tests.NetCoreApp\Microsoft.ML.OnnxRuntime.Tests.NetCoreApp.csproj `
-  -c Release -f net8.0 -p:IncludeMobileTargets=false `
+  -c Release -f net10.0 -p:IncludeMobileTargets=false `
   -p:OnnxRuntimeBuildDirectory=<native-build-root> `
   --filter FullyQualifiedName~EncryptedEpContextTests
 ```
