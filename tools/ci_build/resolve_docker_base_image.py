@@ -18,6 +18,8 @@ from pathlib import Path
 
 DOCKER_DIR = Path(__file__).resolve().parent / "github" / "linux" / "docker"
 MANIFEST_PATH = DOCKER_DIR / "base-images.json"
+ACR_BASE_PREFIX = "onnxruntimebuildcache.azurecr.io/internal/azureml/onnxruntime/build/"
+GHCR_BASE_PREFIX = "ghcr.io/microsoft/onnxruntime/base/"
 
 
 def load_manifest():
@@ -37,16 +39,27 @@ def load_manifest():
     return manifest
 
 
-def resolve_family(family, manifest=None):
+def ghcr_repository(family, image):
+    if not re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", family):
+        raise ValueError(f"Invalid base-image family: {family!r}")
+    if image["repository"] != ACR_BASE_PREFIX + family:
+        raise ValueError(f"Unapproved source repository for {family!r}")
+    return GHCR_BASE_PREFIX + family
+
+
+def resolve_family(family, manifest=None, registry="acr"):
+    if registry not in ("acr", "ghcr"):
+        raise ValueError(f"Unknown base-image registry: {registry!r}")
     if manifest is None:
         manifest = load_manifest()
     if family not in manifest["images"]:
         raise ValueError(f"Unknown Docker base-image family: {family!r}")
     image = manifest["images"][family]
-    return f"{image['repository']}@{image['digest']}"
+    repository = ghcr_repository(family, image) if registry == "ghcr" else image["repository"]
+    return f"{repository}@{image['digest']}"
 
 
-def resolve_build_args(dockerfile, build_args="", family=""):
+def resolve_build_args(dockerfile, build_args="", family="", registry="acr"):
     arguments = shlex.split(build_args)
     base_images = []
     for index, argument in enumerate(arguments):
@@ -75,7 +88,7 @@ def resolve_build_args(dockerfile, build_args="", family=""):
             relative = ""
         family = manifest["dockerfile_defaults"].get(relative, "")
     if family:
-        arguments.extend(["--build-arg", f"BASEIMAGE={resolve_family(family, manifest)}"])
+        arguments.extend(["--build-arg", f"BASEIMAGE={resolve_family(family, manifest, registry)}"])
     return arguments
 
 
@@ -84,14 +97,17 @@ def main():
     parser.add_argument("--family", default="", help="Image family from base-images.json.")
     parser.add_argument("--dockerfile", help="Dockerfile whose default family should be used.")
     parser.add_argument("--build-args", default="", help="Additional Docker build arguments.")
+    parser.add_argument(
+        "--registry", choices=("acr", "ghcr"), default="acr", help="Registry for managed image families."
+    )
     args = parser.parse_args()
     if not args.dockerfile and not args.family:
         parser.error("Specify --dockerfile or --family")
     try:
         if args.dockerfile:
-            result = shlex.join(resolve_build_args(args.dockerfile, args.build_args, args.family))
+            result = shlex.join(resolve_build_args(args.dockerfile, args.build_args, args.family, args.registry))
         else:
-            result = resolve_family(args.family)
+            result = resolve_family(args.family, registry=args.registry)
         if "\n" in result or "\r" in result:
             raise ValueError("Resolved Docker arguments must be a single line")
     except (KeyError, ValueError, OSError) as error:

@@ -1,0 +1,96 @@
+name: Promote approved base images
+
+on:
+  # Temporary bootstrap: new dispatch workflows are not available before reaching main.
+  push:
+    branches:
+      - eserscor-2026-11-12-base-image-promotion
+  workflow_dispatch:
+    inputs:
+      family:
+        description: 'Family in base-images.json, or all (requires redistribution approval)'
+        type: string
+        required: true
+        default: all
+
+permissions: {}
+
+concurrency:
+  group: promote-approved-base-images
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.repository == 'microsoft/onnxruntime' &&
+      github.ref_protected == true &&
+      (
+        (
+          github.event_name == 'workflow_dispatch' &&
+          github.ref == 'refs/heads/main' &&
+          github.workflow_ref == 'microsoft/onnxruntime/.github/workflows/promote_base_images.yml@refs/heads/main'
+        ) ||
+        (
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/eserscor-2026-11-12-base-image-promotion' &&
+          github.workflow_ref == 'microsoft/onnxruntime/.github/workflows/promote_base_images.yml@refs/heads/eserscor-2026-11-12-base-image-promotion'
+        )
+      )
+    environment: base-image-promotion
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    env:
+      PROMOTION_FAMILY: ${{ github.event_name == 'push' && 'all' || inputs.family }}
+      AZURE_CORE_OUTPUT: none
+      AZURE_CORE_COLLECT_TELEMETRY: 'false'
+      AZURE_LOGIN_PRE_CLEANUP: 'true'
+      # The always() step removes the entire isolated cache, not just its account list.
+      AZURE_LOGIN_POST_CLEANUP: 'false'
+    steps:
+      - name: Checkout trusted event commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate selection and trust boundary before login
+        run: python3 tools/ci_build/promote_docker_base_images.py validate --family "$PROMOTION_FAMILY"
+
+      - name: Install registry copy tool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
+
+      - name: Isolate Azure credential cache
+        run: |
+          config="$(mktemp -d "$RUNNER_TEMP/ort-promotion-azure.XXXXXXXX")"
+          printf 'AZURE_CONFIG_DIR=%s\n' "$config" >> "$GITHUB_ENV"
+
+      - name: Azure OIDC login (ACR reader only)
+        uses: azure/login@8216e11d8cd9b42fe925c852af8e76311ff067ac # v2
+        with:
+          client-id: ${{ vars.ACR_READ_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.ACR_PROMOTION_SUBSCRIPTION_ID }}
+
+      - name: Copy and verify approved manifests and layers
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: python3 tools/ci_build/promote_docker_base_images.py promote --family "$PROMOTION_FAMILY"
+
+      - name: Remove isolated Azure credential cache
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${AZURE_CONFIG_DIR:-}" ]]; then
+            case "$AZURE_CONFIG_DIR" in
+              "$RUNNER_TEMP"/ort-promotion-azure.*) rm -rf -- "$AZURE_CONFIG_DIR" ;;
+              *) echo "::error::Unexpected Azure cache path; refusing cleanup"; exit 1 ;;
+            esac
+          fi
