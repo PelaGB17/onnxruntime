@@ -466,6 +466,7 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
 
     KERNEL_CREATE_INFO_VERSIONED(17, 19, DFT),
     KERNEL_CREATE_INFO(20, DFT),
+    KERNEL_CREATE_INFO(17, STFT),
 
     KERNEL_CREATE_INFO_VERSIONED(1, 9, TopK),
     KERNEL_CREATE_INFO_VERSIONED(10, 10, TopK),
@@ -514,6 +515,8 @@ std::unique_ptr<KernelRegistry> RegisterKernels(bool enable_graph_capture, bool 
 
   // Register int64 Clip kernels with conditional int64 support
   RegisterClipInt64Kernels(*kernel_registry, enable_int64);
+
+  RegisterInt64UnaryKernels(*kernel_registry, enable_int64);
 
   // Register Range kernels with conditional int64 support
   RegisterRangeKernels(*kernel_registry, enable_int64);
