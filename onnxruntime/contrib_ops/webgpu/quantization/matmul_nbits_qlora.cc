@@ -77,7 +77,7 @@ Status ApplyQLoRAOutput(onnxruntime::webgpu::ComputeContext& context, const Tens
   QLoRAOutputProgram program(context.EnableMatmulFp32Accumulation());
   program
       .AddInputs({{base, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten},
-                  {t, ProgramTensorMetadataDependency::Type, 4},
+                  {t, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten, 4},
                   {b, ProgramTensorMetadataDependency::Type, 16},
                   {scales, ProgramTensorMetadataDependency::Type}})
       .AddOutput({y, ProgramTensorMetadataDependency::Type, ProgramOutput::Flatten})
