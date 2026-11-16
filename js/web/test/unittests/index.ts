@@ -5,6 +5,10 @@
 
 if (typeof window !== 'undefined') {
   require('./backends/webgpu/test-upload');
+  if (!BUILD_DEFS.DISABLE_JSEP) {
+    require('./backends/webgpu/test-group-query-attention');
+  }
+  require('./backends/webgpu/test-view-op-registrations');
   require('./backends/webgl/test-glsl-function-inliner');
   require('./backends/webgl/test-conv-new');
   require('./backends/webgl/test-pack-unpack');
@@ -14,6 +18,7 @@ if (typeof window !== 'undefined') {
 
 require('./backends/wasm/test-model-metadata');
 require('./backends/wasm/test-lora-adapter');
+require('./backends/wasm/test-operator-type-coverage');
 
 require('./ep-context-data-read');
 

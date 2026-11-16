@@ -42,6 +42,7 @@ constexpr size_t kKScale = 12;
 constexpr size_t kVScale = 13;
 constexpr size_t kQNorm = 14;
 constexpr size_t kKNorm = 15;
+constexpr size_t kQuerySeqlens = 16;
 
 bool Present(gsl::span<const WorkspaceInputShape> shapes, size_t index) {
   return GetWorkspaceInputShape(shapes, index).GetState() != WorkspaceInputShapeState::Missing;
@@ -315,6 +316,7 @@ std::optional<GQAWorkspaceBounds> BuildBounds(
   bounds.do_rotary = config.do_rotary;
   bounds.is_packed_qkv = packed;
   bounds.use_qk_norm = Present(shapes, kQNorm);
+  bounds.has_query_seqlens = Present(shapes, kQuerySeqlens);
   bounds.prefill_reachable =
       IsGQAPhaseReachableForSequenceBound(GQAExecutionPhase::Prefill, sequence_bound);
   bounds.decode_reachable =
@@ -398,7 +400,7 @@ std::optional<GQAWorkspaceBounds> BuildBounds(
   bool mea_reachable = false;
 #if USE_MEMORY_EFFICIENT_ATTENTION
   mea_reachable =
-      !k_quantized && !has_bias && kernel_options.UseEfficientAttention() &&
+      !k_quantized && !has_bias && !has_sink && kernel_options.UseEfficientAttention() &&
       has_memory_efficient_attention_for_head_size_bounds(
           device_prop.major * 10 + device_prop.minor,
           /*is_half=*/!config.is_bf16, config.is_bf16,
@@ -604,7 +606,7 @@ void SetGroupQueryAttentionWorkspaceRequirements(
     const GQAWorkspaceAggregate& estimate,
     InlinedVector<WorkspaceRequirement>& requirements) {
   requirements.clear();
-  if (!estimate.status.IsOK() || estimate.total_workspace_bytes == 0) return;
+  if (!estimate.status.IsOK()) return;
   requirements.push_back(
       {estimate.total_workspace_bytes, 0, kGQAWorkspaceAlignment});
 }
@@ -612,10 +614,8 @@ void SetGroupQueryAttentionWorkspaceRequirements(
 void SetGroupQueryAttentionLevel1MemoryEstimate(
     const GQAWorkspaceAggregate& workspace,
     Level1MemoryEstimate& estimate) {
-  if (workspace.status.IsOK() && workspace.total_workspace_bytes != 0) {
-    estimate.runtime_workspace_bytes = workspace.total_workspace_bytes;
-  }
   if (workspace.status.IsOK()) {
+    estimate.runtime_workspace_bytes = workspace.total_workspace_bytes;
     estimate.persistent_prepack_bytes = workspace.persistent_prepack_bytes;
     estimate.initialization_scratch_bytes =
         workspace.initialization_scratch_bytes;

@@ -4,7 +4,7 @@ flatbuffers
 jinja2
 markupsafe
 numpy
-onnx
+onnx>=1.21.0
 onnxmltools
 packaging
 pandas
@@ -13,8 +13,10 @@ protobuf>=4.25.8
 pydocstyle[toml]
 pytest
 pytest-cov
+PyYAML
 scikit-learn
 scipy
+semver
 sympy
 wheel
-setuptools>=61.0.0
+setuptools>=84.2.1

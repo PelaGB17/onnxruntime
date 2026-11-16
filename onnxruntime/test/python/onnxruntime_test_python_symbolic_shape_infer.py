@@ -116,6 +116,102 @@ class TestSymbolicShapeInference(unittest.TestCase):
                 else:
                     self.assertEqual([dimension.dim_param for dimension in dimensions], ["batch", "hidden"])
 
+    def test_hyper_connection_low_rank_mix(self):
+        cases = [
+            ([16], [8], [2]),
+            (["batch", 16], ["batch", 8], ["batch", 2]),
+            (["batch", "sequence", 16], ["batch", "sequence", 8], ["batch", "sequence", 2]),
+            (["batch", "width"], ["batch", "width/2"], ["batch", 2]),
+        ]
+        for elem_type in (TensorProto.FLOAT, TensorProto.FLOAT16, TensorProto.BFLOAT16):
+            for input_shape, pre_shape, gate_shape in cases:
+                for streams_output in (None, "streams_out", ""):
+                    with self.subTest(elem_type=elem_type, input_shape=input_shape, streams_output=streams_output):
+                        outputs = ["pre_output", "post_gate"]
+                        expected_shapes = [pre_shape, gate_shape]
+                        if streams_output is not None:
+                            outputs.append(streams_output)
+                        if streams_output:
+                            expected_shapes.append(input_shape)
+                        graph = helper.make_graph(
+                            [
+                                helper.make_node(
+                                    "HyperConnectionLowRankMix",
+                                    ["streams", "norm_scale", "down_weight", "up_weight", "inject_weight"],
+                                    outputs,
+                                    domain="com.microsoft",
+                                    num_branches=2,
+                                )
+                            ],
+                            "hyper_connection_low_rank_mix",
+                            [
+                                helper.make_tensor_value_info("streams", elem_type, input_shape),
+                                helper.make_tensor_value_info("norm_scale", elem_type, [16]),
+                                helper.make_tensor_value_info("down_weight", elem_type, [16, 8]),
+                                helper.make_tensor_value_info("up_weight", elem_type, [8, 16]),
+                                helper.make_tensor_value_info("inject_weight", elem_type, [16, 2]),
+                            ],
+                            [helper.make_empty_tensor_value_info(name) for name in outputs if name],
+                        )
+                        model = helper.make_model(
+                            graph,
+                            opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)],
+                        )
+                        inferred = SymbolicShapeInference.infer_shapes(model, auto_merge=True)
+                        self.assertEqual(len(inferred.graph.output), len(expected_shapes))
+                        for output, expected_shape in zip(inferred.graph.output, expected_shapes, strict=True):
+                            tensor_type = output.type.tensor_type
+                            self.assertEqual(tensor_type.elem_type, elem_type)
+                            self.assertEqual(
+                                [
+                                    dim.dim_param if dim.HasField("dim_param") else dim.dim_value
+                                    for dim in tensor_type.shape.dim
+                                ],
+                                expected_shape,
+                            )
+
+    def test_hyper_connection_low_rank_mix_invalid_stream_shape(self):
+        cases = [
+            ([16], None, "num_branches must be positive"),
+            ([16], 0, "num_branches must be positive"),
+            ([16], -2, "num_branches must be positive"),
+            ([], 2, "flattened streams must have rank at least 1"),
+            ([0], 2, "flattened stream width must be positive and divisible by num_branches"),
+            ([15], 2, "flattened stream width must be positive and divisible by num_branches"),
+        ]
+        for input_shape, branches, error in cases:
+            with self.subTest(input_shape=input_shape, branches=branches):
+                attributes = {} if branches is None else {"num_branches": branches}
+                graph = helper.make_graph(
+                    [
+                        helper.make_node(
+                            "HyperConnectionLowRankMix",
+                            ["streams", "norm_scale", "down_weight", "up_weight", "inject_weight"],
+                            ["pre_output", "post_gate"],
+                            domain="com.microsoft",
+                            **attributes,
+                        )
+                    ],
+                    "hyper_connection_low_rank_mix_invalid",
+                    [
+                        helper.make_tensor_value_info("streams", TensorProto.FLOAT, input_shape),
+                        helper.make_tensor_value_info("norm_scale", TensorProto.FLOAT, [16]),
+                        helper.make_tensor_value_info("down_weight", TensorProto.FLOAT, [16, 8]),
+                        helper.make_tensor_value_info("up_weight", TensorProto.FLOAT, [8, 16]),
+                        helper.make_tensor_value_info("inject_weight", TensorProto.FLOAT, [16, 2]),
+                    ],
+                    [
+                        helper.make_tensor_value_info(name, TensorProto.FLOAT, None)
+                        for name in ("pre_output", "post_gate")
+                    ],
+                )
+                model = helper.make_model(
+                    graph,
+                    opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)],
+                )
+                with self.assertRaisesRegex(AssertionError, error):
+                    SymbolicShapeInference.infer_shapes(model, auto_merge=True)
+
     def test_hyper_connection_pre_mix_invalid_stream_shape(self):
         cases = [
             ("non_positive_branches", [10], -1, "num_branches must be positive"),
@@ -845,6 +941,69 @@ class TestSymbolicShapeInferenceForOperators(unittest.TestCase):
         separate_graph = infer(33, False)
         self.assertEqual(separate_graph.output[0].type.tensor_type.shape.dim[2].dim_value, 33)
         self.assertFalse(separate_graph.output[1].type.tensor_type.HasField("shape"))
+
+    def _infer_multihead_latent_attention(self, batch, sequence, past_length, total_length):
+        # num_heads = 4, head_size = 12, v_head_size = 8. total_length None makes total_sequence_length a graph input.
+        inputs = [
+            helper.make_tensor_value_info("query", TensorProto.FLOAT16, [batch, sequence, 48]),
+            helper.make_tensor_value_info("key", TensorProto.FLOAT16, [batch, sequence, 12]),
+            helper.make_tensor_value_info("seqlens_k", TensorProto.INT32, [batch]),
+        ]
+        if past_length is not None:
+            inputs.append(helper.make_tensor_value_info("past_kv", TensorProto.FLOAT16, [batch, 1, past_length, 12]))
+        initializers = []
+        if total_length is None:
+            inputs.append(helper.make_tensor_value_info("total_sequence_length", TensorProto.INT32, []))
+        else:
+            initializers.append(helper.make_tensor("total_sequence_length", TensorProto.INT32, [], [total_length]))
+        node = helper.make_node(
+            "MultiHeadLatentAttention",
+            ["query", "key", "" if past_length is None else "past_kv", "seqlens_k", "total_sequence_length"],
+            ["output", "present_kv"],
+            domain="com.microsoft",
+            num_heads=4,
+            v_head_size=8,
+            scale=0.25,
+        )
+        graph = helper.make_graph(
+            [node],
+            "MultiHeadLatentAttention",
+            inputs,
+            [
+                helper.make_tensor_value_info("output", TensorProto.FLOAT16, None),
+                helper.make_tensor_value_info("present_kv", TensorProto.FLOAT16, None),
+            ],
+            initializers,
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_operatorsetid("", 18), helper.make_operatorsetid("com.microsoft", 1)],
+        )
+        output, present_kv = SymbolicShapeInference.infer_shapes(model, auto_merge=True).graph.output
+        return self._tensor_shape(output), self._tensor_shape(present_kv)
+
+    def test_multihead_latent_attention_with_past(self):
+        # A preallocated cache keeps its length, a growing one takes total_sequence_length.
+        self.assertEqual(self._infer_multihead_latent_attention(1, 3, 64, 10), ([1, 3, 32], [1, 1, 64, 12]))
+        self.assertEqual(self._infer_multihead_latent_attention(1, 3, 7, 10), ([1, 3, 32], [1, 1, 10, 12]))
+
+    def test_multihead_latent_attention_without_past(self):
+        self.assertEqual(self._infer_multihead_latent_attention(2, 5, None, 5), ([2, 5, 32], [2, 1, 5, 12]))
+
+    def test_multihead_latent_attention_symbolic_dims(self):
+        self.assertEqual(
+            self._infer_multihead_latent_attention("batch", "seq", 64, 10), (["batch", "seq", 32], ["batch", 1, 64, 12])
+        )
+        self.assertEqual(
+            self._infer_multihead_latent_attention("batch", "seq", None, None),
+            (["batch", "seq", 32], ["batch", 1, "seq", 12]),
+        )
+        # Without a constant total_sequence_length the present length is a new dimension, not the past one.
+        output, present_kv = self._infer_multihead_latent_attention("batch", "seq", "past_seq", None)
+        self.assertEqual(output, ["batch", "seq", 32])
+        self.assertEqual([present_kv[0], present_kv[1], present_kv[3]], ["batch", 1, 12])
+        self.assertIsInstance(present_kv[2], str)
+        self.assertNotIn(present_kv[2], ["", "seq", "past_seq"])
 
     def test_unsqueeze_opset_11(self):
         graph = helper.make_graph(

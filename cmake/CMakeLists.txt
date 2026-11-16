@@ -5,6 +5,10 @@
 # Minimum CMake required
 cmake_minimum_required(VERSION 3.28)
 
+if(onnxruntime_USE_ACL)
+  message(FATAL_ERROR "The ACL execution provider has been removed. Remove onnxruntime_USE_ACL from your build configuration.")
+endif()
+
 # Don't let cmake set a default value for CMAKE_CUDA_ARCHITECTURES
 cmake_policy(SET CMP0104 OLD)
 # Project
@@ -123,6 +127,11 @@ option(onnxruntime_BUILD_BENCHMARKS "Build ONNXRuntime micro-benchmarks" OFF)
 option(onnxruntime_USE_VSINPU "Build with VSINPU support" OFF)
 
 cmake_dependent_option(onnxruntime_USE_FLASH_ATTENTION "Build flash attention kernel for scaled dot product attention" ON "onnxruntime_USE_CUDA" OFF)
+# FlashAttention has no compile-time dependence on the SM8x minor version: it selects its tile configuration at run
+# time from cudaDeviceProp (is_sm8x), so the sm_80 cubin also runs on SM86 and SM89 GPUs. When ON and SM80 SASS is
+# requested, FlashAttention is not compiled for SM86/SM89, which saves ~15 MB of fatbin per skipped architecture.
+# SM87 (Jetson Orin) is never skipped: Tegra GPUs do not follow the cubin minor-version compatibility rule.
+option(onnxruntime_FLASH_ATTENTION_REUSE_SM80 "Do not build FlashAttention for SM86/SM89 when it is built for SM80" ON)
 option(onnxruntime_USE_LEAN_ATTENTION "Build lean attention kernel for scaled dot product attention" OFF)
 cmake_dependent_option(onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION "Build memory efficient attention kernel for scaled dot product attention" ON "onnxruntime_USE_CUDA" OFF)
 # The TensorRT fused MHA kernels are prebuilt cubins for sm70-sm89 that mainly benefit BERT-style
@@ -153,7 +162,6 @@ option(onnxruntime_ENABLE_MICROSOFT_INTERNAL "Use this option to enable/disable 
 option(onnxruntime_USE_VITISAI "Build with Vitis-AI" OFF)
 option(onnxruntime_USE_TENSORRT "Build with TensorRT support" OFF)
 option(onnxruntime_USE_TENSORRT_BUILTIN_PARSER "Use TensorRT builtin parser" OFF)
-option(onnxruntime_USE_NV "Build with TensorRT support" OFF)
 option(onnxruntime_ENABLE_LTO "Enable link time optimization" OFF)
 option(onnxruntime_CROSS_COMPILING "Cross compiling onnx runtime" OFF)
 option(onnxruntime_GCOV_COVERAGE "Compile with options necessary to run code coverage" OFF)
@@ -169,7 +177,6 @@ cmake_dependent_option(onnxruntime_ENABLE_DELAY_LOADING_WIN_DLLS "Delay load som
 option(onnxruntime_USE_DML "Build with DirectML support" OFF)
 option(onnxruntime_USE_MIGRAPHX "Build with AMDMIGraphX support" OFF)
 option(onnxruntime_USE_WINML "Build with WinML support" OFF)
-option(onnxruntime_USE_ACL "Build with ACL support" OFF)
 option(onnxruntime_ENABLE_INSTRUMENT "Enable Instrument with Event Tracing for Windows (ETW)" OFF)
 option(onnxruntime_USE_TELEMETRY "Build with Telemetry" OFF)
 # AUTO selects 1DS on supported native platforms; TraceLogging requires an explicit Windows opt-in.
@@ -250,6 +257,7 @@ option(onnxruntime_DISABLE_FLOAT8_TYPES "Disable float 8 types" OFF)
 option(onnxruntime_DISABLE_FLOAT4_TYPES "Disable float 4 types" OFF)
 option(onnxruntime_DISABLE_STRING_TYPE "Disable string type" OFF)
 option(onnxruntime_DISABLE_DEVICE_DISCOVERY "Do not probe the platform for hardware devices; only the CPU device is reported." OFF)
+option(onnxruntime_DISABLE_STREAM "Disable multi-stream execution support. Execution providers that use device streams (e.g. CUDA, TensorRT) need it." OFF)
 option(onnxruntime_MINIMAL_BUILD "Exclude as much as possible from the build. Support ORT format models. No support for ONNX format models." OFF)
 option(onnxruntime_CLIENT_PACKAGE_BUILD "Enables default settings that are more appropriate for client/on-device workloads." OFF)
 option(onnxruntime_ENABLE_SESSION_THREADPOOL_CALLBACKS "Enable per-session thread pool work callbacks." OFF)
@@ -348,7 +356,6 @@ else()
 endif()
 
 option(onnxruntime_USE_TENSORRT_INTERFACE "Build ONNXRuntime shared lib which is compatible with TensorRT EP interface" OFF)
-option(onnxruntime_USE_NV_INTERFACE "Build ONNXRuntime shared lib which is compatible with NV EP interface" OFF)
 option(onnxruntime_USE_CUDA_INTERFACE "Build ONNXRuntime shared lib which is compatible with Cuda EP interface" OFF)
 option(onnxruntime_USE_OPENVINO_INTERFACE "Build ONNXRuntime shared lib which is compatible with OpenVINO EP interface" OFF)
 option(onnxruntime_USE_VITISAI_INTERFACE "Build ONNXRuntime shared lib which is compatible with Vitis-AI EP interface" OFF)
@@ -359,6 +366,14 @@ if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_
 endif()
 
 include(detect_onnxruntime_target_platform.cmake)
+include(onnxruntime_msvc_runtime.cmake)
+
+# OneCore builds link the Windows umbrella libraries (onecoreuap.lib, onecoreuap_apiset.lib) instead of CMake's default
+# MSVC system libraries. build.py --enable_wcos selects them via wcos_rules_override.cmake and gdk_toolchain.cmake sets
+# them directly; other OneCore builds may set CMAKE_<LANG>_STANDARD_LIBRARIES themselves. Every OneCore-specific
+# setting keys off this one variable.
+onnxruntime_detect_onecore_build("${CMAKE_CXX_STANDARD_LIBRARIES}" onnxruntime_BUILD_FOR_ONECORE)
+message(STATUS "onnxruntime_BUILD_FOR_ONECORE: ${onnxruntime_BUILD_FOR_ONECORE}")
 
 # ENABLE_TRAINING includes all training functionality
 # The following 2 entry points
@@ -388,6 +403,10 @@ if (onnxruntime_ENABLE_TRAINING_APIS)
     message(FATAL_ERROR "Standalone On-Device Training build is not supported with Python bindings! "
     "Please use the --enable_training flag instead of the --enable_training_apis flag.")
   endif()
+endif()
+
+if (onnxruntime_DISABLE_STREAM AND onnxruntime_ENABLE_TRAINING)
+  message(FATAL_ERROR "onnxruntime_DISABLE_STREAM=ON is not supported with onnxruntime_ENABLE_TRAINING=ON.")
 endif()
 
 
@@ -990,15 +1009,6 @@ if (onnxruntime_USE_TENSORRT_INTERFACE AND (NOT onnxruntime_USE_TENSORRT))
     list(APPEND ORT_PROVIDER_FLAGS -DUSE_TENSORRT_PROVIDER_INTERFACE=1)
 endif()
 
-if (onnxruntime_USE_NV)
-    list(APPEND ORT_PROVIDER_FLAGS -DUSE_NV=1)
-    list(APPEND ONNXRUNTIME_PROVIDER_NAMES nv_tensorrt_rtx)
-endif()
-
-if (onnxruntime_USE_NV_INTERFACE AND (NOT onnxruntime_USE_NV))
-    list(APPEND ORT_PROVIDER_FLAGS -DUSE_NV_PROVIDER_INTERFACE=1)
-endif()
-
 if (onnxruntime_USE_RKNPU)
     list(APPEND ORT_PROVIDER_FLAGS -DUSE_RKNPU=1)
     list(APPEND ONNXRUNTIME_PROVIDER_NAMES rknpu)
@@ -1073,10 +1083,6 @@ endif()
 if (onnxruntime_USE_WINML)
   list(APPEND ORT_PROVIDER_FLAGS  -DUSE_WINML=1)
   list(APPEND ONNXRUNTIME_PROVIDER_NAMES winml)
-endif()
-if (onnxruntime_USE_ACL)
-    list(APPEND ORT_PROVIDER_FLAGS  -DUSE_ACL=1)
-    list(APPEND ONNXRUNTIME_PROVIDER_NAMES acl)
 endif()
 if (onnxruntime_USE_DML)
     list(APPEND ORT_PROVIDER_FLAGS  -DUSE_DML=1)
@@ -1199,8 +1205,8 @@ function(onnxruntime_set_compile_flags target_name)
     if(onnxruntime_ENABLE_LAZY_TENSOR)
       target_compile_definitions(${target_name} PRIVATE ENABLE_LAZY_TENSOR)
     endif()
-	# Enable stream for all the non-minimal build
-    if (NOT onnxruntime_MINIMAL_BUILD)
+	# Enable stream for all the non-minimal build unless disabled
+    if (NOT onnxruntime_MINIMAL_BUILD AND NOT onnxruntime_DISABLE_STREAM)
       target_compile_definitions(${target_name} PRIVATE ORT_ENABLE_STREAM)
     endif()
 	if (onnxruntime_REDUCED_OPS_BUILD)
@@ -1468,26 +1474,6 @@ function(onnxruntime_add_include_to_target dst_target)
     endforeach()
 endfunction()
 
-# ACL
-if (onnxruntime_USE_ACL)
-  set(onnxruntime_USE_ACL ON)
-
-  if (NOT ${onnxruntime_ACL_LIBS} STREQUAL "")
-    add_library(arm_compute SHARED IMPORTED)
-    set_target_properties(arm_compute PROPERTIES
-        IMPORTED_NO_SONAME 1
-        IMPORTED_LOCATION "${onnxruntime_ACL_LIBS}/libarm_compute.so")
-
-    add_library(arm_compute_graph SHARED IMPORTED)
-    set_target_properties(arm_compute_graph PROPERTIES
-        IMPORTED_NO_SONAME 1
-        IMPORTED_LOCATION "${onnxruntime_ACL_LIBS}/libarm_compute_graph.so")
-  endif()
-
-  list(APPEND onnxruntime_EXTERNAL_LIBRARIES arm_compute arm_compute_graph)
-
-endif()
-
 if (onnxruntime_USE_DNNL)
   include(dnnl)
   add_compile_definitions(DNNL_OPENMP)
@@ -1615,6 +1601,7 @@ if (Git_FOUND)
   endif()
 endif()
 string(APPEND ORT_BUILD_INFO "build type=${CMAKE_BUILD_TYPE}")
+configure_file(onnxruntime_build_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/onnxruntime_build_info.h)
 configure_file(onnxruntime_config.h.in ${CMAKE_CURRENT_BINARY_DIR}/onnxruntime_config.h)
 get_property(onnxruntime_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 
@@ -1850,7 +1837,7 @@ if (WIN32)
   # In a non-onecore build, usually we also do not need to link to advapi32 because VC++ by default should have provide everything we need, except when the build target is Windows ARM32.
   # In the future we will add a build option to allow users disabling all API uses from advapi32 because some Windows environments do not have these APIs. For example, some Windows do not have
   # Windows Registry so we cannot query Registry values.
-  if(onnxruntime_target_platform STREQUAL "ARM" AND CMAKE_CXX_STANDARD_LIBRARIES MATCHES kernel32.lib)
+  if(onnxruntime_target_platform STREQUAL "ARM" AND NOT onnxruntime_BUILD_FOR_ONECORE)
     list(APPEND onnxruntime_EXTERNAL_LIBRARIES advapi32)
   endif()
 else()
@@ -1961,15 +1948,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   endif()
 endif()
 
-# When GDK_PLATFORM is set then WINAPI_FAMILY is defined in gdk_toolchain.cmake (along with other relevant flags/definitions).
-if (WIN32 AND NOT GDK_PLATFORM AND NOT CMAKE_CROSSCOMPILING)
-  if (NOT CMAKE_CXX_STANDARD_LIBRARIES MATCHES kernel32.lib)
-    # On onecore, link to the onecore build of the MSVC runtime
-    get_filename_component(msvc_path "${CMAKE_C_COMPILER}/../../../.." ABSOLUTE)
-    link_directories(BEFORE "${msvc_path}/lib/onecore/${onnxruntime_target_platform}")
-    # The .lib files in the MSVC runtime have a DEFAULITLIB entry for onecore.lib, but it shold not cause any conflict with onecoreuap.lib
-  endif()
-endif()
+# Link OneCore builds against the OneCore (or Spectre-mitigated OneCore) MSVC runtime libraries.
+onnxruntime_configure_msvc_onecore_runtime()
 
 foreach(onnxruntime_cmake_file ${ONNXRUNTIME_CMAKE_FILES})
   include(${onnxruntime_cmake_file}.cmake)

@@ -4,6 +4,7 @@
 
 import importlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -116,15 +117,179 @@ class BuildArgsTest(unittest.TestCase):
         args = self._parse("--android", platform_name="linux")
         self.assertTrue(args.use_telemetry)
 
-    def test_use_acl_emits_deprecation_warning(self):
-        with self.assertWarnsRegex(FutureWarning, "The ACL EP is deprecated"):
-            self._parse("--use_acl", platform_name="linux")
+    def test_compiler_cache_defaults_to_ccache(self):
+        args = self._parse("--use_cache", platform_name="linux")
+        self.assertEqual(args.cache_tool, "ccache")
 
-    def test_acl_deprecation_warning_not_emitted_without_use_acl(self):
-        with mock.patch.object(build_args.warnings, "warn") as warn:
-            self._parse(platform_name="linux")
+    def test_unknown_compiler_cache_is_rejected(self):
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            self._parse("--use_cache", "--cache_tool", "unknown", platform_name="linux")
 
-        warn.assert_not_called()
+    def test_compiler_cache_launchers(self):
+        for platform_name, tool, use_cache, use_cuda in (
+            ("linux", "ccache", True, False),
+            ("macos", "sccache", True, False),
+            ("linux", "sccache", True, True),
+            ("linux", "sccache", False, False),
+        ):
+            with self.subTest(platform_name=platform_name, tool=tool, use_cache=use_cache, use_cuda=use_cuda):
+                arguments = ["--cache_tool", tool]
+                if use_cache:
+                    arguments.append("--use_cache")
+                if use_cuda:
+                    arguments.append("--use_cuda")
+                args = self._parse(*arguments, platform_name=platform_name)
+                with (
+                    tempfile.TemporaryDirectory() as build_dir,
+                    mock.patch.object(build, "is_windows", return_value=False),
+                    mock.patch.object(build, "is_linux", return_value=platform_name == "linux"),
+                    mock.patch.object(build, "is_macOS", return_value=platform_name == "macos"),
+                    mock.patch.object(build, "run_subprocess") as run,
+                ):
+                    build.generate_build_tree(
+                        cmake_path="cmake",
+                        source_dir=str(Path(__file__).resolve().parents[2]),
+                        build_dir=build_dir,
+                        cuda_home="",
+                        cudnn_home="",
+                        nccl_home="",
+                        tensorrt_home="",
+                        migraphx_home="",
+                        qnn_home="",
+                        snpe_root="",
+                        cann_home="",
+                        path_to_protoc_exe="",
+                        configs=["Debug"],
+                        cmake_extra_defines=[],
+                        args=args,
+                        cmake_extra_args=[],
+                    )
+                run.assert_called_once()
+                command = run.call_args.args[0]
+                launchers = [arg for arg in command if "_COMPILER_LAUNCHER=" in arg]
+                expected = (
+                    [f"-DCMAKE_CXX_COMPILER_LAUNCHER={tool}", f"-DCMAKE_C_COMPILER_LAUNCHER={tool}"]
+                    if use_cache
+                    else []
+                )
+                if use_cache and use_cuda:
+                    expected.append(f"-DCMAKE_CUDA_COMPILER_LAUNCHER={tool}")
+                self.assertEqual(launchers, expected)
+                self.assertEqual("-Donnxruntime_BUILD_CACHE=ON" in command, use_cache)
+
+
+class StalePythonCacheArgsTest(unittest.TestCase):
+    def _args_for_cached_python(self, cached_executable: str | None):
+        with tempfile.TemporaryDirectory() as build_dir:
+            if cached_executable is not None:
+                (Path(build_dir) / "CMakeCache.txt").write_text(
+                    "Python_EXECUTABLE:UNINITIALIZED=x\n"
+                    f"_Python_EXECUTABLE:INTERNAL={cached_executable}\n"
+                    "_Python_INCLUDE_DIR:INTERNAL=/old/include\n",
+                    encoding="utf-8",
+                )
+            return build.stale_python_cache_args(build_dir)
+
+    def test_new_build_tree_keeps_the_cache(self):
+        self.assertEqual(self._args_for_cached_python(None), [])
+
+    def test_same_interpreter_keeps_the_cache(self):
+        self.assertEqual(self._args_for_cached_python(sys.executable), [])
+
+    def test_other_interpreter_drops_the_find_python_cache(self):
+        other = str(Path(tempfile.gettempdir()) / "other-python" / "python3")
+        self.assertEqual(self._args_for_cached_python(other), ["-U", "_Python_*"])
+
+
+class DmlBuildStagesTest(unittest.TestCase):
+    def _parse(self, *arguments):
+        with (
+            mock.patch.object(sys, "argv", ["build.py", "--build_dir", "build", *arguments]),
+            mock.patch.object(build_args, "is_windows", return_value=True),
+            mock.patch.object(build_args, "is_linux", return_value=False),
+            mock.patch.object(build_args, "is_macOS", return_value=False),
+            mock.patch.object(build_args.platform, "machine", return_value="AMD64"),
+        ):
+            return build_args.parse_arguments()
+
+    def test_test_only_does_not_restore_or_validate_build_dependencies(self):
+        args = self._parse("--test", "--use_dml", "--dml_path", "not-on-test-runner")
+        with mock.patch.object(build, "run_subprocess") as run:
+            build.setup_dml_build(args, "cmake", "build", ["RelWithDebInfo"])
+        run.assert_not_called()
+
+    def test_update_and_build_still_restore_packages(self):
+        for stage in ("--update", "--build"):
+            with self.subTest(stage=stage):
+                args = self._parse(stage, "--use_dml")
+                with mock.patch.object(build, "run_subprocess") as run:
+                    build.setup_dml_build(args, "cmake", "build", ["RelWithDebInfo"])
+                run.assert_called_once_with(
+                    [
+                        "cmake",
+                        "--build",
+                        str(Path("build") / "RelWithDebInfo"),
+                        "--config",
+                        "RelWithDebInfo",
+                        "--target",
+                        "RESTORE_PACKAGES",
+                    ]
+                )
+
+    def test_test_only_main_runs_python_and_native_tests_without_building(self):
+        args = self._parse(
+            "--test", "--use_dml", "--build_csharp", "--build_wheel", "--skip_onnx_tests", "--enable_wcos"
+        )
+        with (
+            mock.patch.object(build, "parse_arguments", return_value=args),
+            mock.patch.object(build, "is_windows", return_value=True),
+            mock.patch.object(build, "is_linux", return_value=False),
+            mock.patch.object(build, "is_macOS", return_value=False),
+            mock.patch.object(build, "run_onnxruntime_tests") as tests,
+            mock.patch.object(build, "generate_build_tree") as configure,
+            mock.patch.object(build, "build_targets") as compile_targets,
+            mock.patch.object(build, "build_python_wheel") as wheel,
+            mock.patch.object(build, "run_subprocess") as run,
+            mock.patch("sys.stdout"),
+        ):
+            build.main()
+        tests.assert_called_once()
+        self.assertTrue(tests.call_args.args[0].enable_pybind)
+        configure.assert_not_called()
+        compile_targets.assert_not_called()
+        wheel.assert_not_called()
+        run.assert_not_called()
+
+    def test_build_only_main_keeps_csharp_configuration_and_wheel_packaging(self):
+        args = self._parse(
+            "--update",
+            "--build",
+            "--skip_tests",
+            "--use_dml",
+            "--build_csharp",
+            "--build_wheel",
+            "--skip_submodule_sync",
+            "--skip_pip_install",
+        )
+        with (
+            mock.patch.object(build, "parse_arguments", return_value=args),
+            mock.patch.object(build, "is_windows", return_value=True),
+            mock.patch.object(build, "is_linux", return_value=False),
+            mock.patch.object(build, "is_macOS", return_value=False),
+            mock.patch.object(build.platform, "machine", return_value="AMD64"),
+            mock.patch.object(build, "run_onnxruntime_tests") as tests,
+            mock.patch.object(build, "generate_build_tree") as configure,
+            mock.patch.object(build, "build_targets") as compile_targets,
+            mock.patch.object(build, "build_python_wheel") as wheel,
+            mock.patch.object(build, "run_subprocess"),
+            mock.patch("sys.stdout"),
+        ):
+            build.main()
+        tests.assert_not_called()
+        configure.assert_called_once()
+        self.assertTrue(configure.call_args.args[-2].build_csharp)
+        compile_targets.assert_called_once()
+        wheel.assert_called_once()
 
 
 class OnnxBackendTestEnvironmentTest(unittest.TestCase):
