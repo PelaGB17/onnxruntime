@@ -187,7 +187,7 @@ TEST(ContribSourceReplacementPolicyTest, NewUpstreamSchemasHaveExactOwnedPending
   const auto policies = GetSourcePolicies();
   const auto sources = Executables();
   const auto legacy = LegacySourcePolicyKeys();
-  for (const auto* name : {"MoEGroupRouter", "GatherPacked", "MatMulPacked", "MoEPacked",
+  for (const auto* name : {"MultiHeadLatentAttention", "MoEGroupRouter", "GatherPacked", "MatMulPacked", "MoEPacked",
                            "MatMulNBitsQLoRAMlp", "MatMulNBitsQLoRAQkv", "Mamba2Verify"}) {
     SCOPED_TRACE(name);
     const OpKey key{kMS, name, 1};
