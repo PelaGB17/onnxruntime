@@ -16,7 +16,7 @@
 #include "core/framework/op_kernel.h"
 #include "core/framework/op_kernel_context_internal.h"
 #include "core/framework/session_state.h"
-#include "core/framework/tensorseq.h"
+#include "core/framework/TensorSeq.h"
 #include "core/graph/model.h"
 #include "core/graph/op.h"
 #include "core/providers/cpu/cpu_execution_provider.h"
