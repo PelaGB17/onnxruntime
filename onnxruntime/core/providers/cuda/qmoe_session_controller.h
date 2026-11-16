@@ -471,6 +471,10 @@ class QMoESessionController {
     return registered_nodes_.load(std::memory_order_acquire) > 0;
   }
 
+  size_t NumOffloadNodes() const noexcept {
+    return registered_nodes_.load(std::memory_order_acquire);
+  }
+
   bool IsShuttingDown() const noexcept {
     return shutting_down_.load(std::memory_order_acquire);
   }
@@ -725,6 +729,14 @@ class QMoESessionController {
 
   void SetKvHotCacheStreaming(bool enabled) noexcept {
     kv_hot_cache_streaming_.store(enabled, std::memory_order_relaxed);
+  }
+
+  void SetStreamedHostKvBytes(uint64_t bytes) noexcept {
+    streamed_host_kv_bytes_.store(bytes, std::memory_order_relaxed);
+  }
+
+  uint64_t StreamedHostKvBytes() const noexcept {
+    return streamed_host_kv_bytes_.load(std::memory_order_relaxed);
   }
 
   std::filesystem::path GetModelPath() const {
@@ -1791,6 +1803,7 @@ class QMoESessionController {
   std::shared_ptr<BoundedPinnedPool> pinned_pool_;
   std::filesystem::path model_path_;
   std::atomic<bool> kv_hot_cache_streaming_{false};
+  std::atomic<uint64_t> streamed_host_kv_bytes_{0};
   bool policy_initialized_ = false;
   bool session_plan_finalized_ = false;
   onnxruntime::moe_offload::MoeOffloadSessionPolicy policy_;

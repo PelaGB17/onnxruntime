@@ -112,11 +112,18 @@ class QMoEOffload final : public onnxruntime::cuda::CudaKernel, public MoEBase {
                                   bool enable_seeding, cudaStream_t stream) const;
   void StageExperts(const int* experts, int count) const;
   // Windows, direct file-mapped integer banks: queues an asynchronous read of every expert not resident on the GPU, at
-  // the prefill memory priority. The layer before this one calls it while it prefills, so this layer's streamed experts
-  // are read ahead of its own prefill. Returns false when this backend does not stream from a file mapping.
-  bool PostMappedNonResidentPrefetch() const;
+  // the prefill memory priority. Earlier layers call it while they prefill, deduplicating per controller run_id so each
+  // layer is read ahead at most once per prefill chunk. Returns false when this backend does not stream from a mapping.
+  bool PostMappedNonResidentPrefetch(uint64_t run_id = 0) const;
   bool IsDirectMappedIntBank() const noexcept;
+  // Windows, direct file-mapped integer banks: popularity-ranked non-resident experts whose pages prefill staging keeps
+  // cached at a middle memory priority (`ORT_QMOE_WIN_PREFILL_KEEP_MB` / `ORT_QMOE_WIN_PREFILL_KEEP_MEMPRIO`) between
+  // streamed pages (1) and decode cold experts (5).
+  const std::vector<uint8_t>& PrefillKeepSet() const;
   mutable std::atomic<bool> mapped_prefetched_once_{false};
+  mutable std::atomic<uint64_t> last_lookahead_run_id_{0};
+  mutable std::once_flag prefill_keep_once_;
+  mutable std::vector<uint8_t> prefill_keep_;
   void InitializeShared(const OpKernelInfo& info);
   void InitializeNvfp4Offload(const OpKernelInfo& info);
   Status ComputeShared(OpKernelContext* context) const;

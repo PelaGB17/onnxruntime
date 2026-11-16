@@ -749,43 +749,62 @@ void SetFp4Group8MaskForTesting(int mask) noexcept;
 }  // namespace contrib
 }  // namespace onnxruntime
 
+#if defined(_WIN32) && defined(QMOE_SHARED_STANDALONE_DLL)
+#define QMOE_SHARED_EXPORT __declspec(dllexport)
+#else
+#define QMOE_SHARED_EXPORT
+#endif
+
 extern "C" {
-int qmoe_shared_expert_forward(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
-                               int64_t m, float* out, float alpha, float beta, float limit,
-                               int force_scalar);
-int qmoe_shared_expert_contribution(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
-                                    int64_t m, float* out, float alpha, float beta, float limit,
-                                    int force_scalar);
-int qmoe_shared_expert_contribution_fp16(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
-                                         int64_t m, float* out, float alpha, float beta, float limit,
-                                         int force_scalar);
-int64_t qmoe_shared_block_bytes(int64_t hidden, int64_t inter);
-int qmoe_shared_cpu_has_avx512(void);
-int qmoe_shared_cpu_has_avx2(void);
+QMOE_SHARED_EXPORT int qmoe_shared_expert_forward(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
+                                                  int64_t m, float* out, float alpha, float beta, float limit,
+                                                  int force_scalar);
+QMOE_SHARED_EXPORT int qmoe_shared_expert_contribution(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
+                                                       int64_t m, float* out, float alpha, float beta, float limit,
+                                                       int force_scalar);
+QMOE_SHARED_EXPORT int qmoe_shared_expert_contribution_fp16(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
+                                                            int64_t m, float* out, float alpha, float beta, float limit,
+                                                            int force_scalar);
+QMOE_SHARED_EXPORT int64_t qmoe_shared_block_bytes(int64_t hidden, int64_t inter);
+QMOE_SHARED_EXPORT int qmoe_shared_cpu_has_avx512(void);
+QMOE_SHARED_EXPORT int qmoe_shared_cpu_has_avx2(void);
 // C entry point for the test-only AVX-512 toggle shared by the C++ and ctypes-loaded Python suites.
-void qmoe_shared_set_disable_avx512_for_testing(int disable);
-int qmoe_shared_accepts_prepack_contract(int64_t weights_prepacked, int64_t block_size);
-int qmoe_shared_weight_code_at(const uint8_t* weights, int64_t n_total, int64_t k_total, int64_t n,
-                               int64_t k);
-int qmoe_int4_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
-                                  const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
-                                  int64_t hidden, int64_t inter, const float* x, int64_t m,
-                                  float* out, float alpha, float beta, float limit,
-                                  int weights_prepacked, int is_bf16, int apply_fc2_bias, int force_scalar);
-int qmoe_nvfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
-                                        const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
-                                        int64_t hidden, int64_t inter, const float* x, int64_t m,
-                                        float* out, float alpha, float beta, float limit,
-                                        int force_scalar);
-int64_t qmoe_nvfp4_block_bytes(int64_t hidden, int64_t inter);
-int qmoe_mxfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
-                                        const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
-                                        int64_t hidden, int64_t inter, const float* x, int64_t m,
-                                        float* out, float alpha, float beta, float limit,
-                                        int force_scalar);
-int64_t qmoe_mxfp4_block_bytes(int64_t hidden, int64_t inter);
-void qmoe_shared_half_bits_to_float_row(const uint16_t* src, float* dst, int64_t count, int force_scalar);
-int qmoe_shared_is_file_backed_mapping(const void* data, size_t bytes);
-size_t qmoe_shared_evict_file_backed_pages(const void* data, size_t bytes);
-int qmoe_file_store_test_heap_eviction_safety(void);
+QMOE_SHARED_EXPORT void qmoe_shared_set_disable_avx512_for_testing(int disable);
+QMOE_SHARED_EXPORT int qmoe_shared_accepts_prepack_contract(int64_t weights_prepacked, int64_t block_size);
+QMOE_SHARED_EXPORT int qmoe_shared_weight_code_at(const uint8_t* weights, int64_t n_total, int64_t k_total, int64_t n,
+                                                  int64_t k);
+QMOE_SHARED_EXPORT int qmoe_int4_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
+                                                     const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
+                                                     int64_t hidden, int64_t inter, const float* x, int64_t m,
+                                                     float* out, float alpha, float beta, float limit,
+                                                     int weights_prepacked, int is_bf16, int apply_fc2_bias, int force_scalar);
+QMOE_SHARED_EXPORT int qmoe_int3_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
+                                                     const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
+                                                     int64_t hidden, int64_t inter, int64_t block_size,
+                                                     const float* x, int64_t m, float* out,
+                                                     float alpha, float beta, float limit,
+                                                     int is_bf16, int apply_fc2_bias, int force_scalar);
+QMOE_SHARED_EXPORT int qmoe_int2_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
+                                                     const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
+                                                     int64_t hidden, int64_t inter, int64_t block_size,
+                                                     const float* x, int64_t m, float* out,
+                                                     float alpha, float beta, float limit,
+                                                     int weights_prepacked, int is_bf16, int apply_fc2_bias, int force_scalar);
+QMOE_SHARED_EXPORT int64_t qmoe_int3_block_bytes(int64_t hidden, int64_t inter, int64_t block_size);
+QMOE_SHARED_EXPORT int qmoe_nvfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
+                                                           const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
+                                                           int64_t hidden, int64_t inter, const float* x, int64_t m,
+                                                           float* out, float alpha, float beta, float limit,
+                                                           int force_scalar);
+QMOE_SHARED_EXPORT int64_t qmoe_nvfp4_block_bytes(int64_t hidden, int64_t inter);
+QMOE_SHARED_EXPORT int qmoe_mxfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
+                                                           const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
+                                                           int64_t hidden, int64_t inter, const float* x, int64_t m,
+                                                           float* out, float alpha, float beta, float limit,
+                                                           int force_scalar);
+QMOE_SHARED_EXPORT int64_t qmoe_mxfp4_block_bytes(int64_t hidden, int64_t inter);
+QMOE_SHARED_EXPORT void qmoe_shared_half_bits_to_float_row(const uint16_t* src, float* dst, int64_t count, int force_scalar);
+QMOE_SHARED_EXPORT int qmoe_shared_is_file_backed_mapping(const void* data, size_t bytes);
+QMOE_SHARED_EXPORT size_t qmoe_shared_evict_file_backed_pages(const void* data, size_t bytes);
+QMOE_SHARED_EXPORT int qmoe_file_store_test_heap_eviction_safety(void);
 }

@@ -531,6 +531,210 @@ void Avx2GemmRange(const uint8_t* weights, const uint16_t* scales, const uint16_
                     out, out_stride, n_begin, n_end, /*deferred_scale=*/true);
 }
 
+namespace {
+
+inline void Avx2Interleave8x2(__m256 a, __m256 b, __m256& out_lo, __m256& out_hi) noexcept {
+  const __m256 u0 = _mm256_unpacklo_ps(a, b);
+  const __m256 u1 = _mm256_unpackhi_ps(a, b);
+  out_lo = _mm256_permute2f128_ps(u0, u1, 0x20);
+  out_hi = _mm256_permute2f128_ps(u0, u1, 0x31);
+}
+
+inline __m256 Avx2RoundFp16Vec(__m256 v) noexcept {
+  return _mm256_cvtph_ps(_mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+
+inline __m256 Avx2ExpVec8(__m256 x) noexcept {
+  // Cody-Waite range reduction x = n * ln2 + r, |r| <= ln2 / 2, degree-7 minimax polynomial (~0.50 ULP).
+  const __m256 min_x = _mm256_set1_ps(-103.9720840454f);
+  const __m256 max_x = _mm256_set1_ps(88.72283905f);
+  const __m256 x_clamped = _mm256_min_ps(_mm256_max_ps(x, min_x), max_x);
+  const __m256 inv_ln2 = _mm256_set1_ps(1.44269504088896341f);
+  const __m256 ln2_hi = _mm256_set1_ps(0.693145751953125f);
+  const __m256 ln2_lo = _mm256_set1_ps(1.428606765330187045e-6f);
+  const __m256 n = _mm256_round_ps(_mm256_mul_ps(x_clamped, inv_ln2), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  const __m256 r = _mm256_fnmadd_ps(n, ln2_lo, _mm256_fnmadd_ps(n, ln2_hi, x_clamped));
+
+  __m256 p = _mm256_set1_ps(1.98756915e-4f);
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.39819995e-3f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.33345190e-3f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.16657959e-2f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.66666657e-1f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.00000012e-1f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+
+  // Split integer exponent n = n1 + n2 so both 2^n1 and 2^n2 are normal IEEE-754 floats across [-150, 128].
+  const __m256i ni = _mm256_cvtps_epi32(n);
+  const __m256i n1 = _mm256_srai_epi32(ni, 1);
+  const __m256i n2 = _mm256_sub_epi32(ni, n1);
+  const __m256i bias = _mm256_set1_epi32(127);
+  const __m256 pow2_1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n1, bias), 23));
+  const __m256 pow2_2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(n2, bias), 23));
+  const __m256 res = _mm256_mul_ps(_mm256_mul_ps(p, pow2_1), pow2_2);
+
+  const __m256 underflow = _mm256_cmp_ps(x, min_x, _CMP_LT_OQ);
+  const __m256 overflow = _mm256_cmp_ps(x, max_x, _CMP_GT_OQ);
+  const __m256 is_nan = _mm256_cmp_ps(x, x, _CMP_UNORD_Q);
+  __m256 out = _mm256_blendv_ps(res, _mm256_setzero_ps(), underflow);
+  out = _mm256_blendv_ps(out, _mm256_castsi256_ps(_mm256_set1_epi32(0x7F800000)), overflow);
+  return _mm256_blendv_ps(out, x, is_nan);
+}
+
+inline __m256 Avx2EvalSwiGlu8(__m256 gate, __m256 up, float alpha, float beta, float limit,
+                                                      bool has_limit, bool bf16_out, bool fp16_out) noexcept {
+  if (has_limit) {
+    const __m256 vlim = _mm256_set1_ps(limit);
+    const __m256 vnlim = _mm256_set1_ps(-limit);
+    gate = _mm256_min_ps(vlim, gate);
+    up = _mm256_min_ps(vlim, _mm256_max_ps(vnlim, up));
+  }
+  const __m256 neg_ag = _mm256_mul_ps(_mm256_set1_ps(-alpha), gate);
+  const __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), Avx2ExpVec8(neg_ag));
+  __m256 silu = _mm256_div_ps(gate, denom);
+  const __m256 pos_inf = _mm256_castsi256_ps(_mm256_set1_epi32(0x7F800000));
+  const __m256 neg_inf = _mm256_castsi256_ps(_mm256_set1_epi32(static_cast<int>(0xFF800000u)));
+  if (alpha > 0.0f) {
+    silu = _mm256_blendv_ps(silu, _mm256_setzero_ps(), _mm256_cmp_ps(gate, neg_inf, _CMP_EQ_OQ));
+  } else if (alpha < 0.0f) {
+    silu = _mm256_blendv_ps(silu, _mm256_setzero_ps(), _mm256_cmp_ps(gate, pos_inf, _CMP_EQ_OQ));
+  }
+  const __m256 act = _mm256_mul_ps(silu, _mm256_add_ps(up, _mm256_set1_ps(beta)));
+  if (bf16_out) return Avx2RoundBf16Vec(act);
+  if (fp16_out) return Avx2RoundFp16Vec(act);
+  return act;
+}
+
+}  // namespace
+
+void Avx2ReorderInt4Row(const float* src, float* dst, int64_t k) noexcept {
+  for (int64_t off = 0; off < k; off += 32) {
+    const __m256 a0 = _mm256_loadu_ps(src + off + 0);
+    const __m256 a1 = _mm256_loadu_ps(src + off + 8);
+    const __m256 b0 = _mm256_loadu_ps(src + off + 16);
+    const __m256 b1 = _mm256_loadu_ps(src + off + 24);
+    __m256 d0, d1, d2, d3;
+    Avx2Interleave8x2(a0, b0, d0, d1);
+    Avx2Interleave8x2(a1, b1, d2, d3);
+    _mm256_storeu_ps(dst + off + 0, d0);
+    _mm256_storeu_ps(dst + off + 8, d1);
+    _mm256_storeu_ps(dst + off + 16, d2);
+    _mm256_storeu_ps(dst + off + 24, d3);
+  }
+}
+
+void Avx2ReorderInt2Row(const float* src, float* dst, int64_t k) noexcept {
+  for (int64_t off = 0; off < k; off += 64) {
+    const __m256 v0 = _mm256_loadu_ps(src + off + 0);
+    const __m256 v1 = _mm256_loadu_ps(src + off + 8);
+    const __m256 v2 = _mm256_loadu_ps(src + off + 16);
+    const __m256 v3 = _mm256_loadu_ps(src + off + 24);
+    const __m256 v4 = _mm256_loadu_ps(src + off + 32);
+    const __m256 v5 = _mm256_loadu_ps(src + off + 40);
+    const __m256 v6 = _mm256_loadu_ps(src + off + 48);
+    const __m256 v7 = _mm256_loadu_ps(src + off + 56);
+    __m256 d0, d1, d2, d3, d4, d5, d6, d7;
+    Avx2Interleave8x2(v0, v4, d0, d1);
+    Avx2Interleave8x2(v1, v5, d2, d3);
+    Avx2Interleave8x2(v2, v6, d4, d5);
+    Avx2Interleave8x2(v3, v7, d6, d7);
+    _mm256_storeu_ps(dst + off + 0, d0);
+    _mm256_storeu_ps(dst + off + 8, d1);
+    _mm256_storeu_ps(dst + off + 16, d2);
+    _mm256_storeu_ps(dst + off + 24, d3);
+    _mm256_storeu_ps(dst + off + 32, d4);
+    _mm256_storeu_ps(dst + off + 40, d5);
+    _mm256_storeu_ps(dst + off + 48, d6);
+    _mm256_storeu_ps(dst + off + 56, d7);
+  }
+}
+
+// out_order: 0 = natural, 1 = prepacked INT4 (32-block interleave), 2 = prepacked INT2 (64-block interleave).
+void Avx2SwiGluInterleavedPairs(const float* row_tmp, const uint16_t* bias_u16, bool bias_is_bf16,
+                                bool round_proj_before_bias, int64_t pair_count,
+                                float alpha, float beta, float limit,
+                                bool bf16_boundaries, bool fp16_boundaries,
+                                int out_order, float* dst) noexcept {
+  const bool has_limit = (limit < 3.402823466e38f);
+
+  auto eval8 = [&](int64_t p0) -> __m256 {
+    __m256 v0 = _mm256_loadu_ps(row_tmp + 2 * p0);
+    __m256 v1 = _mm256_loadu_ps(row_tmp + 2 * p0 + 8);
+    if (round_proj_before_bias) {
+      if (bf16_boundaries) {
+        v0 = Avx2RoundBf16Vec(v0);
+        v1 = Avx2RoundBf16Vec(v1);
+      } else if (fp16_boundaries) {
+        v0 = Avx2RoundFp16Vec(v0);
+        v1 = Avx2RoundFp16Vec(v1);
+      }
+    }
+    if (bias_u16 != nullptr) {
+      __m256 b0, b1;
+      if (bias_is_bf16) {
+        b0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(bias_u16 + 2 * p0))), 16));
+        b1 = _mm256_castsi256_ps(_mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(bias_u16 + 2 * p0 + 8))), 16));
+      } else {
+        b0 = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(bias_u16 + 2 * p0)));
+        b1 = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(bias_u16 + 2 * p0 + 8)));
+      }
+      v0 = _mm256_add_ps(v0, b0);
+      v1 = _mm256_add_ps(v1, b1);
+    }
+    const __m256 lo = _mm256_permute2f128_ps(v0, v1, 0x20);
+    const __m256 hi = _mm256_permute2f128_ps(v0, v1, 0x31);
+    const __m256 gate = _mm256_shuffle_ps(lo, hi, _MM_SHUFFLE(2, 0, 2, 0));
+    const __m256 up = _mm256_shuffle_ps(lo, hi, _MM_SHUFFLE(3, 1, 3, 1));
+    return Avx2EvalSwiGlu8(gate, up, alpha, beta, limit, has_limit, bf16_boundaries, fp16_boundaries);
+  };
+
+  if (out_order == 2) {
+    for (int64_t p0 = 0; p0 < pair_count; p0 += 64) {
+      const __m256 a0 = eval8(p0 + 0);
+      const __m256 a1 = eval8(p0 + 8);
+      const __m256 a2 = eval8(p0 + 16);
+      const __m256 a3 = eval8(p0 + 24);
+      const __m256 a4 = eval8(p0 + 32);
+      const __m256 a5 = eval8(p0 + 40);
+      const __m256 a6 = eval8(p0 + 48);
+      const __m256 a7 = eval8(p0 + 56);
+      __m256 d0, d1, d2, d3, d4, d5, d6, d7;
+      Avx2Interleave8x2(a0, a4, d0, d1);
+      Avx2Interleave8x2(a1, a5, d2, d3);
+      Avx2Interleave8x2(a2, a6, d4, d5);
+      Avx2Interleave8x2(a3, a7, d6, d7);
+      _mm256_storeu_ps(dst + p0 + 0, d0);
+      _mm256_storeu_ps(dst + p0 + 8, d1);
+      _mm256_storeu_ps(dst + p0 + 16, d2);
+      _mm256_storeu_ps(dst + p0 + 24, d3);
+      _mm256_storeu_ps(dst + p0 + 32, d4);
+      _mm256_storeu_ps(dst + p0 + 40, d5);
+      _mm256_storeu_ps(dst + p0 + 48, d6);
+      _mm256_storeu_ps(dst + p0 + 56, d7);
+    }
+  } else if (out_order == 1) {
+    for (int64_t p0 = 0; p0 < pair_count; p0 += 32) {
+      const __m256 a0 = eval8(p0 + 0);
+      const __m256 a1 = eval8(p0 + 8);
+      const __m256 a2 = eval8(p0 + 16);
+      const __m256 a3 = eval8(p0 + 24);
+      __m256 d0, d1, d2, d3;
+      Avx2Interleave8x2(a0, a2, d0, d1);
+      Avx2Interleave8x2(a1, a3, d2, d3);
+      _mm256_storeu_ps(dst + p0 + 0, d0);
+      _mm256_storeu_ps(dst + p0 + 8, d1);
+      _mm256_storeu_ps(dst + p0 + 16, d2);
+      _mm256_storeu_ps(dst + p0 + 24, d3);
+    }
+  } else {
+    for (int64_t p0 = 0; p0 < pair_count; p0 += 8) {
+      _mm256_storeu_ps(dst + p0, eval8(p0));
+    }
+  }
+}
+
 }  // namespace detail
 }  // namespace qmoe_shared
 }  // namespace contrib

@@ -186,6 +186,7 @@ void Int3Group8Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uin
 template <int RT, int BlockSize, bool ScaleIsBf16, bool DeferredScale>
 void Int3Group4Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uint16_t* scales,
                     int64_t n0, int64_t k, const float* a_natural, float (&result)[4][RT]) noexcept {
+  static_assert(RT >= 1 && RT <= 4, "Int3Group4Avx2 is specialized for RT=1..4");
   static_assert(BlockSize == 32 || BlockSize == 64 || BlockSize == 128,
                 "Int3Group4Avx2 requires BlockSize 32, 64, or 128");
   constexpr int kChunks32 = BlockSize / 32;
@@ -195,10 +196,14 @@ void Int3Group4Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uin
   const __m256i shifts = _mm256_set_epi32(21, 18, 15, 12, 9, 6, 3, 0);
   const __m256i mask7 = _mm256_set1_epi32(7);
   const __m256i four = _mm256_set1_epi32(4);
-  __m256 acc0_0 = _mm256_setzero_ps(), acc0_1 = _mm256_setzero_ps();
-  __m256 acc1_0 = _mm256_setzero_ps(), acc1_1 = _mm256_setzero_ps();
-  __m256 acc2_0 = _mm256_setzero_ps(), acc2_1 = _mm256_setzero_ps();
-  __m256 acc3_0 = _mm256_setzero_ps(), acc3_1 = _mm256_setzero_ps();
+  __m256 acc0_0 = _mm256_setzero_ps(), acc0_1 = _mm256_setzero_ps(),
+         acc0_2 = _mm256_setzero_ps(), acc0_3 = _mm256_setzero_ps();
+  __m256 acc1_0 = _mm256_setzero_ps(), acc1_1 = _mm256_setzero_ps(),
+         acc1_2 = _mm256_setzero_ps(), acc1_3 = _mm256_setzero_ps();
+  __m256 acc2_0 = _mm256_setzero_ps(), acc2_1 = _mm256_setzero_ps(),
+         acc2_2 = _mm256_setzero_ps(), acc2_3 = _mm256_setzero_ps();
+  __m256 acc3_0 = _mm256_setzero_ps(), acc3_1 = _mm256_setzero_ps(),
+         acc3_2 = _mm256_setzero_ps(), acc3_3 = _mm256_setzero_ps();
 
   for (int64_t kb = 0; kb < blocks; ++kb) {
     const int64_t byte_off = kb * kBlockBytes;
@@ -207,7 +212,7 @@ void Int3Group4Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uin
         _mm_prefetch(reinterpret_cast<const char*>(next_w_base + c * raw_w_stride + byte_off), _MM_HINT_T0);
       }
     }
-    auto step_col = [&](int c, __m256& acc_r0, __m256& acc_r1) QMOE_AVX2_LAMBDA_INLINE {
+    auto step_col = [&](int c, __m256& acc_r0, __m256& acc_r1, __m256& acc_r2, __m256& acc_r3) QMOE_AVX2_LAMBDA_INLINE {
       const uint8_t* p = w_base + c * raw_w_stride + byte_off;
       const uint16_t s_bits = scales[(n0 + c) * blocks + kb];
       const float s_val = ScaleIsBf16 ? Avx2Int3BFloat16BitsToFloat(s_bits)
@@ -215,22 +220,32 @@ void Int3Group4Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uin
       const __m256 table = DeferredScale ? _mm256_set1_ps(s_val) : Int3LookupAvx2(s_bits, s_val, ScaleIsBf16);
       __m256 prod0 = _mm256_setzero_ps();
       __m256 prod1 = _mm256_setzero_ps();
+      __m256 prod2 = _mm256_setzero_ps();
+      __m256 prod3 = _mm256_setzero_ps();
       for (int ch = 0; ch < kChunks32; ++ch) {
-        const __m256 a0_0 = _mm256_loadu_ps(a_natural + 0 * k + kb * BlockSize + ch * 32 + 0);
-        const __m256 a1_0 = _mm256_loadu_ps(a_natural + 0 * k + kb * BlockSize + ch * 32 + 8);
-        const __m256 a2_0 = _mm256_loadu_ps(a_natural + 0 * k + kb * BlockSize + ch * 32 + 16);
-        const __m256 a3_0 = _mm256_loadu_ps(a_natural + 0 * k + kb * BlockSize + ch * 32 + 24);
-        const __m256 d0 = Dot32Int3Avx2<DeferredScale>(p + ch * 12, a0_0, a1_0, a2_0, a3_0, shifts, mask7, four, table);
-        prod0 = (ch == 0) ? d0 : _mm256_add_ps(prod0, d0);
-        if constexpr (RT >= 2) {
-          const __m256 a0_1 = _mm256_loadu_ps(a_natural + 1 * k + kb * BlockSize + ch * 32 + 0);
-          const __m256 a1_1 = _mm256_loadu_ps(a_natural + 1 * k + kb * BlockSize + ch * 32 + 8);
-          const __m256 a2_1 = _mm256_loadu_ps(a_natural + 1 * k + kb * BlockSize + ch * 32 + 16);
-          const __m256 a3_1 = _mm256_loadu_ps(a_natural + 1 * k + kb * BlockSize + ch * 32 + 24);
-          const __m256 d1 =
-              Dot32Int3Avx2<DeferredScale>(p + ch * 12, a0_1, a1_1, a2_1, a3_1, shifts, mask7, four, table);
-          prod1 = (ch == 0) ? d1 : _mm256_add_ps(prod1, d1);
-        }
+        const int64_t a_off = kb * BlockSize + ch * 32;
+        const uint8_t* pc = p + ch * 12;
+        uint32_t u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+        std::memcpy(&u0, pc + 0, sizeof(uint32_t));
+        std::memcpy(&u1, pc + 3, sizeof(uint32_t));
+        std::memcpy(&u2, pc + 6, sizeof(uint32_t));
+        std::memcpy(&u3, pc + 8, sizeof(uint32_t));
+        u3 >>= 8;
+        const __m256 w0 = UnpackDequant8Int3WeightsAvx2<DeferredScale>(u0, shifts, mask7, four, table);
+        const __m256 w1 = UnpackDequant8Int3WeightsAvx2<DeferredScale>(u1, shifts, mask7, four, table);
+        const __m256 w2 = UnpackDequant8Int3WeightsAvx2<DeferredScale>(u2, shifts, mask7, four, table);
+        const __m256 w3 = UnpackDequant8Int3WeightsAvx2<DeferredScale>(u3, shifts, mask7, four, table);
+        auto dot_row = [&](int r, __m256& prod) QMOE_AVX2_LAMBDA_INLINE {
+          const float* ar = a_natural + r * k + a_off;
+          const __m256 p01 = _mm256_fmadd_ps(w0, _mm256_loadu_ps(ar + 0), _mm256_mul_ps(w1, _mm256_loadu_ps(ar + 8)));
+          const __m256 p23 = _mm256_fmadd_ps(w2, _mm256_loadu_ps(ar + 16), _mm256_mul_ps(w3, _mm256_loadu_ps(ar + 24)));
+          const __m256 d = _mm256_add_ps(p01, p23);
+          prod = (ch == 0) ? d : _mm256_add_ps(prod, d);
+        };
+        dot_row(0, prod0);
+        if constexpr (RT >= 2) dot_row(1, prod1);
+        if constexpr (RT >= 3) dot_row(2, prod2);
+        if constexpr (RT >= 4) dot_row(3, prod3);
       }
       acc_r0 = DeferredScale ? _mm256_fmadd_ps(prod0, table, acc_r0) : _mm256_add_ps(prod0, acc_r0);
       if constexpr (RT >= 2) {
@@ -238,11 +253,21 @@ void Int3Group4Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uin
       } else {
         (void)acc_r1;
       }
+      if constexpr (RT >= 3) {
+        acc_r2 = DeferredScale ? _mm256_fmadd_ps(prod2, table, acc_r2) : _mm256_add_ps(prod2, acc_r2);
+      } else {
+        (void)acc_r2;
+      }
+      if constexpr (RT >= 4) {
+        acc_r3 = DeferredScale ? _mm256_fmadd_ps(prod3, table, acc_r3) : _mm256_add_ps(prod3, acc_r3);
+      } else {
+        (void)acc_r3;
+      }
     };
-    step_col(0, acc0_0, acc0_1);
-    step_col(1, acc1_0, acc1_1);
-    step_col(2, acc2_0, acc2_1);
-    step_col(3, acc3_0, acc3_1);
+    step_col(0, acc0_0, acc0_1, acc0_2, acc0_3);
+    step_col(1, acc1_0, acc1_1, acc1_2, acc1_3);
+    step_col(2, acc2_0, acc2_1, acc2_2, acc2_3);
+    step_col(3, acc3_0, acc3_1, acc3_2, acc3_3);
   }
   result[0][0] = Avx2Int3ReduceAddPs(acc0_0);
   result[1][0] = Avx2Int3ReduceAddPs(acc1_0);
@@ -253,6 +278,18 @@ void Int3Group4Avx2(const uint8_t* w_base, const uint8_t* next_w_base, const uin
     result[1][1] = Avx2Int3ReduceAddPs(acc1_1);
     result[2][1] = Avx2Int3ReduceAddPs(acc2_1);
     result[3][1] = Avx2Int3ReduceAddPs(acc3_1);
+  }
+  if constexpr (RT >= 3) {
+    result[0][2] = Avx2Int3ReduceAddPs(acc0_2);
+    result[1][2] = Avx2Int3ReduceAddPs(acc1_2);
+    result[2][2] = Avx2Int3ReduceAddPs(acc2_2);
+    result[3][2] = Avx2Int3ReduceAddPs(acc3_2);
+  }
+  if constexpr (RT >= 4) {
+    result[0][3] = Avx2Int3ReduceAddPs(acc0_3);
+    result[1][3] = Avx2Int3ReduceAddPs(acc1_3);
+    result[2][3] = Avx2Int3ReduceAddPs(acc2_3);
+    result[3][3] = Avx2Int3ReduceAddPs(acc3_3);
   }
 }
 
@@ -341,14 +378,27 @@ void Avx2Int3GemmRangeImpl(const uint8_t* weights, const uint16_t* scales, const
                            int64_t n_total, int64_t k, const float* a_natural, int64_t m,
                            float* out, int64_t out_stride, int64_t n_begin, int64_t n_end) {
   int64_t r = 0;
-  while (r + 2 <= m) {
-    Int3RowTileAvx2<2, DeferredScale>(weights, scales, bias, block_size, scale_is_bf16, bias_is_bf16,
-                                      n_total, k, a_natural + r * k, out + r * out_stride, out_stride, n_begin, n_end);
-    r += 2;
-  }
-  if (r < m) {
-    Int3RowTileAvx2<1, DeferredScale>(weights, scales, bias, block_size, scale_is_bf16, bias_is_bf16,
-                                      n_total, k, a_natural + r * k, out + r * out_stride, out_stride, n_begin, n_end);
+  while (r < m) {
+    const int64_t left = m - r;
+    const float* ar = a_natural + r * k;
+    float* orow = out + r * out_stride;
+    if (left >= 4) {
+      Int3RowTileAvx2<4, DeferredScale>(weights, scales, bias, block_size, scale_is_bf16, bias_is_bf16,
+                                        n_total, k, ar, orow, out_stride, n_begin, n_end);
+      r += 4;
+    } else if (left == 3) {
+      Int3RowTileAvx2<3, DeferredScale>(weights, scales, bias, block_size, scale_is_bf16, bias_is_bf16,
+                                        n_total, k, ar, orow, out_stride, n_begin, n_end);
+      r += 3;
+    } else if (left == 2) {
+      Int3RowTileAvx2<2, DeferredScale>(weights, scales, bias, block_size, scale_is_bf16, bias_is_bf16,
+                                        n_total, k, ar, orow, out_stride, n_begin, n_end);
+      r += 2;
+    } else {
+      Int3RowTileAvx2<1, DeferredScale>(weights, scales, bias, block_size, scale_is_bf16, bias_is_bf16,
+                                        n_total, k, ar, orow, out_stride, n_begin, n_end);
+      r += 1;
+    }
   }
 }
 

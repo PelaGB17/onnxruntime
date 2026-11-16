@@ -34,21 +34,49 @@ KERNEL_SRC = SRC_ROOT / "contrib_ops" / "cpu" / "moe" / "qmoe_shared_layout.cc"
 def load_lib():
     if not KERNEL_SRC.is_file():
         raise unittest.SkipTest(f"C++ source {KERNEL_SRC} not found")
-    out = Path(tempfile.mkdtemp()) / "libqmoe_shared_layout.so"
-    subprocess.check_call(
-        [
-            "g++",
-            "-O2",
-            "-std=c++17",
-            "-shared",
-            "-fPIC",
-            f"-I{SRC_ROOT}",
-            f"-I{SRC_ROOT.parent / 'include/onnxruntime'}",
-            str(KERNEL_SRC),
-            "-o",
-            str(out),
-        ]
-    )
+    tmp_dir = Path(tempfile.mkdtemp())
+    inc_ort = SRC_ROOT.parent / "include" / "onnxruntime"
+    if sys.platform == "win32":
+        out = tmp_dir / "qmoe_shared_layout.dll"
+        vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / (
+            r"Microsoft Visual Studio\Installer\vswhere.exe"
+        )
+        vcvars = None
+        if vswhere.is_file():
+            install_dir = subprocess.check_output(
+                [str(vswhere), "-latest", "-products", "*", "-property", "installationPath"],
+                text=True,
+            ).strip()
+            if install_dir:
+                cand = Path(install_dir) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+                if cand.is_file():
+                    vcvars = cand
+        if vcvars is None:
+            raise unittest.SkipTest("MSVC vcvars64.bat not found on Windows")
+        bat = tmp_dir / "build_qmoe.bat"
+        bat.write_text(
+            f'@echo off\r\ncall "{vcvars}" >nul || exit /b 1\r\n'
+            f'cl /nologo /O2 /std:c++20 /EHsc /LD /arch:AVX2 /DQMOE_SHARED_STANDALONE_DLL=1 '
+            f'/I"{SRC_ROOT}" /I"{inc_ort}" "{KERNEL_SRC}" /Fe:"{out}" /Fo:"{tmp_dir / "qmoe.obj"}"\r\n',
+            encoding="utf-8",
+        )
+        subprocess.check_call([os.environ.get("ComSpec", "cmd.exe"), "/c", str(bat)])
+    else:
+        out = tmp_dir / "libqmoe_shared_layout.so"
+        subprocess.check_call(
+            [
+                "g++",
+                "-O2",
+                "-std=c++17",
+                "-shared",
+                "-fPIC",
+                f"-I{SRC_ROOT}",
+                f"-I{inc_ort}",
+                str(KERNEL_SRC),
+                "-o",
+                str(out),
+            ]
+        )
     lib = ctypes.CDLL(str(out))
     lib.qmoe_shared_expert_forward.argtypes = [
         ctypes.c_void_p,
@@ -125,6 +153,28 @@ def load_lib():
         ctypes.c_int,
     ]
     lib.qmoe_int3_expert_contribution.restype = ctypes.c_int
+    lib.qmoe_int2_expert_contribution.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_void_p,
+        ctypes.c_int64,
+        ctypes.c_void_p,
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_float,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    lib.qmoe_int2_expert_contribution.restype = ctypes.c_int
     lib.qmoe_int3_block_bytes.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_int64]
     lib.qmoe_int3_block_bytes.restype = ctypes.c_int64
     lib.qmoe_shared_half_bits_to_float_row.argtypes = [
@@ -165,7 +215,6 @@ def run_cpu(lib, block, hidden, inter, x, force_scalar, swiglu=(1.0, 0.0, float(
     return out
 
 
-@unittest.skipIf(sys.platform == "win32", "SharedLayoutTest requires POSIX g++ toolchain to build shared test library.")
 class SharedLayoutTest(unittest.TestCase):
     def test_fp16_boundaries_match_explicit_reference(self):
         rng = np.random.default_rng(20261009)
@@ -1019,6 +1068,121 @@ class RealArtifactGoldenTest(unittest.TestCase):
         for layer in (0, 17, 47):
             self._run(layer, 1)
         self._run(0, 4)
+
+
+class Avx2KernelParityTest(unittest.TestCase):
+    """Verifies AVX2 SwiGLU, activation reorder, and RT=1..4 INT2/INT3/INT4 expert kernels against scalar reference."""
+
+    def test_avx2_int2_int3_int4_parity_all_row_tiles(self):
+        lib = load_lib()
+        if not lib.qmoe_shared_cpu_has_avx2():
+            self.skipTest("CPU does not support AVX2+FMA+F16C")
+
+        rng = np.random.default_rng(20261116)
+        hidden, inter = 256, 128
+        n1 = 2 * inter
+
+        def f32_to_bf16_u16(arr: np.ndarray) -> np.ndarray:
+            u32 = arr.astype(np.float32).view(np.uint32)
+            lsb = (u32 >> 16) & 1
+            return ((u32 + 0x7FFF + lsb) >> 16).astype(np.uint16)
+
+        lib.qmoe_shared_set_disable_avx512_for_testing(1)
+        try:
+            for is_bf16 in (1, 0):
+                make_u16 = (
+                    f32_to_bf16_u16
+                    if is_bf16
+                    else lambda a: a.astype(np.float16).view(np.uint16)
+                )
+                s1_32 = make_u16(rng.uniform(0.005, 0.03, (n1, hidden // 32)))
+                s2_32 = make_u16(rng.uniform(0.005, 0.03, (hidden, inter // 32)))
+                s1_64 = make_u16(rng.uniform(0.005, 0.03, (n1, hidden // 64)))
+                s2_64 = make_u16(rng.uniform(0.005, 0.03, (hidden, inter // 64)))
+                b1 = make_u16(rng.uniform(-0.1, 0.1, (n1,)))
+                b2 = make_u16(rng.uniform(-0.1, 0.1, (hidden,)))
+
+                w1_i4 = rng.integers(0, 256, (n1, hidden // 2), dtype=np.uint8)
+                w2_i4 = rng.integers(0, 256, (hidden, inter // 2), dtype=np.uint8)
+                w1_i3 = rng.integers(0, 256, (n1, (hidden * 3) // 8), dtype=np.uint8)
+                w2_i3 = rng.integers(0, 256, (hidden, (inter * 3) // 8), dtype=np.uint8)
+                w1_i2 = rng.integers(0, 256, (n1, hidden // 4), dtype=np.uint8)
+                w2_i2 = rng.integers(0, 256, (hidden, inter // 4), dtype=np.uint8)
+
+                tol = 2e-4 if is_bf16 else 1e-4
+                for m in (1, 2, 3, 4, 7, 8):
+                    x = rng.standard_normal((m, hidden)).astype(np.float32) * 0.75
+                    for alpha, beta, limit in ((1.0, 0.0, float("inf")), (1.702, 1.0, 2.5)):
+                        # INT4 prepacked
+                        out_ref = np.zeros((m, hidden), dtype=np.float32)
+                        out_dut = np.zeros((m, hidden), dtype=np.float32)
+                        self.assertEqual(
+                            lib.qmoe_int4_expert_contribution(
+                                w1_i4.ctypes.data, s1_32.ctypes.data, b1.ctypes.data,
+                                w2_i4.ctypes.data, s2_32.ctypes.data, b2.ctypes.data,
+                                hidden, inter, x.ctypes.data, m, out_ref.ctypes.data,
+                                alpha, beta, limit, 1, is_bf16, 1, 1,
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            lib.qmoe_int4_expert_contribution(
+                                w1_i4.ctypes.data, s1_32.ctypes.data, b1.ctypes.data,
+                                w2_i4.ctypes.data, s2_32.ctypes.data, b2.ctypes.data,
+                                hidden, inter, x.ctypes.data, m, out_dut.ctypes.data,
+                                alpha, beta, limit, 1, is_bf16, 1, 0,
+                            ),
+                            1,
+                        )
+                        np.testing.assert_allclose(out_dut, out_ref, rtol=tol, atol=tol)
+
+                        # INT3 (block_size=64, exercises RT=1..4 including new RT=3,4)
+                        out_ref.fill(0.0)
+                        out_dut.fill(0.0)
+                        self.assertEqual(
+                            lib.qmoe_int3_expert_contribution(
+                                w1_i3.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
+                                w2_i3.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
+                                hidden, inter, 64, x.ctypes.data, m, out_ref.ctypes.data,
+                                alpha, beta, limit, is_bf16, 1, 1,
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            lib.qmoe_int3_expert_contribution(
+                                w1_i3.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
+                                w2_i3.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
+                                hidden, inter, 64, x.ctypes.data, m, out_dut.ctypes.data,
+                                alpha, beta, limit, is_bf16, 1, 0,
+                            ),
+                            1,
+                        )
+                        np.testing.assert_allclose(out_dut, out_ref, rtol=tol, atol=tol)
+
+                        # INT2 prepacked (block_size=64)
+                        out_ref.fill(0.0)
+                        out_dut.fill(0.0)
+                        self.assertEqual(
+                            lib.qmoe_int2_expert_contribution(
+                                w1_i2.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
+                                w2_i2.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
+                                hidden, inter, 64, x.ctypes.data, m, out_ref.ctypes.data,
+                                alpha, beta, limit, 1, is_bf16, 1, 1,
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            lib.qmoe_int2_expert_contribution(
+                                w1_i2.ctypes.data, s1_64.ctypes.data, b1.ctypes.data,
+                                w2_i2.ctypes.data, s2_64.ctypes.data, b2.ctypes.data,
+                                hidden, inter, 64, x.ctypes.data, m, out_dut.ctypes.data,
+                                alpha, beta, limit, 1, is_bf16, 1, 0,
+                            ),
+                            1,
+                        )
+                        np.testing.assert_allclose(out_dut, out_ref, rtol=tol, atol=tol)
+        finally:
+            lib.qmoe_shared_set_disable_avx512_for_testing(0)
 
 
 if __name__ == "__main__":

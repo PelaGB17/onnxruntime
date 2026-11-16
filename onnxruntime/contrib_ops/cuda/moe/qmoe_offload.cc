@@ -322,16 +322,25 @@ inline int PrefillMemoryPriority() noexcept {
   return (priority >= 1 && priority <= 5) ? priority : 0;
 }
 
+// Memory priority of the prefill keep set (`QMoEOffload::PrefillKeepSet`): above streamed pages (1), so the keep set
+// survives across prompt chunks without LRU thrashing, and below normal (5), so decode cold experts still win.
+inline int PrefillKeepMemoryPriority() noexcept {
+  static const int priority = ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFILL_KEEP_MEMPRIO", 3);
+  return (priority >= 1 && priority <= 5) ? priority : 0;
+}
+
 class ScopedPrefillMemoryPriority final {
  public:
-  ScopedPrefillMemoryPriority() noexcept {
+  // `priority` 1..5 sets the calling thread's memory priority for the scope; 0 leaves it unchanged.
+  explicit ScopedPrefillMemoryPriority(int priority = PrefillMemoryPriority()) noexcept {
 #if defined(_WIN32)
-    const int priority = PrefillMemoryPriority();
-    if (priority == 0) return;
+    if (priority < 1 || priority > 5) return;
     if (GetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &orig_, sizeof(orig_)) == FALSE) return;
     MEMORY_PRIORITY_INFORMATION low{};
     low.MemoryPriority = static_cast<ULONG>(priority);
     active_ = SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &low, sizeof(low)) != FALSE;
+#else
+    ORT_UNUSED_PARAMETER(priority);
 #endif
   }
   ~ScopedPrefillMemoryPriority() {
@@ -354,10 +363,8 @@ class ScopedPrefillMemoryPriority final {
 #if defined(_WIN32)
 using MappedPrefetchRanges = InlinedVector<WIN32_MEMORY_RANGE_ENTRY, 64>;
 
-// Issues PrefetchVirtualMemory for file-mapped expert ranges on a helper thread, so the caller's work starts at once and
-// only waits for pages whose reads are still in flight. Each request carries the memory priority its pages are read at
-// (0 = normal). Requests are a best-effort hint: when the worker falls behind, the oldest queued request is dropped.
-// Provider teardown joins the worker (Shutdown) before the library unloads, like the doorbell service.
+// Issues PrefetchVirtualMemory for file-mapped expert ranges across a small helper-thread pool so multiple layers'
+// reads overlap at NVMe queue depth >= 3-4 while the caller's compute/staging starts immediately.
 class MappedPrefetchService final {
  public:
   static MappedPrefetchService& Instance() {
@@ -374,24 +381,31 @@ class MappedPrefetchService final {
       }
       state_->cv.notify_all();
     }
-    if (worker_.joinable()) {
-      worker_.detach();
+    for (auto& w : workers_) {
+      if (w.joinable()) {
+        w.detach();
+      }
     }
   }
 
   void Post(MappedPrefetchRanges&& ranges, int memory_priority) {
     if (ranges.empty()) return;
+    static const size_t num_workers = static_cast<size_t>(
+        std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFETCH_WORKERS", 1), 1, 8));
     std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
     if (!state_) {
       state_ = std::make_shared<State>();
     }
     std::lock_guard<std::mutex> lock(state_->mutex);
-    if (!worker_.joinable()) {
+    if (workers_.empty()) {
       state_->stop = false;
-      auto st = state_;
-      worker_ = std::thread([st] { Loop(st); });
+      workers_.reserve(num_workers);
+      for (size_t i = 0; i < num_workers; ++i) {
+        auto st = state_;
+        workers_.emplace_back([st] { Loop(st); });
+      }
     }
-    constexpr size_t kMaxQueued = 4;
+    constexpr size_t kMaxQueued = 8;
     if (state_->queue.size() >= kMaxQueued) state_->queue.pop_front();
     state_->queue.push_back(Request{std::move(ranges), memory_priority});
     state_->cv.notify_one();
@@ -399,7 +413,7 @@ class MappedPrefetchService final {
 
   void Shutdown() noexcept {
     std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
-    if (!worker_.joinable()) return;
+    if (workers_.empty()) return;
     if (state_) {
       {
         std::lock_guard<std::mutex> lock(state_->mutex);
@@ -407,7 +421,10 @@ class MappedPrefetchService final {
       }
       state_->cv.notify_all();
     }
-    worker_.join();
+    for (auto& w : workers_) {
+      if (w.joinable()) w.join();
+    }
+    workers_.clear();
     if (state_) {
       std::lock_guard<std::mutex> lock(state_->mutex);
       state_->queue.clear();
@@ -456,7 +473,7 @@ class MappedPrefetchService final {
 
   std::mutex lifecycle_mutex_;
   std::shared_ptr<State> state_;
-  std::thread worker_;
+  std::vector<std::thread> workers_;
 };
 #endif
 
@@ -2793,19 +2810,73 @@ std::mutex g_mapped_layers_mutex;
 std::map<std::pair<const void*, int64_t>, const QMoEOffload*> g_mapped_layers;
 }  // namespace
 
+const std::vector<uint8_t>& QMoEOffload::PrefillKeepSet() const {
+  std::call_once(prefill_keep_once_, [this] {
+#if defined(_WIN32)
+    if (!IsDirectMappedIntBank() || ranked_experts_.empty()) return;
+    // MiB across all offloaded layers; -1 (default) = half of pageable RAM after reserving 13 GiB for OS, process
+    // private working set, CUDA/WDDM state, and any host-pinned streamed QSA KV buffers (~8 GiB keep set on 30 GiB RAM,
+    // ~25 GiB on 64 GiB RAM), leaving >=512 MiB free standby RAM for async read-ahead and decode cold experts.
+    static const int64_t keep_mb = ParseEnvironmentVariableWithDefault<int64_t>("ORT_QMOE_WIN_PREFILL_KEEP_MB", -1);
+    uint64_t keep_bytes = keep_mb > 0 ? static_cast<uint64_t>(keep_mb) << 20 : 0;
+    if (keep_mb < 0) {
+      MEMORYSTATUSEX mem_stat{};
+      mem_stat.dwLength = sizeof(mem_stat);
+      if (GlobalMemoryStatusEx(&mem_stat)) {
+        constexpr uint64_t kSystemAndProcessHeadroom = 13ULL << 30;
+        uint64_t usable_phys = mem_stat.ullTotalPhys;
+        const uint64_t pinned_kv = session_controller_ ? session_controller_->StreamedHostKvBytes() : 0ULL;
+        if (usable_phys > pinned_kv) {
+          usable_phys -= pinned_kv;
+        } else {
+          usable_phys = 0;
+        }
+        keep_bytes = (usable_phys > kSystemAndProcessHeadroom) ? ((usable_phys - kSystemAndProcessHeadroom) / 2) : 0ULL;
+      }
+    }
+    const size_t layers = session_controller_ ? std::max<size_t>(1, session_controller_->NumOffloadNodes()) : 1;
+    const size_t expert_bytes =
+        resident_bank_bytes_[0] + resident_bank_bytes_[1] + resident_bank_bytes_[2] + resident_bank_bytes_[3];
+    if (keep_bytes == 0 || expert_bytes == 0) return;
+    const size_t keep_count = static_cast<size_t>(keep_bytes / layers / expert_bytes);
+    if (keep_count == 0) return;
+    prefill_keep_.assign(static_cast<size_t>(num_experts_), 0);
+    const size_t first = std::min(ranked_experts_.size(), static_cast<size_t>(std::max(0, base_resident_slots_)));
+    size_t kept = 0;
+    for (size_t i = first; i < ranked_experts_.size() && kept < keep_count; ++i) {
+      const int expert = ranked_experts_[i];
+      if (expert >= 0 && expert < num_experts_) {
+        prefill_keep_[static_cast<size_t>(expert)] = 1;
+        ++kept;
+      }
+    }
+    if (resident_log_) {
+      std::fprintf(stderr, "QMoEOffload prefill keep layer=%lld experts=%zu mib=%.1f\n",
+                   static_cast<long long>(layer_index_), kept, static_cast<double>(kept * expert_bytes) / (1 << 20));
+    }
+#endif
+  });
+  return prefill_keep_;
+}
+
 bool QMoEOffload::IsDirectMappedIntBank() const noexcept {
   return (int4_bank_mode_ || int2_bank_mode_ || (int3_bank_mode_ && !expert_blocks_)) &&
          !(host_cache_bytes_ > 0 && file_expert_store_.IsInitialized()) && !host_complement_mode_ &&
          nvfp4_fc1_w_ && nvfp4_fc2_w_ && nvfp4_fc1_s_ && nvfp4_fc2_s_;
 }
 
-bool QMoEOffload::PostMappedNonResidentPrefetch() const {
+bool QMoEOffload::PostMappedNonResidentPrefetch(uint64_t run_id) const {
 #if defined(_WIN32)
   if (!IsDirectMappedIntBank()) return false;
+  if (run_id != 0 && last_lookahead_run_id_.exchange(run_id, std::memory_order_relaxed) == run_id) {
+    return false;
+  }
   if (mapped_prefetched_once_.load(std::memory_order_relaxed)) {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof(ms);
-    if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys >= (4ULL << 30)) {
+    // Only skip subsequent chunk lookahead on >=48 GiB RAM hosts where all expert banks remain cached in RAM;
+    // on <=32 GiB RAM hosts, VirtualUnlock intentionally raises ullAvailPhys into standby while cold banks still fault.
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= (48ULL << 30) && ms.ullAvailPhys >= (4ULL << 30)) {
       return false;
     }
   }
@@ -2937,6 +3008,14 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info,
         kv_hot_cfg.has_value() && !kv_hot_cfg->empty() && *kv_hot_cfg != "0") {
       session_controller_->SetKvHotCacheStreaming(true);
     }
+    if (const auto kv_bytes_cfg = info.GetConfigOptions().GetConfigEntry("ep.cuda.dsa_streamed_host_kv_bytes");
+        kv_bytes_cfg.has_value() && !kv_bytes_cfg->empty()) {
+      char* end_ptr = nullptr;
+      const unsigned long long parsed_bytes = std::strtoull(kv_bytes_cfg->c_str(), &end_ptr, 10);
+      if (end_ptr == kv_bytes_cfg->data() + kv_bytes_cfg->size()) {
+        session_controller_->SetStreamedHostKvBytes(static_cast<uint64_t>(parsed_bytes));
+      }
+    }
     device_id_ = session_controller_->DeviceId();
     int cur_dev = -1;
     if (cudaGetDevice(&cur_dev) == cudaSuccess && cur_dev != device_id_) {
@@ -3044,7 +3123,7 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info)
                 "QMoEOffload requires CUDA graphs off; eager streaming cannot be captured.");
 #endif
   }
-  ORT_ENFORCE(sm_ >= 80, "QMoEOffload requires SM80 or later.");
+  ORT_ENFORCE(sm_ >= 80, "QMoEOffload requires CUDA SM80 or later.");
 
 #ifdef BUILD_CUDA_EP_AS_PLUGIN
   auto input_elem_type = info.GetKernelInfo().GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType();
@@ -3059,6 +3138,14 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info)
     if (const auto kv_hot_cfg = info.GetConfigOptions().GetConfigEntry("ep.cuda.dsa_kv_hot_cache_tokens");
         kv_hot_cfg.has_value() && !kv_hot_cfg->empty() && *kv_hot_cfg != "0") {
       session_controller_->SetKvHotCacheStreaming(true);
+    }
+    if (const auto kv_bytes_cfg = info.GetConfigOptions().GetConfigEntry("ep.cuda.dsa_streamed_host_kv_bytes");
+        kv_bytes_cfg.has_value() && !kv_bytes_cfg->empty()) {
+      char* end_ptr = nullptr;
+      const unsigned long long parsed_bytes = std::strtoull(kv_bytes_cfg->c_str(), &end_ptr, 10);
+      if (end_ptr == kv_bytes_cfg->data() + kv_bytes_cfg->size()) {
+        session_controller_->SetStreamedHostKvBytes(static_cast<uint64_t>(parsed_bytes));
+      }
     }
     device_id_ = session_controller_->DeviceId();
     int cur_dev = -1;
@@ -7587,7 +7674,7 @@ int QMoEOffload::RunColdExperts(CpuWork& work, int group_count, const ActT* host
         std::getenv("ORT_QMOE_WIN_DECODE_PREFETCH") == nullptr) {
       MEMORYSTATUSEX ms{};
       ms.dwLength = sizeof(ms);
-      if (GlobalMemoryStatusEx(&ms) && ms.ullAvailPhys >= (4ULL << 30)) {
+      if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys >= (48ULL << 30) && ms.ullAvailPhys >= (4ULL << 30)) {
         need_decode_prefetch = false;
       }
     }
@@ -9084,43 +9171,71 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
       if (!in_warmup && start == 0 && (int4_bank_mode_ || int2_bank_mode_ || (int3_bank_mode_ && !expert_blocks_)) &&
           !(host_cache_bytes_ > 0 && file_expert_store_.IsInitialized()) &&
           nvfp4_fc1_w_ && nvfp4_fc2_w_ && nvfp4_fc1_s_ && nvfp4_fc2_s_) {
-        static const bool enable_win_prefetch =
-            ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFETCH_MMAP", 0) == 1;
+        // 0 = off, 1 = async read on MappedPrefetchService (default), 2 = synchronous read on this thread.
+        static const int win_prefetch_mode =
+            ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFETCH_MMAP", 1);
         MEMORYSTATUSEX pf_mem_stat{};
         pf_mem_stat.dwLength = sizeof(pf_mem_stat);
         const bool has_free_phys =
             GlobalMemoryStatusEx(&pf_mem_stat) && pf_mem_stat.ullAvailPhys >= (512ULL << 20);
-        if (enable_win_prefetch && has_free_phys) {
-          const uint8_t* w1_b = static_cast<const uint8_t*>(nvfp4_fc1_w_->DataRaw());
-          const uint8_t* w2_b = static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw());
-          const uint8_t* s1_b = static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw());
-          const uint8_t* s2_b = static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw());
-          std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
-          ranges.reserve(static_cast<size_t>(num_experts_) * 4);
-          for (int exp_id = 0; exp_id < num_experts_; ++exp_id) {
-            if (!stream_skip.empty() ? (stream_skip[exp_id] == 0) : expert_routes[exp_id].empty()) continue;
-            ranges.push_back({const_cast<uint8_t*>(w1_b + static_cast<size_t>(exp_id) * resident_bank_bytes_[0]), resident_bank_bytes_[0]});
-            ranges.push_back({const_cast<uint8_t*>(w2_b + static_cast<size_t>(exp_id) * resident_bank_bytes_[1]), resident_bank_bytes_[1]});
-            ranges.push_back({const_cast<uint8_t*>(s1_b + static_cast<size_t>(exp_id) * resident_bank_bytes_[2]), resident_bank_bytes_[2]});
-            ranges.push_back({const_cast<uint8_t*>(s2_b + static_cast<size_t>(exp_id) * resident_bank_bytes_[3]), resident_bank_bytes_[3]});
+        const bool already_cached_high_ram =
+            mapped_prefetched_once_.load(std::memory_order_relaxed) &&
+            pf_mem_stat.ullTotalPhys >= (48ULL << 30) &&
+            pf_mem_stat.ullAvailPhys >= (4ULL << 30) &&
+            std::getenv("ORT_QMOE_WIN_PREFETCH_MMAP") == nullptr;
+        if ((win_prefetch_mode == 1 || win_prefetch_mode == 2) && has_free_phys && !already_cached_high_ram) {
+          const uint8_t* bank_base[4] = {static_cast<const uint8_t*>(nvfp4_fc1_w_->DataRaw()),
+                                         static_cast<const uint8_t*>(nvfp4_fc2_w_->DataRaw()),
+                                         static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw()),
+                                         static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw())};
+          MappedPrefetchRanges ranges;
+          ranges.reserve(256);
+          auto is_routed_stream_expert = [&](int exp_id) noexcept {
+            return !stream_skip.empty() ? (stream_skip[exp_id] != 0) : !expert_routes[exp_id].empty();
+          };
+          for (int exp_id = 0; exp_id < num_experts_;) {
+            if (!is_routed_stream_expert(exp_id)) {
+              ++exp_id;
+              continue;
+            }
+            int end_exp = exp_id + 1;
+            while (end_exp < num_experts_ && is_routed_stream_expert(end_exp)) {
+              ++end_exp;
+            }
+            const size_t span_cnt = static_cast<size_t>(end_exp - exp_id);
+            for (int b = 0; b < 4; ++b) {
+              ranges.push_back({const_cast<uint8_t*>(bank_base[b] + static_cast<size_t>(exp_id) * resident_bank_bytes_[b]),
+                                span_cnt * resident_bank_bytes_[b]});
+            }
+            exp_id = end_exp;
           }
-          if (!ranges.empty()) {
+          if (!ranges.empty() && win_prefetch_mode == 1) {
+            MappedPrefetchService::Instance().Post(std::move(ranges), PrefillMemoryPriority());
+          } else if (!ranges.empty()) {
             ScopedPrefillMemoryPriority low_memory_priority;
             static_cast<void>(PrefetchVirtualMemory(GetCurrentProcess(), static_cast<ULONG_PTR>(ranges.size()), ranges.data(), 0));
           }
         }
       }
-      // Read the next layer's streamed experts while this layer prefills. Small prompts route to a fraction of the
-      // experts, so only large tiles, which route to nearly all of them, look ahead.
+      // Read upcoming layers' streamed experts while this layer prefills, overlapping multiple layers across the
+      // prefetch worker pool to drive higher NVMe queue depth while deduplicating per controller run_id.
       static const int lookahead_min_rows =
           ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFILL_LOOKAHEAD_MIN_ROWS", 1024);
-      if (start == 0 && lookahead_min_rows > 0 && tile_rows >= lookahead_min_rows && IsDirectMappedIntBank()) {
+      static const int lookahead_layers =
+          std::clamp(ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFILL_LOOKAHEAD_LAYERS", 1), 0, 8);
+      if (start == 0 && lookahead_min_rows > 0 && lookahead_layers > 0 &&
+          tile_rows >= lookahead_min_rows && IsDirectMappedIntBank()) {
         const void* scope = session_controller_.get();
+        const uint64_t cur_run_id = session_controller_ ? session_controller_->CurrentRunId() : 0;
         std::lock_guard<std::mutex> lock(g_mapped_layers_mutex);
         g_mapped_layers[{scope, layer_index_}] = this;
-        const auto next = g_mapped_layers.find({scope, layer_index_ + 1});
-        if (!in_warmup && next != g_mapped_layers.end()) {
-          static_cast<void>(next->second->PostMappedNonResidentPrefetch());
+        if (!in_warmup) {
+          for (int d = 1; d <= lookahead_layers; ++d) {
+            const auto next = g_mapped_layers.find({scope, layer_index_ + d});
+            if (next != g_mapped_layers.end()) {
+              static_cast<void>(next->second->PostMappedNonResidentPrefetch(cur_run_id));
+            }
+          }
         }
       }
 #endif
@@ -9339,24 +9454,60 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
             const uint8_t* fc1_s_base = static_cast<const uint8_t*>(nvfp4_fc1_s_->DataRaw());
             const uint8_t* fc2_s_base = static_cast<const uint8_t*>(nvfp4_fc2_s_->DataRaw());
             const size_t w1_bytes = resident_bank_bytes_[0];
-            const size_t w1_half = (w1_bytes / 2) & ~size_t{63};
             const size_t w2_bytes = resident_bank_bytes_[1];
             const size_t s1_bytes = resident_bank_bytes_[2];
             const size_t s2_bytes = resident_bank_bytes_[3];
+            static const bool release_staged_pages =
+                ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_WIN_PREFILL_RELEASE_WS", 1) == 1;
+            const std::vector<uint8_t>& keep_set = PrefillKeepSet();
+            // Slice w1 and w2 into 128 KiB dynamic work items so fast P-cores / cached pages steal work instead of
+            // spinning behind a single worker stalled on NVMe hard faults, and release working-set pages once per
+            // non-kept expert only after all slices of that expert complete.
+            constexpr size_t kSliceBytes = size_t{128} << 10;
+            const size_t w1_slices = std::max<size_t>(1, (w1_bytes + kSliceBytes - 1) / kSliceBytes);
+            const size_t w2_slices = std::max<size_t>(1, (w2_bytes + kSliceBytes - 1) / kSliceBytes);
+            const size_t weight_slices = w1_slices + w2_slices;
+            const size_t tasks_per_expert = weight_slices + 1;
+            std::atomic<int> stack_rem[64];
+            std::unique_ptr<std::atomic<int>[]> heap_rem;
+            std::atomic<int>* weight_rem = stack_rem;
+            if (count > 64) {
+              heap_rem = std::make_unique<std::atomic<int>[]>(static_cast<size_t>(count));
+              weight_rem = heap_rem.get();
+            }
+            for (int r = 0; r < count; ++r) {
+              weight_rem[r].store(static_cast<int>(weight_slices), std::memory_order_relaxed);
+            }
             auto stage_wave_fn = [&](ptrdiff_t task_idx) noexcept {
-              ScopedPrefillMemoryPriority low_memory_priority;
-              const int r = static_cast<int>(task_idx >> 2);
-              const int part = static_cast<int>(task_idx & 3);
+              const int r = static_cast<int>(static_cast<size_t>(task_idx) / tasks_per_expert);
+              const size_t sub = static_cast<size_t>(task_idx) % tasks_per_expert;
               const int exp_id = stream_list[first + r];
-              if (part == 0) {
-                std::memcpy(wave_w1_pinned + static_cast<size_t>(r) * w1_bytes,
-                            fc1_w_base + static_cast<size_t>(exp_id) * w1_bytes, w1_half);
-              } else if (part == 1) {
-                std::memcpy(wave_w1_pinned + static_cast<size_t>(r) * w1_bytes + w1_half,
-                            fc1_w_base + static_cast<size_t>(exp_id) * w1_bytes + w1_half, w1_bytes - w1_half);
-              } else if (part == 2) {
-                std::memcpy(wave_w2_pinned + static_cast<size_t>(r) * w2_bytes,
-                            fc2_w_base + static_cast<size_t>(exp_id) * w2_bytes, w2_bytes);
+              const bool keep = !keep_set.empty() && keep_set[static_cast<size_t>(exp_id)] != 0;
+              ScopedPrefillMemoryPriority low_memory_priority(keep ? PrefillKeepMemoryPriority() : PrefillMemoryPriority());
+              if (sub < weight_slices) {
+                if (sub < w1_slices) {
+                  const size_t off = sub * kSliceBytes;
+                  const size_t len = std::min(kSliceBytes, w1_bytes - off);
+                  std::memcpy(wave_w1_pinned + static_cast<size_t>(r) * w1_bytes + off,
+                              fc1_w_base + static_cast<size_t>(exp_id) * w1_bytes + off, len);
+                } else {
+                  const size_t off = (sub - w1_slices) * kSliceBytes;
+                  const size_t len = std::min(kSliceBytes, w2_bytes - off);
+                  std::memcpy(wave_w2_pinned + static_cast<size_t>(r) * w2_bytes + off,
+                              fc2_w_base + static_cast<size_t>(exp_id) * w2_bytes + off, len);
+                }
+                if (weight_rem[r].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+#if defined(_WIN32)
+                  if (release_staged_pages && !keep) {
+                    static_cast<void>(VirtualUnlock(
+                        const_cast<uint8_t*>(fc1_w_base + static_cast<size_t>(exp_id) * w1_bytes), w1_bytes));
+                    static_cast<void>(VirtualUnlock(
+                        const_cast<uint8_t*>(fc2_w_base + static_cast<size_t>(exp_id) * w2_bytes), w2_bytes));
+                  }
+#else
+                  ORT_UNUSED_PARAMETER(keep);
+#endif
+                }
               } else if (xpose_scales) {
                 CopyOrTransposeScaleBankToHost(
                     2, fc1_s_base + static_cast<size_t>(SafeInt<size_t>(exp_id) * s1_bytes),
@@ -9371,10 +9522,12 @@ Status QMoEOffload::ComputeShared(OpKernelContext* context) const {
                             fc2_s_base + static_cast<size_t>(exp_id) * s2_bytes, s2_bytes);
               }
             };
+            const ptrdiff_t total_wave_tasks =
+                static_cast<ptrdiff_t>(static_cast<size_t>(count) * tasks_per_expert);
             if (unified_cpu_service_ && cpu_threads_ > 0) {
-              SharedSpinPool(cpu_threads_).ParallelFor(static_cast<ptrdiff_t>(count) * 4, stage_wave_fn, 1);
+              SharedSpinPool(cpu_threads_).ParallelFor(total_wave_tasks, stage_wave_fn, 1);
             } else {
-              for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(count) * 4; ++t) stage_wave_fn(t);
+              for (ptrdiff_t t = 0; t < total_wave_tasks; ++t) stage_wave_fn(t);
             }
 #if defined(_WIN32)
             if (!mapped_evictable_expert_.empty()) {

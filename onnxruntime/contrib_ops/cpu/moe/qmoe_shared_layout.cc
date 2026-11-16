@@ -106,6 +106,13 @@ void Avx2BFloat16BitsToFloatRow(const uint16_t* src, float* dst, int64_t count);
 void Avx2FloatToBFloat16BitsRow(const float* src, uint16_t* dst, int64_t count);
 float Avx2RoundFp16Scalar(float v) noexcept;
 void Avx2RoundFp16InPlace(float* buf, int64_t count) noexcept;
+void Avx2ReorderInt4Row(const float* src, float* dst, int64_t k) noexcept;
+void Avx2ReorderInt2Row(const float* src, float* dst, int64_t k) noexcept;
+void Avx2SwiGluInterleavedPairs(const float* row_tmp, const uint16_t* bias_u16, bool bias_is_bf16,
+                                bool round_proj_before_bias, int64_t pair_count,
+                                float alpha, float beta, float limit,
+                                bool bf16_boundaries, bool fp16_boundaries,
+                                int out_order, float* dst) noexcept;
 }  // namespace detail
 #endif
 
@@ -2275,6 +2282,12 @@ void ReorderActivationRow(const float* src, float* dst, int64_t k) {
     return;
   }
 #endif
+#if QMOE_COMPILER_SUPPORTS_AVX2
+  if (CpuHasAvx2FmaF16c() && (k % 32) == 0) {
+    detail::Avx2ReorderInt4Row(src, dst, k);
+    return;
+  }
+#endif
   for (int64_t kb = 0; kb < k / kBlockSize; ++kb) {
     const float* s = src + kb * kBlockSize;
     float* d = dst + kb * kBlockSize;
@@ -2300,6 +2313,12 @@ void ReorderInt2ActivationRow(const float* src, float* dst, int64_t k) {
 #if QMOE_COMPILER_SUPPORTS_AVX512
   if (CpuHasAvx512() && (k % 64) == 0) {
     detail::Avx512ReorderInt2Row(src, dst, k);
+    return;
+  }
+#endif
+#if QMOE_COMPILER_SUPPORTS_AVX2
+  if (CpuHasAvx2FmaF16c() && (k % 64) == 0) {
+    detail::Avx2ReorderInt2Row(src, dst, k);
     return;
   }
 #endif
@@ -2569,12 +2588,32 @@ void Fc1SwiGluRange(const ExpertBlockLayout& layout, const uint8_t* block, const
   for (int64_t nb = n_begin; nb < n_end; nb += kChunk) {
     const int64_t ne = std::min(nb + kChunk, n_end);
     GemmRange(w, s, bias, n_total, layout.hidden, x_reordered, m, tmp, kChunk, nb, ne, force_scalar);
-    for (int64_t n = nb; n < ne; n += 2) {
-      const int64_t j = n / 2;
-      const int pos = ReorderedPosition(static_cast<int>(j % 32));
-      for (int64_t r = 0; r < m; ++r) {
-        const float gate_projection = tmp[r * kChunk + (n - nb)];
-        const float up_projection = tmp[r * kChunk + (n - nb) + 1];
+    for (int64_t r = 0; r < m; ++r) {
+      const float* row_tmp = tmp + r * kChunk;
+      float* row_out = inter_reordered + r * layout.inter;
+#if QMOE_COMPILER_SUPPORTS_AVX512
+      if (!force_scalar && CpuHasAvx512() && ((nb & 63) == 0) && (((ne - nb) & 63) == 0) &&
+          std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx512SwiGluInterleavedPairs(row_tmp, nullptr, false, fp16_boundaries, (ne - nb) / 2,
+                                             swiglu.alpha, swiglu.beta, swiglu.limit,
+                                             false, fp16_boundaries, 1, row_out + (nb / 2));
+        continue;
+      }
+#endif
+#if QMOE_COMPILER_SUPPORTS_AVX2
+      if (!force_scalar && CpuHasAvx2FmaF16c() && ((nb & 63) == 0) && (((ne - nb) & 63) == 0) &&
+          std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx2SwiGluInterleavedPairs(row_tmp, nullptr, false, fp16_boundaries, (ne - nb) / 2,
+                                           swiglu.alpha, swiglu.beta, swiglu.limit,
+                                           false, fp16_boundaries, 1, row_out + (nb / 2));
+        continue;
+      }
+#endif
+      for (int64_t n = nb; n < ne; n += 2) {
+        const int64_t j = n / 2;
+        const int pos = ReorderedPosition(static_cast<int>(j % 32));
+        const float gate_projection = row_tmp[n - nb];
+        const float up_projection = row_tmp[(n - nb) + 1];
         float gate = fp16_boundaries ? BoundaryFloat16::Round(gate_projection) : gate_projection;
         float value = fp16_boundaries ? BoundaryFloat16::Round(up_projection) : up_projection;
         if (std::isfinite(swiglu.limit)) {
@@ -2582,7 +2621,7 @@ void Fc1SwiGluRange(const ExpertBlockLayout& layout, const uint8_t* block, const
           value = std::clamp(value, -swiglu.limit, swiglu.limit);
         }
         const float act = gate / (1.0f + std::exp(-swiglu.alpha * gate)) * (value + swiglu.beta);
-        inter_reordered[r * layout.inter + (j / 32) * 32 + pos] = fp16_boundaries ? BoundaryFloat16::Round(act) : act;
+        row_out[(j / 32) * 32 + pos] = fp16_boundaries ? BoundaryFloat16::Round(act) : act;
       }
     }
   }
@@ -2670,6 +2709,15 @@ void Int4Fc1SwiGluRange(int64_t hidden, int64_t inter, const Int4ExpertView& vie
         detail::Avx512SwiGluInterleavedPairs(row_tmp, nullptr, false, false, (ne - nb) / 2,
                                              swiglu.alpha, swiglu.beta, swiglu.limit,
                                              bf16_boundaries, fp16_boundaries, 1, row_out + (nb / 2));
+        continue;
+      }
+#endif
+#if QMOE_COMPILER_SUPPORTS_AVX2
+      if (!force_scalar && CpuHasAvx2FmaF16c() && view.weights_are_prepacked && ((nb & 63) == 0) &&
+          (((ne - nb) & 63) == 0) && std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx2SwiGluInterleavedPairs(row_tmp, nullptr, false, false, (ne - nb) / 2,
+                                           swiglu.alpha, swiglu.beta, swiglu.limit,
+                                           bf16_boundaries, fp16_boundaries, 1, row_out + (nb / 2));
         continue;
       }
 #endif
@@ -2804,6 +2852,15 @@ void Int3Fc1SwiGluRange(int64_t hidden, int64_t inter, const Int3ExpertView& vie
         detail::Avx512SwiGluInterleavedPairs(row_tmp, nullptr, false, false, (ne - nb) / 2,
                                              swiglu.alpha, swiglu.beta, swiglu.limit,
                                              bf16_boundaries, fp16_boundaries, 0, row_out + (nb / 2));
+        continue;
+      }
+#endif
+#if QMOE_COMPILER_SUPPORTS_AVX2
+      if (!force_scalar && CpuHasAvx2FmaF16c() && ((nb & 15) == 0) && (((ne - nb) & 15) == 0) &&
+          std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx2SwiGluInterleavedPairs(row_tmp, nullptr, false, false, (ne - nb) / 2,
+                                           swiglu.alpha, swiglu.beta, swiglu.limit,
+                                           bf16_boundaries, fp16_boundaries, 0, row_out + (nb / 2));
         continue;
       }
 #endif
@@ -2986,6 +3043,17 @@ bool Int2Fc1SwiGluRange(int64_t hidden, int64_t inter, const Int2ExpertView& vie
                                              view.bias_is_bf16, true, (ne - nb) / 2,
                                              swiglu.alpha, swiglu.beta, swiglu.limit,
                                              bf16_boundaries, fp16_boundaries, 2, row_out + (nb / 2));
+        continue;
+      }
+#endif
+#if QMOE_COMPILER_SUPPORTS_AVX2
+      if (!force_scalar && CpuHasAvx2FmaF16c() && view.weights_are_prepacked && !view.bias_is_fp32 &&
+          ((nb & 127) == 0) && (((ne - nb) & 127) == 0) &&
+          std::isfinite(swiglu.alpha) && std::isfinite(swiglu.beta)) {
+        detail::Avx2SwiGluInterleavedPairs(row_tmp, view.fc1_bias ? (view.fc1_bias + nb) : nullptr,
+                                           view.bias_is_bf16, true, (ne - nb) / 2,
+                                           swiglu.alpha, swiglu.beta, swiglu.limit,
+                                           bf16_boundaries, fp16_boundaries, 2, row_out + (nb / 2));
         continue;
       }
 #endif
@@ -3214,56 +3282,56 @@ void SetFp4Group8MaskForTesting(int mask) noexcept {
 using namespace onnxruntime::contrib::qmoe_shared;
 
 extern "C" {
-int qmoe_shared_expert_forward(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
-                               int64_t m, float* out, float alpha, float beta, float limit,
-                               int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_shared_expert_forward(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
+                                                  int64_t m, float* out, float alpha, float beta, float limit,
+                                                  int force_scalar) {
   ExpertBlockLayout layout;
   if (!MakeExpertBlockLayout(hidden, inter, &layout)) return 0;
   SwiGluParams p{alpha, beta, limit};
   return ExpertForward(layout, block, x, m, p, out, force_scalar != 0) ? 1 : 0;
 }
 
-int qmoe_shared_expert_contribution(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
-                                    int64_t m, float* out, float alpha, float beta, float limit,
-                                    int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_shared_expert_contribution(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
+                                                       int64_t m, float* out, float alpha, float beta, float limit,
+                                                       int force_scalar) {
   ExpertBlockLayout layout;
   if (!MakeExpertBlockLayout(hidden, inter, &layout)) return 0;
   SwiGluParams params{alpha, beta, limit};
   return ExpertForward(layout, block, x, m, params, out, force_scalar != 0, false) ? 1 : 0;
 }
 
-int qmoe_shared_expert_contribution_fp16(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
-                                         int64_t m, float* out, float alpha, float beta, float limit,
-                                         int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_shared_expert_contribution_fp16(const uint8_t* block, int64_t hidden, int64_t inter, const float* x,
+                                                            int64_t m, float* out, float alpha, float beta, float limit,
+                                                            int force_scalar) {
   ExpertBlockLayout layout;
   if (!MakeExpertBlockLayout(hidden, inter, &layout)) return 0;
   SwiGluParams params{alpha, beta, limit};
   return ExpertForward(layout, block, x, m, params, out, force_scalar != 0, false, true) ? 1 : 0;
 }
 
-int64_t qmoe_shared_block_bytes(int64_t hidden, int64_t inter) {
+QMOE_SHARED_EXPORT int64_t qmoe_shared_block_bytes(int64_t hidden, int64_t inter) {
   ExpertBlockLayout layout;
   return MakeExpertBlockLayout(hidden, inter, &layout) ? static_cast<int64_t>(layout.stride) : -1;
 }
 
-int qmoe_shared_cpu_has_avx512(void) { return CpuHasAvx512() ? 1 : 0; }
-int qmoe_shared_cpu_has_avx2(void) { return CpuHasAvx2FmaF16c() ? 1 : 0; }
-void qmoe_shared_set_disable_avx512_for_testing(int disable) { SetDisableAvx512ForTesting(disable != 0); }
+QMOE_SHARED_EXPORT int qmoe_shared_cpu_has_avx512(void) { return CpuHasAvx512() ? 1 : 0; }
+QMOE_SHARED_EXPORT int qmoe_shared_cpu_has_avx2(void) { return CpuHasAvx2FmaF16c() ? 1 : 0; }
+QMOE_SHARED_EXPORT void qmoe_shared_set_disable_avx512_for_testing(int disable) { SetDisableAvx512ForTesting(disable != 0); }
 
-int qmoe_shared_accepts_prepack_contract(int64_t weights_prepacked, int64_t block_size) {
+QMOE_SHARED_EXPORT int qmoe_shared_accepts_prepack_contract(int64_t weights_prepacked, int64_t block_size) {
   return IsAcceptedPrepackContract(weights_prepacked, block_size) ? 1 : 0;
 }
 
-int qmoe_shared_weight_code_at(const uint8_t* weights, int64_t n_total, int64_t k_total, int64_t n,
-                               int64_t k) {
+QMOE_SHARED_EXPORT int qmoe_shared_weight_code_at(const uint8_t* weights, int64_t n_total, int64_t k_total, int64_t n,
+                                                  int64_t k) {
   return WeightCodeAt(weights, n_total, k_total, n, k);
 }
 
-int qmoe_int4_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
-                                  const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
-                                  int64_t hidden, int64_t inter, const float* x, int64_t m,
-                                  float* out, float alpha, float beta, float limit,
-                                  int weights_prepacked, int is_bf16, int apply_fc2_bias, int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_int4_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
+                                                     const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
+                                                     int64_t hidden, int64_t inter, const float* x, int64_t m,
+                                                     float* out, float alpha, float beta, float limit,
+                                                     int weights_prepacked, int is_bf16, int apply_fc2_bias, int force_scalar) {
   Int4ExpertView view{};
   view.fc1_weights = fc1_w;
   view.fc1_scales = fc1_s;
@@ -3283,12 +3351,12 @@ int qmoe_int4_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, c
              : 0;
 }
 
-int qmoe_int3_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
-                                  const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
-                                  int64_t hidden, int64_t inter, int64_t block_size,
-                                  const float* x, int64_t m, float* out,
-                                  float alpha, float beta, float limit,
-                                  int is_bf16, int apply_fc2_bias, int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_int3_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
+                                                     const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
+                                                     int64_t hidden, int64_t inter, int64_t block_size,
+                                                     const float* x, int64_t m, float* out,
+                                                     float alpha, float beta, float limit,
+                                                     int is_bf16, int apply_fc2_bias, int force_scalar) {
   Int3ExpertView view{};
   view.fc1_weights = fc1_w;
   view.fc1_scales = fc1_s;
@@ -3307,18 +3375,44 @@ int qmoe_int3_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, c
              : 0;
 }
 
-int64_t qmoe_int3_block_bytes(int64_t hidden, int64_t inter, int64_t block_size) {
+QMOE_SHARED_EXPORT int qmoe_int2_expert_contribution(const uint8_t* fc1_w, const uint16_t* fc1_s, const uint16_t* fc1_b,
+                                                     const uint8_t* fc2_w, const uint16_t* fc2_s, const uint16_t* fc2_b,
+                                                     int64_t hidden, int64_t inter, int64_t block_size,
+                                                     const float* x, int64_t m, float* out,
+                                                     float alpha, float beta, float limit,
+                                                     int weights_prepacked, int is_bf16, int apply_fc2_bias, int force_scalar) {
+  Int2ExpertView view{};
+  view.fc1_weights = fc1_w;
+  view.fc1_scales = fc1_s;
+  view.fc1_bias = fc1_b;
+  view.fc2_weights = fc2_w;
+  view.fc2_scales = fc2_s;
+  view.fc2_bias = fc2_b;
+  view.block_size = block_size;
+  view.scales_are_block_major = false;
+  view.weights_are_prepacked = (weights_prepacked != 0);
+  view.scale_is_bf16 = (is_bf16 != 0);
+  view.bias_is_bf16 = (is_bf16 != 0);
+  SwiGluParams params{alpha, beta, limit};
+  return Int2ExpertForward(hidden, inter, view, x, m, params, out, force_scalar != 0,
+                           apply_fc2_bias != 0, /*bf16_boundaries=*/is_bf16 != 0,
+                           /*fp16_boundaries=*/is_bf16 == 0)
+             ? 1
+             : 0;
+}
+
+QMOE_SHARED_EXPORT int64_t qmoe_int3_block_bytes(int64_t hidden, int64_t inter, int64_t block_size) {
   Nvfp4ExpertBlockLayout layout;
   return MakeInt3ExpertBlockLayout(hidden, inter, block_size, &layout)
              ? static_cast<int64_t>(layout.stride)
              : -1;
 }
 
-int qmoe_nvfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
-                                        const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
-                                        int64_t hidden, int64_t inter, const float* x, int64_t m,
-                                        float* out, float alpha, float beta, float limit,
-                                        int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_nvfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
+                                                           const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
+                                                           int64_t hidden, int64_t inter, const float* x, int64_t m,
+                                                           float* out, float alpha, float beta, float limit,
+                                                           int force_scalar) {
   Nvfp4ExpertView view{};
   view.fc1_weights = fc1_w;
   view.fc1_scales = fc1_s;
@@ -3334,16 +3428,16 @@ int qmoe_nvfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1
              : 0;
 }
 
-int64_t qmoe_nvfp4_block_bytes(int64_t hidden, int64_t inter) {
+QMOE_SHARED_EXPORT int64_t qmoe_nvfp4_block_bytes(int64_t hidden, int64_t inter) {
   Nvfp4ExpertBlockLayout layout;
   return MakeNvfp4ExpertBlockLayout(hidden, inter, &layout) ? static_cast<int64_t>(layout.stride) : -1;
 }
 
-int qmoe_mxfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
-                                        const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
-                                        int64_t hidden, int64_t inter, const float* x, int64_t m,
-                                        float* out, float alpha, float beta, float limit,
-                                        int force_scalar) {
+QMOE_SHARED_EXPORT int qmoe_mxfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1_s, float fc1_g,
+                                                           const uint8_t* fc2_w, const uint8_t* fc2_s, float fc2_g,
+                                                           int64_t hidden, int64_t inter, const float* x, int64_t m,
+                                                           float* out, float alpha, float beta, float limit,
+                                                           int force_scalar) {
   Nvfp4ExpertView view{};
   view.fc1_weights = fc1_w;
   view.fc1_scales = fc1_s;
@@ -3360,24 +3454,24 @@ int qmoe_mxfp4_expert_contribution_bf16(const uint8_t* fc1_w, const uint8_t* fc1
              : 0;
 }
 
-int64_t qmoe_mxfp4_block_bytes(int64_t hidden, int64_t inter) {
+QMOE_SHARED_EXPORT int64_t qmoe_mxfp4_block_bytes(int64_t hidden, int64_t inter) {
   Nvfp4ExpertBlockLayout layout;
   return MakeMxfp4ExpertBlockLayout(hidden, inter, &layout) ? static_cast<int64_t>(layout.stride) : -1;
 }
 
-void qmoe_shared_half_bits_to_float_row(const uint16_t* src, float* dst, int64_t count, int force_scalar) {
+QMOE_SHARED_EXPORT void qmoe_shared_half_bits_to_float_row(const uint16_t* src, float* dst, int64_t count, int force_scalar) {
   HalfBitsToFloatRow(src, dst, count, force_scalar != 0);
 }
 
-int qmoe_shared_is_file_backed_mapping(const void* data, size_t bytes) {
+QMOE_SHARED_EXPORT int qmoe_shared_is_file_backed_mapping(const void* data, size_t bytes) {
   return IsFileBackedReadOnlyMapping(data, bytes) ? 1 : 0;
 }
 
-size_t qmoe_shared_evict_file_backed_pages(const void* data, size_t bytes) {
+QMOE_SHARED_EXPORT size_t qmoe_shared_evict_file_backed_pages(const void* data, size_t bytes) {
   return EvictFileBackedHostPages(data, bytes);
 }
 
-int qmoe_file_store_test_heap_eviction_safety(void) {
+QMOE_SHARED_EXPORT int qmoe_file_store_test_heap_eviction_safety(void) {
 #if !defined(_WIN32)
   const long page_raw = sysconf(_SC_PAGESIZE);
   const size_t page_size = (page_raw > 0) ? static_cast<size_t>(page_raw) : 4096u;
