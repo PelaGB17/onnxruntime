@@ -262,7 +262,7 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
     mul_program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
   }
   if (has_qlora_up) {
-    mul_program.AddInput({lora_t, ProgramTensorMetadataDependency::Type, 4});
+    mul_program.AddInput({lora_t, ProgramTensorMetadataDependency::Type, ProgramInput::Flatten, 4});
     mul_program.AddInput({lora_b, ProgramTensorMetadataDependency::Type, 16});
     mul_program.AddInput({lora_b_scales, ProgramTensorMetadataDependency::Type});
   }

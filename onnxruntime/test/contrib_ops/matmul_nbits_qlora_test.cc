@@ -416,8 +416,8 @@ TEST(MatMulNBitsQLoRA, Fp32NumericsWithoutSubgroups) {
 #endif
 }
 
-void RunFp32DP4AQuantization(int64_t m) {
-  SCOPED_TRACE(m);
+void RunFp32DP4AQuantization(int64_t m, bool rank2 = false) {
+  SCOPED_TRACE(MakeString("m=", m, " rank2=", rank2));
 #if defined(ORT_USE_EP_API_ADAPTERS)
   GTEST_SKIP() << "Hardware-specific specialization checks require direct adapter capability inspection.";
 #else
@@ -465,14 +465,16 @@ void RunFp32DP4AQuantization(int64_t m) {
   test.AddAttribute<int64_t>("K", k);
   test.AddAttribute<int64_t>("N", n);
   test.AddAttribute<int64_t>("accuracy_level", 4);
-  test.AddInput<float>("X", {batch, m, k}, x);
+  const auto x_dims = rank2 ? std::vector<int64_t>{rows, k} : std::vector<int64_t>{batch, m, k};
+  const auto y_dims = rank2 ? std::vector<int64_t>{rows, n} : std::vector<int64_t>{batch, m, n};
+  test.AddInput<float>("X", x_dims, x);
   test.AddInput<uint8_t>("W", {n, k / 32, 16}, std::vector<uint8_t>(n * k / 2, 0x99), true);
   test.AddInput<float>("S", {n, k / 32}, std::vector<float>(n * k / 32, 0.03125f), true);
   test.AddInput<uint8_t>("AQ", {32, k / 32, 32}, aq);
   test.AddInput<float>("AS", {32, k / 32}, as);
   test.AddInput<uint8_t>("BQ", {n, 1, 32}, bq);
   test.AddInput<float>("BS", {n, 1}, std::vector<float>(n, 1.0f));
-  test.AddOutput<float>("Y", {batch, m, n}, expected);
+  test.AddOutput<float>("Y", y_dims, expected);
   test.SetOutputAbsErr("Y", 0.00001f);
   test.SetOutputRelErr("Y", 0.00001f);
   std::vector<std::unique_ptr<IExecutionProvider>> eps;
@@ -484,6 +486,13 @@ TEST(MatMulNBitsQLoRA, DecodeJointDP4AQuantization) { RunFp32DP4AQuantization(1)
 
 TEST(MatMulNBitsQLoRA, SmallMPrefillDP4AQuantization) {
   RunFp32DP4AQuantization(2);
+}
+
+// The tiled DP4A up projection reshapes its other operands to a fixed rank,
+// so both X ranks must share one shader for the same cache key.
+TEST(MatMulNBitsQLoRA, TiledDP4APrefillRank2And3) {
+  RunFp32DP4AQuantization(4);
+  RunFp32DP4AQuantization(4, true);
 }
 
 TEST(MatMulNBitsQLoRA, NarrowKParallelReduction) {
