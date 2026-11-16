@@ -175,8 +175,12 @@ bool tryLaunchMoeGemvIntSymmetric(const T* input, const WeightType* weights, con
     if (disabled || env_disabled || has_block_zeros) {
       return false;
     }
+    const bool bf16_tc_eligible =
+        std::is_same_v<T, __nv_bfloat16> && weight_bits == 4 && group_size == 32 &&
+        tensor_core_min_rows > 0 && expanded_num_rows >= tensor_core_min_rows &&
+        n % 128 == 0 && k % 128 == 0;
     if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
-            sm, expanded_num_rows, n, k, weight_bits, group_size)) {
+            sm, expanded_num_rows, n, k, weight_bits, group_size, bf16_tc_eligible)) {
       return false;
     }
     onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int_symmetric<T, WeightType>(
@@ -269,7 +273,8 @@ bool tryLaunchMoeGemvIntSymmetricFusedFinalize(
 template <typename T, typename WeightType, typename ScaleBiasType>
 bool moeGemvInterleavedSwiGLUWillRun(const ScaleBiasType* weight_zeros, int64_t expanded_num_rows,
                                      int64_t inter_size, int64_t k, int sm, int group_size, bool disabled,
-                                     cutlass_kernels::ActivationParams activation_params) {
+                                     cutlass_kernels::ActivationParams activation_params,
+                                     int tensor_core_min_rows = 33) {
   if constexpr ((std::is_same_v<WeightType, cutlass::uint4b_t> || std::is_same_v<WeightType, uint8_t>) &&
                 (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) && std::is_same_v<ScaleBiasType, T>) {
     const bool has_block_zeros = group_size > 0 && weight_zeros != nullptr;
@@ -284,8 +289,12 @@ bool moeGemvInterleavedSwiGLUWillRun(const ScaleBiasType* weight_zeros, int64_t 
       return false;
     }
     constexpr int weight_bits = MoeGemvWeightBits<WeightType>();
+    const bool bf16_tc_eligible =
+        std::is_same_v<T, __nv_bfloat16> && weight_bits == 4 && group_size == 32 &&
+        tensor_core_min_rows > 0 && expanded_num_rows >= tensor_core_min_rows &&
+        (inter_size * 2) % 64 == 0 && k % 512 == 0;
     return onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, inter_size * 2, k,
-                                                                      weight_bits, group_size);
+                                                                      weight_bits, group_size, bf16_tc_eligible);
   } else {
     (void)weight_zeros;
     (void)expanded_num_rows;
@@ -295,6 +304,7 @@ bool moeGemvInterleavedSwiGLUWillRun(const ScaleBiasType* weight_zeros, int64_t 
     (void)group_size;
     (void)disabled;
     (void)activation_params;
+    (void)tensor_core_min_rows;
     return false;
   }
 }
@@ -310,7 +320,8 @@ bool tryLaunchMoeGemvIntSymmetricInterleavedSwiGLU(
   if constexpr ((std::is_same_v<WeightType, cutlass::uint4b_t> || std::is_same_v<WeightType, uint8_t>) &&
                 (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) && std::is_same_v<ScaleBiasType, T>) {
     if (!moeGemvInterleavedSwiGLUWillRun<T, WeightType, ScaleBiasType>(
-            weight_zeros, expanded_num_rows, inter_size, k, sm, group_size, disabled, activation_params)) {
+            weight_zeros, expanded_num_rows, inter_size, k, sm, group_size, disabled, activation_params,
+            tensor_core_min_rows)) {
       return false;
     }
     onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int_symmetric_interleaved_swiglu<T, WeightType>(
@@ -3097,7 +3108,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
             /*disabled=*/
             MoeGemvFc1Disabled(parallelism_config.ep_size, use_ampere_activation_fusion,
                                /*bias_is_broadcast=*/true, expanded_num_rows, inter_size),
-            activation_params);
+            activation_params, quant_params.tensor_core_min_rows);
     const bool skip_expand_input_rows =
         !MoeGemvSkipExpandDisabledByEnv() && expand_is_pure_permutation && fc1_gemv_will_run;
 

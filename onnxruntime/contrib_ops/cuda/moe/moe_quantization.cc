@@ -1987,12 +1987,16 @@ Status QMoE::ComputeInternal(OpKernelContext* context) const {
   const void* packed_int_fc1 = preloaded_int2_or_mixed ? fc1_experts_weights->DataRaw() : packed_fc1_weights_.get();
   const void* packed_int_fc2 = preloaded_int2_or_mixed ? fc2_experts_weights->DataRaw() : packed_fc2_weights_.get();
   const int64_t packed_int_expanded = moe_params.num_rows * static_cast<int64_t>(k_);
+  const bool packed_int_tc_eligible =
+      !is_fp16_ && moe_tc_min_rows_ > 0 && packed_int_expanded >= moe_tc_min_rows_ &&
+      (fc1_expert_weight_bits_ != 4 || moe_params.hidden_size % 512 == 0) &&
+      (fc2_expert_weight_bits_ != 4 || (moe_params.hidden_size % 128 == 0 && moe_params.inter_size % 128 == 0));
   const bool packed_int_fc1_shape_supported = onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
       sm_, packed_int_expanded, moe_params.inter_size * 2, moe_params.hidden_size,
-      static_cast<int>(fc1_expert_weight_bits_), static_cast<int>(block_size_));
+      static_cast<int>(fc1_expert_weight_bits_), static_cast<int>(block_size_), packed_int_tc_eligible);
   const bool packed_int_fc2_shape_supported = onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(
       sm_, packed_int_expanded, moe_params.hidden_size, moe_params.inter_size,
-      static_cast<int>(fc2_expert_weight_bits_), static_cast<int>(block_size_));
+      static_cast<int>(fc2_expert_weight_bits_), static_cast<int>(block_size_), packed_int_tc_eligible);
   const bool packed_int_routing_supported =
       moe_params.num_rows <= 256 && moe_params.num_experts <= 512 &&
       (k_ == 1 || k_ == 2 || k_ == 4 || k_ == 6 || k_ == 8 || k_ == 10);
@@ -4245,8 +4249,15 @@ Status QMoE::ComputeInt3(OpKernelContext* context) const {
   if (rows == 0) return Status::OK();
   const size_t element_size = input->DataType()->Size();
 
-  static const int int3_prefill_min_rows =
-      onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_INT3_PREFILL_MIN_ROWS", 16);
+  static const int env_int3_prefill_min_rows =
+      onnxruntime::ParseEnvironmentVariableWithDefault<int>("ORT_INT3_PREFILL_MIN_ROWS", -1);
+  constexpr size_t kPrepackedInt3MaxCoalescedRoutes = 640;
+  const int int3_prefill_min_rows =
+      env_int3_prefill_min_rows >= 0
+          ? env_int3_prefill_min_rows
+          : (use_prepacked_int3
+                 ? static_cast<int>(kPrepackedInt3MaxCoalescedRoutes / std::max<size_t>(1, static_cast<size_t>(k_)) + 1)
+                 : 16);
   namespace ck = onnxruntime::llm::kernels::cutlass_kernels;
   // The Tensor Core path reads packed weights as 8/4/16-byte words (2/3/4 bits) and the activations and biases as
   // 16-byte vectors. Externally bound tensors can start at any element boundary of a larger allocation, so
@@ -4388,7 +4399,8 @@ Status QMoE::ComputeInt3(OpKernelContext* context) const {
   size_t tile_rows = std::min<size_t>(rows, (budget - grouped_header_bytes) / per_row_bytes);
   if (row_tile_size_ > 0) tile_rows = std::min<size_t>(tile_rows, row_tile_size_);
   if (use_prepacked_int3) {
-    tile_rows = std::min<size_t>(tile_rows, std::max<size_t>(1, 256 / static_cast<size_t>(k_)));
+    tile_rows = std::min<size_t>(tile_rows,
+                                 std::max<size_t>(1, kPrepackedInt3MaxCoalescedRoutes / static_cast<size_t>(k_)));
   }
   tile_rows = std::min<size_t>(tile_rows, std::numeric_limits<int>::max() / std::max<int64_t>(hidden, SafeInt<int64_t>(k_) * intermediate));
   ORT_RETURN_IF_NOT(tile_rows > 0, "INT3 QMoE dimensions exceed launch limits.");

@@ -1141,7 +1141,8 @@ void LogInt2TensorCoreLaunch(bool swiglu, int64_t rows, int min_rows) {
 // the n-tiling requirement: the plain GEMVs use kCtaN, the fused-finalize kernel uses the smaller
 // kFusedFinalizeCtaN and therefore accepts n values the plain kernels reject.
 bool is_moe_gemv_shape_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
-                                 int weight_bits, int group_size, int cta_n) {
+                                 int weight_bits, int group_size, int cta_n,
+                                 bool bf16_tensor_core_eligible = false) {
   if (sm < 80) {
     return false;
   }
@@ -1156,7 +1157,13 @@ bool is_moe_gemv_shape_supported(int sm, int64_t expanded_num_rows, int64_t n, i
   if (group_size > 0 && k % group_size != 0) {
     return false;
   }
-  if (expanded_num_rows <= 0 || expanded_num_rows > kMaxProfiledExpandedRows) {
+  const bool tc_blockwise_shape =
+      bf16_tensor_core_eligible &&
+      ((weight_bits == 2 && (group_size == 32 || group_size == 64 || group_size == 128) &&
+        n % 64 == 0 && k % 64 == 0) ||
+       (weight_bits == 4 && group_size == 32 && n % 64 == 0 && k % 128 == 0));
+  const int64_t max_expanded_rows = tc_blockwise_shape ? kMaxTensorCoreExpandedRows : kMaxProfiledExpandedRows;
+  if (expanded_num_rows <= 0 || expanded_num_rows > max_expanded_rows) {
     return false;
   }
   if (n < kMinProfiledProblemDim || k < kMinProfiledProblemDim) {
@@ -1191,9 +1198,10 @@ bool is_moe_gemv_shape_supported(int sm, int64_t expanded_num_rows, int64_t n, i
 }  // namespace
 
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
-                           int weight_bits, int group_size) {
+                           int weight_bits, int group_size, bool bf16_tensor_core_eligible) {
   const int cta_n = weight_bits == 2 ? kCtaN / 2 : kCtaN;
-  return is_moe_gemv_shape_supported(sm, expanded_num_rows, n, k, weight_bits, group_size, cta_n);
+  return is_moe_gemv_shape_supported(sm, expanded_num_rows, n, k, weight_bits, group_size, cta_n,
+                                     bf16_tensor_core_eligible);
 }
 
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k) {

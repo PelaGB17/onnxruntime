@@ -600,7 +600,7 @@ inline bool TryLaunchInt4Bf16(bool swiglu, const __nv_bfloat16* act, const uint8
     } else {
       Launch<true, 4, 4>(p, expanded_num_rows, stream);
     }
-  } else if (UsesCompact80(p, expanded_num_rows)) {
+  } else if (UsesCompact80(p, expanded_num_rows) || (expert_first_token_offset != nullptr && (n % 128 == 0))) {
     Launch<false, 1, 2>(p, expanded_num_rows, stream);
   } else if (expert_first_token_offset == nullptr && ((k / kStepK) % 2 == 0) && (n % 64 == 0)) {
     Launch<false, 2, 2>(p, expanded_num_rows, stream);

@@ -19,6 +19,7 @@ namespace kernels {
 namespace moe_gemv {
 
 inline constexpr int64_t kMaxProfiledExpandedRows = 80;
+inline constexpr int64_t kMaxTensorCoreExpandedRows = 640;
 inline constexpr int64_t kMaxProfiledExpandedRowsForSmallProblemDim = 4;
 inline constexpr int64_t kMinProfiledProblemDim = 512;
 // Lowered from 704 to 512 so block-wise decode shapes (e.g. Qwen top_k=8,
@@ -30,7 +31,7 @@ inline constexpr int64_t kMinProfiledProblemDimForExpandedRowsAbove4 = 512;
 // Requirements: FP16/BF16 activations, sm >= 80, small expanded_num_rows, supported
 // INT weight type, supported group size, and n divisible by the kernel tile width.
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
-                           int weight_bits, int group_size);
+                           int weight_bits, int group_size, bool bf16_tensor_core_eligible = false);
 
 // Backward-compatible per-channel INT4 shape check.
 bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k);

@@ -41,11 +41,12 @@ namespace contrib {
 namespace cuda {
 namespace int3_tc {
 
-constexpr int kMaxRoutes = 8;         // mma N
-constexpr int kMaxTotalRoutes = 256;  // route ids are packed into bytes
-constexpr int kBlockSize = 64;        // quantization block (codes per scale)
-constexpr int kStepK = 512;           // K consumed per super-step: 4 lanes x 128 codes
-constexpr int kKPartitions = 5;       // super-steps are summed in this many partial sums (s % kKPartitions)
+constexpr int kMaxRoutes = 8;                  // mma N
+constexpr int kMaxTotalRoutes = 256;           // raw-weight route ids are packed into bytes
+constexpr int kMaxCoalescedTotalRoutes = 640;  // prepacked coalesced route ids are packed into 16-bit halves
+constexpr int kBlockSize = 64;                 // quantization block (codes per scale)
+constexpr int kStepK = 512;                    // K consumed per super-step: 4 lanes x 128 codes
+constexpr int kKPartitions = 5;                // super-steps are summed in this many partial sums (s % kKPartitions)
 constexpr int kMaxSharedBytes = 48 * 1024;
 
 struct Params {
@@ -297,14 +298,19 @@ __global__ void __launch_bounds__(kWarps * 32, kMinCtas) Int3TcCoalescedKernel(c
     return;
   }
   int count = 0;
-  uint64_t members = 0;
+  uint64_t members_lo = 0;
+  uint64_t members_hi = 0;
 #pragma unroll
   for (int i = 0; i < kRouteChunks; ++i) {
     uint32_t bits = match[i] & (i < c0 ? 0u : (i == c0 ? (0xffffffffu << b0) : 0xffffffffu));
     while (bits != 0u && count < kMaxRoutes) {
       const int pos = (i << 5) + (__ffs(bits) - 1);
       bits &= bits - 1u;
-      members |= static_cast<uint64_t>(pos) << (8 * count);
+      if (count < 4) {
+        members_lo |= static_cast<uint64_t>(pos) << (16 * count);
+      } else {
+        members_hi |= static_cast<uint64_t>(pos) << (16 * (count - 4));
+      }
       ++count;
     }
   }
@@ -393,7 +399,7 @@ __global__ void __launch_bounds__(kWarps * 32, kMinCtas) Int3TcCoalescedKernel(c
     const int rs = threadIdx.x & 7;
     const __nv_bfloat16* src = nullptr;
     if (rs < count) {
-      const int route = static_cast<int>((members >> (8 * rs)) & 0xffu);
+      const int route = static_cast<int>(((rs < 4 ? members_lo : members_hi) >> (16 * (rs & 3))) & 0xffffu);
       const int row = kSwiglu ? route / p.top_k : route;
       src = static_cast<const __nv_bfloat16*>(p.input) + static_cast<int64_t>(row) * k;
     }
@@ -427,7 +433,7 @@ __global__ void __launch_bounds__(kWarps * 32, kMinCtas) Int3TcCoalescedKernel(c
       if (slot >= count) {
         continue;
       }
-      const int route = static_cast<int>((members >> (8 * slot)) & 0xffu);
+      const int route = static_cast<int>(((slot < 4 ? members_lo : members_hi) >> (16 * (slot & 3))) & 0xffffu);
       float even = h == 0 ? d.x : d.y;
       float odd = h == 0 ? d.z : d.w;
       if constexpr (kSwiglu) {
@@ -1295,8 +1301,14 @@ inline cudaError_t LaunchFc1(const Params& fc1, int hidden, int grid_x, bool tc_
       if (total_routes <= 96) {
         Int3TcCoalescedKernel<true, 4, 2, 4, 0, 3>
             <<<grid, 4 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
-      } else {
+      } else if (total_routes <= 256) {
         Int3TcCoalescedKernel<true, 4, 2, 4, 0, 8>
+            <<<grid, 4 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
+      } else if (total_routes <= 320) {
+        Int3TcCoalescedKernel<true, 4, 2, 4, 0, 10>
+            <<<grid, 4 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
+      } else {
+        Int3TcCoalescedKernel<true, 4, 2, 4, 0, 20>
             <<<grid, 4 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
       }
     } else {
@@ -1304,8 +1316,14 @@ inline cudaError_t LaunchFc1(const Params& fc1, int hidden, int grid_x, bool tc_
       if (total_routes <= 96) {
         Int3TcCoalescedKernel<true, 8, 2, 2, 0, 3>
             <<<grid, 8 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
-      } else {
+      } else if (total_routes <= 256) {
         Int3TcCoalescedKernel<true, 8, 2, 2, 0, 8>
+            <<<grid, 8 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
+      } else if (total_routes <= 320) {
+        Int3TcCoalescedKernel<true, 8, 2, 2, 0, 10>
+            <<<grid, 8 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
+      } else {
+        Int3TcCoalescedKernel<true, 8, 2, 2, 0, 20>
             <<<grid, 8 * 32, static_cast<size_t>(hidden) * 16, stream>>>(fc1);
       }
     }
@@ -1349,8 +1367,14 @@ inline cudaError_t LaunchFc2(const Params& fc2, int intermediate, int grid_x, bo
     } else if (total_routes <= 96) {
       Int3TcCoalescedKernel<false, 4, 1, 6, 1, 3>
           <<<grid, 4 * 32, static_cast<size_t>(intermediate) * 16, stream>>>(fc2);
-    } else {
+    } else if (total_routes <= 256) {
       Int3TcCoalescedKernel<false, 4, 1, 6, 1, 8>
+          <<<grid, 4 * 32, static_cast<size_t>(intermediate) * 16, stream>>>(fc2);
+    } else if (total_routes <= 320) {
+      Int3TcCoalescedKernel<false, 4, 1, 6, 1, 10>
+          <<<grid, 4 * 32, static_cast<size_t>(intermediate) * 16, stream>>>(fc2);
+    } else {
+      Int3TcCoalescedKernel<false, 4, 1, 6, 1, 20>
           <<<grid, 4 * 32, static_cast<size_t>(intermediate) * 16, stream>>>(fc2);
     }
   } else {
@@ -1385,8 +1409,9 @@ inline bool CanLaunchBf16(const Int3MoeParams& params) {
   // Prepacked weights exist only when the user did not set a route threshold above 1 (see the QMoE constructor), and
   // only these kernels read their layout, so they take the tensor-core path from the first route.
   const int min_routes = params.tc_prepacked ? 1 : params.tensor_core_min_routes;
+  const int max_routes = params.tc_prepacked ? kMaxCoalescedTotalRoutes : kMaxTotalRoutes;
   if (!params.is_bfloat16 || params.fc1.bits != 3 || params.fc2.bits != 3 || params.block_size != kBlockSize ||
-      params.router_weights != nullptr || total_routes < min_routes || total_routes > kMaxTotalRoutes ||
+      params.router_weights != nullptr || total_routes < min_routes || total_routes > max_routes ||
       params.hidden % kStepK != 0 || params.intermediate % 128 != 0 ||
       static_cast<int64_t>(params.hidden) * 16 > kMaxSharedBytes ||
       static_cast<int64_t>(params.intermediate) * 16 > kMaxSharedBytes ||
