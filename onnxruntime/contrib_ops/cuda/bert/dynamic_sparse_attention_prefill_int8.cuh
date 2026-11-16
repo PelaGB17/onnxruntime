@@ -189,7 +189,9 @@ __device__ __noinline__ void AttendRowFp32(const __nv_bfloat16* __restrict__ que
                                            __nv_bfloat16* __restrict__ output, float* __restrict__ partial_max,
                                            float* __restrict__ partial_sum, float* __restrict__ partial_output,
                                            int partial_block, int split_count, int warp, int lane,
-                                           bool query_fp16 = false) {
+                                           bool query_fp16 = false,
+                                           const int32_t* __restrict__ page_table = nullptr,
+                                           int main_capacity = 0) {
   float ks[8];
   float vs[8];
 #pragma unroll
@@ -210,10 +212,16 @@ __device__ __noinline__ void AttendRowFp32(const __nv_bfloat16* __restrict__ que
     float denominator = 0.0f;
     for (int i = begin; i < end; ++i) {
       const int index = row_indices[i];
-      if (index < 0 || index >= total || index > query_position) {
+      if (index < 0 || index >= total || index > query_position || (main_capacity > 0 && index >= main_capacity)) {
         continue;
       }
-      const int64_t offset = static_cast<int64_t>(index) * kHeadDim + lane;
+      int phys_index = index;
+      if (page_table != nullptr) {
+        const int sl = page_table[index >> 2];
+        if (sl < 0) continue;
+        phys_index = (sl << 2) | (index & 3);
+      }
+      const int64_t offset = static_cast<int64_t>(phys_index) * kHeadDim + lane;
       float dot = 0.0f;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
@@ -290,7 +298,9 @@ __global__ void __launch_bounds__(kThreads, 3) DynamicSparseAttentionInt8TcKerne
     float scale,
     const float* __restrict__ key_scale,
     const float* __restrict__ value_scale,
-    bool query_fp16 = false) {
+    bool query_fp16 = false,
+    const int32_t* __restrict__ page_table = nullptr,
+    int kv_stride_capacity = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   extern __shared__ __align__(16) unsigned char smem_raw[];
   constexpr int kKVStages = kTwoBufferSmem ? 1 : 2;
@@ -320,7 +330,8 @@ __global__ void __launch_bounds__(kThreads, 3) DynamicSparseAttentionInt8TcKerne
   const int total = valid_length ? static_cast<int>(total_length) : 0;
   const int count = valid_length ? max(0, min(selected_counts[row], max_selected)) : 0;
   const int32_t* row_indices = selected_indices + static_cast<int64_t>(row) * max_selected;
-  const int64_t kv_head_offset = (static_cast<int64_t>(batch) * kv_num_heads + kv_head) * capacity * kHeadDim;
+  const int stride_cap = kv_stride_capacity > 0 ? kv_stride_capacity : capacity;
+  const int64_t kv_head_offset = (static_cast<int64_t>(batch) * kv_num_heads + kv_head) * stride_cap * kHeadDim;
   const int8_t* key_base = key + kv_head_offset;
   const int8_t* value_base = value + kv_head_offset;
 
@@ -416,12 +427,12 @@ __global__ void __launch_bounds__(kThreads, 3) DynamicSparseAttentionInt8TcKerne
       AttendRowFp32<true>(query_group, key_base, value_base, kv_key_scale, kv_value_scale, row_indices,
                           tile_begin * kTile, min(count, (tile_begin + tiles) * kTile), total, query_position, scale,
                           group, nullptr, partial_max, partial_sum, partial_output, partial_block, split_count, warp,
-                          lane, query_fp16);
+                          lane, query_fp16, page_table, capacity);
     } else {
       AttendRowFp32<false>(query_group, key_base, value_base, kv_key_scale, kv_value_scale, row_indices, 0, count,
                            total, query_position, scale, group,
                            output + (static_cast<int64_t>(row) * num_heads + kv_head * group) * kHeadDim, nullptr,
-                           nullptr, nullptr, 0, 1, warp, lane, query_fp16);
+                           nullptr, nullptr, 0, 1, warp, lane, query_fp16, page_table, capacity);
     }
   };
   if (__syncthreads_or(needs_fp32)) {
@@ -445,7 +456,10 @@ __global__ void __launch_bounds__(kThreads, 3) DynamicSparseAttentionInt8TcKerne
   const bool check_tail_depth = __syncthreads_or(large_value_scale);
 
   auto resolve_index = [&](int raw) -> int {
-    return (raw >= 0 && raw < total && raw <= query_position && raw < capacity) ? raw : -1;
+    if (raw < 0 || raw >= total || raw > query_position || raw >= capacity) return -1;
+    if (page_table == nullptr) return raw;
+    const int sl = page_table[raw >> 2];
+    return sl >= 0 ? ((sl << 2) | (raw & 3)) : -1;
   };
 
   const int first_candidate = tile_begin * kTile;
@@ -870,6 +884,9 @@ __global__ void __launch_bounds__(kThreads, 3) DynamicSparseAttentionInt8TcKerne
   (void)scale;
   (void)key_scale;
   (void)value_scale;
+  (void)query_fp16;
+  (void)page_table;
+  (void)kv_stride_capacity;
 #endif
 }
 

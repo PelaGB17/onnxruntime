@@ -457,7 +457,9 @@ __global__ void __launch_bounds__(kThreads, 2) DynamicSparseAttentionFp16TcKerne
     int kv_num_heads,
     int capacity,
     int max_selected,
-    float scale) {
+    float scale,
+    const int32_t* __restrict__ page_table = nullptr,
+    int kv_stride_capacity = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   static_assert(kCandTile == 32 || kCandTile == 64, "kCandTile must be 32 or 64");
   constexpr int kCandPStride = kCandTile + 8;
@@ -491,7 +493,8 @@ __global__ void __launch_bounds__(kThreads, 2) DynamicSparseAttentionFp16TcKerne
   const int total = valid_length ? static_cast<int>(total_length) : 0;
   const int count = valid_length ? max(0, min(selected_counts[row], max_selected)) : 0;
   const int32_t* row_indices = selected_indices + static_cast<int64_t>(row) * max_selected;
-  const int64_t kv_head_offset = (static_cast<int64_t>(batch) * kv_num_heads + kv_head) * capacity * kHeadDim;
+  const int stride_cap = kv_stride_capacity > 0 ? kv_stride_capacity : capacity;
+  const int64_t kv_head_offset = (static_cast<int64_t>(batch) * kv_num_heads + kv_head) * stride_cap * kHeadDim;
   const __half* key_base = key + kv_head_offset;
   const __half* value_base = value + kv_head_offset;
 
@@ -534,7 +537,10 @@ __global__ void __launch_bounds__(kThreads, 2) DynamicSparseAttentionFp16TcKerne
   __syncthreads();
 
   auto resolve_index = [&](int raw) -> int {
-    return (raw >= 0 && raw < total && raw <= query_position && raw < capacity) ? raw : -1;
+    if (raw < 0 || raw >= total || raw > query_position || raw >= capacity) return -1;
+    if (page_table == nullptr) return raw;
+    const int sl = page_table[raw >> 2];
+    return sl >= 0 ? ((sl << 2) | (raw & 3)) : -1;
   };
 
   const int first_candidate = tile_begin * kCandTile;
@@ -888,6 +894,8 @@ __global__ void __launch_bounds__(kThreads, 2) DynamicSparseAttentionFp16TcKerne
   (void)capacity;
   (void)max_selected;
   (void)scale;
+  (void)page_table;
+  (void)kv_stride_capacity;
 #endif
 }
 

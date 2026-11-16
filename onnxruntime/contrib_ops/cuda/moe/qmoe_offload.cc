@@ -2933,6 +2933,10 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info,
 
   session_controller_ = GetQMoESessionController();
   if (session_controller_) {
+    if (const auto kv_hot_cfg = info.GetConfigOptions().GetConfigEntry("ep.cuda.dsa_kv_hot_cache_tokens");
+        kv_hot_cfg.has_value() && !kv_hot_cfg->empty() && *kv_hot_cfg != "0") {
+      session_controller_->SetKvHotCacheStreaming(true);
+    }
     device_id_ = session_controller_->DeviceId();
     int cur_dev = -1;
     if (cudaGetDevice(&cur_dev) == cudaSuccess && cur_dev != device_id_) {
@@ -3052,6 +3056,10 @@ QMoEOffload::QMoEOffload(const OpKernelInfo& info)
 
   session_controller_ = GetQMoESessionController();
   if (session_controller_) {
+    if (const auto kv_hot_cfg = info.GetConfigOptions().GetConfigEntry("ep.cuda.dsa_kv_hot_cache_tokens");
+        kv_hot_cfg.has_value() && !kv_hot_cfg->empty() && *kv_hot_cfg != "0") {
+      session_controller_->SetKvHotCacheStreaming(true);
+    }
     device_id_ = session_controller_->DeviceId();
     int cur_dev = -1;
     if (cudaGetDevice(&cur_dev) == cudaSuccess && cur_dev != device_id_) {

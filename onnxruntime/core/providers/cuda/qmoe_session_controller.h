@@ -723,6 +723,10 @@ class QMoESessionController {
     model_path_ = std::move(model_path);
   }
 
+  void SetKvHotCacheStreaming(bool enabled) noexcept {
+    kv_hot_cache_streaming_.store(enabled, std::memory_order_relaxed);
+  }
+
   std::filesystem::path GetModelPath() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return model_path_;
@@ -1311,7 +1315,9 @@ class QMoESessionController {
               (total_vram >= (28ULL << 30)) ? (is_moe_packed ? (512ULL << 20) : (1792ULL << 20)) : (1536ULL << 20);
           if (total_vram < (20ULL << 30)) {
             extra_wddm_reserve = 0ULL;
-          } else if (total_vram < (28ULL << 30) && (policy.reserve_device_bytes <= (5700ULL << 20) || is_moe_packed)) {
+          } else if (total_vram < (28ULL << 30) &&
+                     (policy.reserve_device_bytes <= (5700ULL << 20) || is_moe_packed ||
+                      kv_hot_cache_streaming_.load(std::memory_order_relaxed))) {
             extra_wddm_reserve = 256ULL << 20;
           }
           const uint64_t post_session_reserve =
@@ -1784,6 +1790,7 @@ class QMoESessionController {
   std::mutex pinned_pool_mutex_;
   std::shared_ptr<BoundedPinnedPool> pinned_pool_;
   std::filesystem::path model_path_;
+  std::atomic<bool> kv_hot_cache_streaming_{false};
   bool policy_initialized_ = false;
   bool session_plan_finalized_ = false;
   onnxruntime::moe_offload::MoeOffloadSessionPolicy policy_;

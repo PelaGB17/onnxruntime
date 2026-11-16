@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
+
 #include "core/providers/cuda/cuda_kernel.h"
 #include "contrib_ops/cuda/cuda_session_options.h"
 #include "contrib_ops/cpu/bert/dynamic_sparse_attention_helper.h"
@@ -11,10 +14,13 @@ namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
+struct DsaKvHotCacheState;
+
 template <typename T>
 class DynamicSparseAttention final : public onnxruntime::cuda::CudaKernel {
  public:
   explicit DynamicSparseAttention(const OpKernelInfo& info);
+  ~DynamicSparseAttention() override;
   Status ComputeInternal(OpKernelContext* context) const override;
 
  private:
@@ -34,8 +40,12 @@ class DynamicSparseAttention final : public onnxruntime::cuda::CudaKernel {
   bool prefill_int8_tc_;
   bool decode_int8_tc_;
   int decode_int8_tc_tiles_per_split_;
+  int kv_hot_cache_tokens_;
+  bool kv_stream_log_;
   DynamicSparseAttentionMode attention_mode_;
   DynamicSparseAttentionKvSource selected_kv_source_;
+  mutable std::mutex hot_cache_mutex_;
+  mutable std::unique_ptr<DsaKvHotCacheState> hot_cache_state_;
 };
 
 }  // namespace cuda

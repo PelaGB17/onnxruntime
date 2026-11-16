@@ -26,6 +26,46 @@ enum DynamicSparseAttentionValidationError : int32_t {
   kDynamicSparseAttentionInvalidCacheScale = 10,
 };
 
+inline constexpr int kDsaKvHotPageTokens = 4;
+inline constexpr int kDsaKvHotCtlInts = 16;
+
+// Fixed-address device residency map and hot block slots for a streamed QSA layer whose authoritative K/V lives in
+// device-mapped host memory. All pointers stay constant across runs so decode steps capture cleanly in CUDA graphs.
+struct DsaKvHotCacheMap {
+  void* hot_key = nullptr;          // [1, kv_num_heads, hot_capacity, head_size]
+  void* hot_value = nullptr;        // [1, kv_num_heads, hot_capacity, head_size]
+  int32_t* page_table = nullptr;    // [n_blocks] logical 4-token block -> physical slot in [0, n_slots), or -1
+  int32_t* slot_block = nullptr;    // [n_slots] physical slot -> logical block, or -1
+  int32_t* slot_stamp = nullptr;    // [n_slots] resolve epoch that last touched this slot
+  int32_t* slot_ref = nullptr;      // [n_slots] CLOCK second-chance reference bit
+  int32_t* miss_block = nullptr;    // [n_slots] scratch for missed logical blocks
+  int32_t* miss_slot = nullptr;     // [n_slots] scratch for assigned physical slots
+  int32_t* ctl = nullptr;           // [kDsaKvHotCtlInts] device control & 64-bit telemetry words
+  int32_t n_blocks = 0;             // (cache_capacity + 3) / 4
+  int32_t n_slots = 0;              // hot_capacity / 4
+  int32_t hot_capacity = 0;         // n_slots * 4
+};
+
+// Shared single-layer VRAM staging buffers used by eager prefill chunks when K/V lives in mapped host memory.
+struct DsaKvPrefillStage {
+  void* stage_key = nullptr;        // [1, kv_num_heads, cache_capacity, head_size]
+  void* stage_value = nullptr;      // [1, kv_num_heads, cache_capacity, head_size]
+  uint32_t* block_bitmap = nullptr; // [(n_blocks + 31) / 32] selected prefix blocks
+  int32_t* stage_list = nullptr;    // [n_blocks + 1]: [0] = count, [1..count] = block indices
+  int32_t n_blocks = 0;
+};
+
+struct DsaKvHotCacheCounters {
+  uint64_t h2d_miss_blocks = 0;
+  uint64_t block_lookups = 0;
+  uint64_t decode_calls = 0;
+  uint64_t prefill_staged_blocks = 0;
+  bool overflow = false;
+};
+
+Status ResetDsaKvHotCacheMap(cudaStream_t stream, const DsaKvHotCacheMap& map);
+DsaKvHotCacheCounters ReadDsaKvHotCacheCounters(const DsaKvHotCacheMap& map);
+
 template <typename T>
 struct DynamicSparseAttentionData {
   const T* query = nullptr;
@@ -60,6 +100,9 @@ struct DynamicSparseAttentionData {
   int decode_int8_tc_tiles_per_split = 0;
   const float* key_scale = nullptr;
   const float* value_scale = nullptr;
+  const DsaKvHotCacheMap* hot_cache = nullptr;
+  const DsaKvPrefillStage* prefill_stage = nullptr;
+  bool use_hot_cache_decode = false;
 };
 
 size_t GetDynamicSparseAttentionValidationWorkspaceSize(

@@ -14,6 +14,8 @@
 
 namespace onnxruntime::contrib::cuda {
 
+inline constexpr const char* kOrtSessionOptionsCudaDsaKvHotCacheTokens = "ep.cuda.dsa_kv_hot_cache_tokens";
+
 // An explicit configured value takes precedence over the environment.
 inline std::string ResolveCudaSessionOptionText(const std::optional<std::string>& configured, const char* env,
                                                 const std::string& default_text) {

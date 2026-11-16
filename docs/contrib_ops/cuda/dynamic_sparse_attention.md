@@ -302,3 +302,28 @@ listed under [Numerics and fallbacks](#numerics-and-fallbacks) the guards.
 
 The corresponding indexer switch results are in
 [../packed_sparse_attention_indexer.md](../packed_sparse_attention_indexer.md#benchmark).
+
+## Host-mapped KV streaming and on-GPU CLOCK hot cache
+
+Session option `ep.cuda.dsa_kv_hot_cache_tokens` (environment override `ORT_DSA_KV_HOT_CACHE_TOKENS`, default `0`) enables
+bit-exact sparse KV streaming when a layer's in-place `past_key` / `past_value` buffers reside in pinned, device-mapped
+host memory (`cudaHostAllocMapped`) and `cache_capacity > hot_cache_tokens` (`batch_size == 1`, `selected_kv_source == "main"`).
+Layers whose `past_key` buffer resides in device VRAM (`cudaMemoryTypeDevice`, queried once outside CUDA graph capture)
+automatically bypass the streaming path with zero memory or launch overhead, allowing hybrid per-layer placement.
+
+- **Decode (`sequence_length <= 8`, CUDA-graph capturable)**: Each streamed layer owns a fixed-address VRAM hot pool of
+  `n_slots` 4-token blocks (`n_slots >= 8 * (ceil(max_selected / 4) + 2)` when `max_selected >= 512`, i.e. `>= 4,112`
+  blocks = `16,448` tokens for `S = 8, max_selected = 2048` so an 8-row speculative verification step cannot overflow)
+  and a residency map (`page_table[block] -> slot` or `-1`). `DsaKvHotResolveKernel` marks newly appended blocks and all
+  selected candidate blocks, selects victims via a parallel CLOCK second-chance sweep without evicting current-epoch
+  slots, and self-resets in-graph when `dest_start == 0` or `dest_start <= prev_dest_start`. `DsaKvHotCopyKernel` streams
+  only missed blocks with pre-existing committed tokens (`4 * b < dest_start`) over PCIe into VRAM slots; `AppendKvKernel`
+  writes newly appended rows to both VRAM hot slots and the authoritative host cache; attention kernels translate
+  `raw_idx -> (page_table[raw_idx >> 2] << 2) | (raw_idx & 3)` and execute unchanged in VRAM.
+- **Prefill (`sequence_length > 8`, eager)**: A ref-counted per-device single-layer VRAM staging buffer
+  (`SharedDsaPrefillStagePool`) marks and compacts only prefix blocks referenced by `selected_indices` (plus any
+  unaligned `pos >> 2` boundary block), copies those blocks from mapped host memory, appends the chunk in VRAM, writes
+  the appended span out via coalesced 16-byte stores, runs the tensor-core prefill kernel in VRAM, and pre-warms the
+  layer's hot cache via VRAM-to-VRAM copy before decode begins.
+- **Telemetry**: Setting `ORT_DSA_KV_STREAM_LOG=1` (or `ORT_QMOE_SHARED_RESIDENT_LOG=1`) logs per-layer hot-cache lookups,
+  PCIe H2D block misses, hit rate, prefill staged blocks, and overflow status on session teardown.

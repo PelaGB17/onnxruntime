@@ -3,8 +3,11 @@
 
 #include "contrib_ops/cuda/bert/dynamic_sparse_attention.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <map>
 #include <string>
 #include <type_traits>
 
@@ -72,6 +75,253 @@ bool ParseBoolAttribute(const OpKernelInfo& info, const char* name, int64_t defa
 
 }  // namespace
 
+struct DsaKvHotCacheState {
+  int device_id = -1;
+  int allocated_blocks = 0;
+  int allocated_slots = 0;
+  size_t allocated_kv_bytes = 0;
+  const void* checked_present_ptr = nullptr;
+  bool is_host_backed_kv = false;
+  void* hot_key_buf = nullptr;
+  void* hot_val_buf = nullptr;
+  int32_t* meta_buf = nullptr;
+  DsaKvHotCacheMap map{};
+  bool registered_with_stage_pool = false;
+
+  void ReleaseBuffers() noexcept;
+  ~DsaKvHotCacheState();
+};
+
+namespace {
+
+struct DevicePrefillStageEntry {
+  std::mutex mu;
+  size_t active_users = 0;
+  size_t allocated_kv_bytes = 0;
+  int allocated_blocks = 0;
+  void* stage_key = nullptr;
+  void* stage_value = nullptr;
+  uint32_t* block_bitmap = nullptr;
+  int32_t* stage_list = nullptr;
+  cudaStream_t last_stream = nullptr;
+  cudaEvent_t ready_event = nullptr;
+
+  void FreeUnlocked(int dev_id) noexcept {
+    int prev = 0;
+    const bool restore = (cudaGetDevice(&prev) == cudaSuccess && prev != dev_id);
+    if (restore) static_cast<void>(cudaSetDevice(dev_id));
+    if (ready_event != nullptr) {
+      if (cudaEventDestroy(ready_event) != cudaSuccess) static_cast<void>(cudaGetLastError());
+      ready_event = nullptr;
+    }
+    auto safe_free = [](void*& p) {
+      if (p != nullptr) {
+        if (cudaFree(p) != cudaSuccess) static_cast<void>(cudaGetLastError());
+        p = nullptr;
+      }
+    };
+    safe_free(stage_key);
+    safe_free(stage_value);
+    void* bm = block_bitmap;
+    safe_free(bm);
+    block_bitmap = nullptr;
+    void* sl = stage_list;
+    safe_free(sl);
+    stage_list = nullptr;
+    allocated_kv_bytes = 0;
+    allocated_blocks = 0;
+    last_stream = nullptr;
+    if (restore) static_cast<void>(cudaSetDevice(prev));
+  }
+};
+
+class SharedDsaPrefillStagePool {
+ public:
+  static SharedDsaPrefillStagePool& Instance() {
+    static SharedDsaPrefillStagePool pool;
+    return pool;
+  }
+
+  DevicePrefillStageEntry& EntryForDevice(int dev_id) {
+    std::lock_guard<std::mutex> lock(map_mu_);
+    auto& ptr = entries_[dev_id];
+    if (!ptr) ptr = std::make_unique<DevicePrefillStageEntry>();
+    return *ptr;
+  }
+
+  void Retain(int dev_id) {
+    DevicePrefillStageEntry& entry = EntryForDevice(dev_id);
+    std::lock_guard<std::mutex> lock(entry.mu);
+    ++entry.active_users;
+  }
+
+  void Release(int dev_id) noexcept {
+    DevicePrefillStageEntry* entry_ptr = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(map_mu_);
+      auto it = entries_.find(dev_id);
+      if (it == entries_.end() || !it->second) return;
+      entry_ptr = it->second.get();
+    }
+    std::lock_guard<std::mutex> lock(entry_ptr->mu);
+    if (entry_ptr->active_users > 0 && --entry_ptr->active_users == 0) {
+      entry_ptr->FreeUnlocked(dev_id);
+    }
+  }
+
+  Status EnsureLocked(DevicePrefillStageEntry& entry, size_t kv_bytes, int n_blocks, cudaStream_t stream,
+                      DsaKvPrefillStage& out) {
+    if (entry.ready_event == nullptr) {
+      CUDA_RETURN_IF_ERROR(cudaEventCreateWithFlags(&entry.ready_event, cudaEventDisableTiming));
+    }
+    if (entry.last_stream != nullptr && entry.last_stream != stream) {
+      CUDA_RETURN_IF_ERROR(cudaStreamWaitEvent(stream, entry.ready_event, 0));
+    }
+    if (kv_bytes > entry.allocated_kv_bytes) {
+      if (entry.stage_key != nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaFree(entry.stage_key));
+        entry.stage_key = nullptr;
+      }
+      if (entry.stage_value != nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaFree(entry.stage_value));
+        entry.stage_value = nullptr;
+      }
+      CUDA_RETURN_IF_ERROR(cudaMalloc(&entry.stage_key, kv_bytes));
+      const cudaError_t v_err = cudaMalloc(&entry.stage_value, kv_bytes);
+      if (v_err != cudaSuccess) {
+        static_cast<void>(cudaFree(entry.stage_key));
+        entry.stage_key = nullptr;
+        return CUDA_CALL(v_err);
+      }
+      entry.allocated_kv_bytes = kv_bytes;
+    }
+    if (n_blocks > entry.allocated_blocks) {
+      if (entry.block_bitmap != nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaFree(entry.block_bitmap));
+        entry.block_bitmap = nullptr;
+      }
+      if (entry.stage_list != nullptr) {
+        CUDA_RETURN_IF_ERROR(cudaFree(entry.stage_list));
+        entry.stage_list = nullptr;
+      }
+      const size_t bitmap_words = static_cast<size_t>((n_blocks + 31) / 32);
+      CUDA_RETURN_IF_ERROR(cudaMalloc(&entry.block_bitmap, std::max<size_t>(1, bitmap_words) * sizeof(uint32_t)));
+      const cudaError_t sl_err = cudaMalloc(&entry.stage_list, static_cast<size_t>(n_blocks + 1) * sizeof(int32_t));
+      if (sl_err != cudaSuccess) {
+        static_cast<void>(cudaFree(entry.block_bitmap));
+        entry.block_bitmap = nullptr;
+        return CUDA_CALL(sl_err);
+      }
+      entry.allocated_blocks = n_blocks;
+    }
+    out.stage_key = entry.stage_key;
+    out.stage_value = entry.stage_value;
+    out.block_bitmap = entry.block_bitmap;
+    out.stage_list = entry.stage_list;
+    out.n_blocks = n_blocks;
+    return Status::OK();
+  }
+
+ private:
+  std::mutex map_mu_;
+  std::map<int, std::unique_ptr<DevicePrefillStageEntry>> entries_;
+};
+
+Status EnsureDsaHotCacheState(DsaKvHotCacheState& state, int dev_id, int n_blocks, int n_slots,
+                              size_t kv_elem_bytes, int kv_num_heads, int head_size, cudaStream_t stream) {
+  const int hot_capacity = n_slots * kDsaKvHotPageTokens;
+  const size_t hot_kv_bytes =
+      SafeInt<size_t>(kv_num_heads) * static_cast<size_t>(hot_capacity) * static_cast<size_t>(head_size) * kv_elem_bytes;
+  if (state.hot_key_buf != nullptr && state.allocated_blocks == n_blocks &&
+      state.allocated_slots == n_slots && state.allocated_kv_bytes == hot_kv_bytes) {
+    return Status::OK();
+  }
+
+  cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+  CUDA_RETURN_IF_ERROR(cudaStreamIsCapturing(stream, &cap_status));
+  ORT_RETURN_IF_NOT(cap_status == cudaStreamCaptureStatusNone,
+                    "DynamicSparseAttention: cannot allocate or resize KV hot cache during CUDA graph capture.");
+
+  if (!state.registered_with_stage_pool) {
+    state.device_id = dev_id;
+    SharedDsaPrefillStagePool::Instance().Retain(dev_id);
+    state.registered_with_stage_pool = true;
+  }
+  state.ReleaseBuffers();
+
+  const size_t meta_ints =
+      static_cast<size_t>(n_blocks) + static_cast<size_t>(n_slots) * 5 + static_cast<size_t>(kDsaKvHotCtlInts);
+  CUDA_RETURN_IF_ERROR(cudaMalloc(&state.hot_key_buf, hot_kv_bytes));
+  cudaError_t err = cudaMalloc(&state.hot_val_buf, hot_kv_bytes);
+  if (err != cudaSuccess) {
+    state.ReleaseBuffers();
+    return CUDA_CALL(err);
+  }
+  err = cudaMalloc(&state.meta_buf, meta_ints * sizeof(int32_t));
+  if (err != cudaSuccess) {
+    state.ReleaseBuffers();
+    return CUDA_CALL(err);
+  }
+
+  state.allocated_blocks = n_blocks;
+  state.allocated_slots = n_slots;
+  state.allocated_kv_bytes = hot_kv_bytes;
+
+  int32_t* cur = state.meta_buf;
+  state.map.hot_key = state.hot_key_buf;
+  state.map.hot_value = state.hot_val_buf;
+  state.map.page_table = cur;
+  cur += n_blocks;
+  state.map.slot_block = cur;
+  cur += n_slots;
+  state.map.slot_stamp = cur;
+  cur += n_slots;
+  state.map.slot_ref = cur;
+  cur += n_slots;
+  state.map.miss_block = cur;
+  cur += n_slots;
+  state.map.miss_slot = cur;
+  cur += n_slots;
+  state.map.ctl = cur;
+  state.map.n_blocks = n_blocks;
+  state.map.n_slots = n_slots;
+  state.map.hot_capacity = hot_capacity;
+
+  return ResetDsaKvHotCacheMap(stream, state.map);
+}
+
+}  // namespace
+
+void DsaKvHotCacheState::ReleaseBuffers() noexcept {
+  int prev = 0;
+  const bool restore = (device_id >= 0 && cudaGetDevice(&prev) == cudaSuccess && prev != device_id);
+  if (restore) static_cast<void>(cudaSetDevice(device_id));
+  auto safe_free = [](void*& p) {
+    if (p != nullptr) {
+      if (cudaFree(p) != cudaSuccess) static_cast<void>(cudaGetLastError());
+      p = nullptr;
+    }
+  };
+  safe_free(hot_key_buf);
+  safe_free(hot_val_buf);
+  void* m = meta_buf;
+  safe_free(m);
+  meta_buf = nullptr;
+  map = DsaKvHotCacheMap{};
+  allocated_blocks = 0;
+  allocated_slots = 0;
+  allocated_kv_bytes = 0;
+  if (restore) static_cast<void>(cudaSetDevice(prev));
+}
+
+DsaKvHotCacheState::~DsaKvHotCacheState() {
+  ReleaseBuffers();
+  if (registered_with_stage_pool && device_id >= 0) {
+    SharedDsaPrefillStagePool::Instance().Release(device_id);
+    registered_with_stage_pool = false;
+  }
+}
+
 template <typename T>
 DynamicSparseAttention<T>::DynamicSparseAttention(const OpKernelInfo& info)
     : CudaKernel(info) {
@@ -117,11 +367,41 @@ DynamicSparseAttention<T>::DynamicSparseAttention(const OpKernelInfo& info)
   decode_int8_tc_tiles_per_split_ =
       ReadCudaSessionOption(info, kOrtSessionOptionsCudaDsaDecodeInt8TcTilesPerSplit,
                             "ORT_DSA_DECODE_INT8_TC_TILES_PER_SPLIT", 0, 0, std::numeric_limits<int>::max());
+  kv_hot_cache_tokens_ =
+      ReadCudaSessionOption(info, kOrtSessionOptionsCudaDsaKvHotCacheTokens,
+                            "ORT_DSA_KV_HOT_CACHE_TOKENS", 0, 0, std::numeric_limits<int>::max());
+  kv_stream_log_ =
+      ParseEnvironmentVariableWithDefault<int>("ORT_DSA_KV_STREAM_LOG", 0) != 0 ||
+      ParseEnvironmentVariableWithDefault<int>("ORT_QMOE_SHARED_RESIDENT_LOG", 0) != 0;
   strict_validation_ = ParseEnvironmentVariableWithDefault<bool>(kStrictValidation, false);
   attention_mode_ = ParseAttentionMode(
       info.GetAttrOrDefault<std::string>("attention_mode", "selected_only"));
   selected_kv_source_ = ParseKvSource(
       info.GetAttrOrDefault<std::string>("selected_kv_source", "main"));
+}
+
+template <typename T>
+DynamicSparseAttention<T>::~DynamicSparseAttention() {
+  if (kv_stream_log_ && hot_cache_state_ && hot_cache_state_->map.ctl != nullptr) {
+    const DsaKvHotCacheCounters c = ReadDsaKvHotCacheCounters(hot_cache_state_->map);
+    if (c.decode_calls > 0 || c.prefill_staged_blocks > 0) {
+      const double hit_pct =
+          c.block_lookups > 0
+              ? (100.0 * static_cast<double>(c.block_lookups > c.h2d_miss_blocks ? c.block_lookups - c.h2d_miss_blocks : 0) /
+                 static_cast<double>(c.block_lookups))
+              : 100.0;
+      std::fprintf(stderr,
+                   "DSA_KV_STREAM hot_tokens=%d hot_slots=%d decode_calls=%llu block_lookups=%llu "
+                   "h2d_miss_blocks=%llu hit_pct=%.2f prefill_staged_blocks=%llu overflow=%d\n",
+                   hot_cache_state_->map.hot_capacity, hot_cache_state_->map.n_slots,
+                   static_cast<unsigned long long>(c.decode_calls),
+                   static_cast<unsigned long long>(c.block_lookups),
+                   static_cast<unsigned long long>(c.h2d_miss_blocks),
+                   hit_pct,
+                   static_cast<unsigned long long>(c.prefill_staged_blocks),
+                   c.overflow ? 1 : 0);
+    }
+  }
 }
 
 template <typename T>
@@ -312,8 +592,92 @@ Status DynamicSparseAttention<T>::ComputeInternal(OpKernelContext* context) cons
 
   const bool initialize_key_cache = data.past_key != data.present_key;
   const bool initialize_value_cache = data.past_value != data.present_value;
-  return LaunchDynamicSparseAttention<CudaT>(
+
+  // Streamed KV hot-cache / prefill-stage path when configured (`ep.cuda.dsa_kv_hot_cache_tokens` > 0) and
+  // `cache_capacity` exceeds the hot-cache window for single-batch main-KV attention.
+  DsaKvPrefillStage prefill_stage_desc{};
+  DevicePrefillStageEntry* locked_stage_entry = nullptr;
+  std::unique_lock<std::mutex> stage_lock;
+  if (kv_hot_cache_tokens_ > 0 &&
+      parameters.batch_size == 1 &&
+      parameters.selected_kv_source == DynamicSparseAttentionKvSource::kMain &&
+      !initialize_key_cache && !initialize_value_cache) {
+    const int n_blocks = (parameters.cache_capacity + kDsaKvHotPageTokens - 1) / kDsaKvHotPageTokens;
+    int n_slots = std::max(16, (kv_hot_cache_tokens_ + kDsaKvHotPageTokens - 1) / kDsaKvHotPageTokens);
+    // Enforce >= 8 * (max_selected / 4 + 2) slots (4,112 slots = 16,448 tokens for S=8, budget=2048) on full-scale
+    // QSA layers (`max_selected >= 512`) so 8-row speculative verification never overflows its hot cache.
+    if (parameters.max_selected >= 512) {
+      const int min_s8_slots = 8 * ((parameters.max_selected + kDsaKvHotPageTokens - 1) / kDsaKvHotPageTokens + 2);
+      n_slots = std::max(n_slots, min_s8_slots);
+    }
+    if (n_slots < n_blocks) {
+      int dev_id = 0;
+      CUDA_RETURN_IF_ERROR(cudaGetDevice(&dev_id));
+      bool use_streamed_layer = false;
+      {
+        std::lock_guard<std::mutex> hc_lock(hot_cache_mutex_);
+        if (!hot_cache_state_) hot_cache_state_ = std::make_unique<DsaKvHotCacheState>();
+        if (hot_cache_state_->checked_present_ptr != data.present_key) {
+          cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+          CUDA_RETURN_IF_ERROR(cudaStreamIsCapturing(stream, &cap_status));
+          if (cap_status == cudaStreamCaptureStatusNone) {
+            cudaPointerAttributes attr{};
+            const cudaError_t attr_err = cudaPointerGetAttributes(&attr, data.present_key);
+            if (attr_err != cudaSuccess) {
+              static_cast<void>(cudaGetLastError());
+              hot_cache_state_->is_host_backed_kv = false;
+            } else {
+              hot_cache_state_->is_host_backed_kv = (attr.type != cudaMemoryTypeDevice);
+            }
+            hot_cache_state_->checked_present_ptr = data.present_key;
+          }
+        }
+        if (hot_cache_state_->is_host_backed_kv) {
+          ORT_RETURN_IF_ERROR(EnsureDsaHotCacheState(
+              *hot_cache_state_, dev_id, n_blocks, n_slots, cache_element_bytes,
+              parameters.kv_num_heads, parameters.head_size, stream));
+          data.hot_cache = &hot_cache_state_->map;
+          use_streamed_layer = true;
+        }
+      }
+
+      if (use_streamed_layer) {
+        const int eff_local =
+            (parameters.attention_mode == DynamicSparseAttentionMode::kLocalPlusSelected && parameters.local_window_size > 0)
+                ? std::min(parameters.local_window_size, parameters.cache_capacity)
+                : 0;
+        const int single_row_blocks =
+            (std::min(parameters.max_selected, parameters.cache_capacity) + kDsaKvHotPageTokens - 1) / kDsaKvHotPageTokens +
+            (eff_local + kDsaKvHotPageTokens - 1) / kDsaKvHotPageTokens + 2;
+        const bool fits_decode_hot_cache =
+            parameters.sequence_length <= 8 &&
+            n_slots >= single_row_blocks + 2 * parameters.sequence_length;
+        if (fits_decode_hot_cache) {
+          data.use_hot_cache_decode = true;
+        } else {
+          cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+          CUDA_RETURN_IF_ERROR(cudaStreamIsCapturing(stream, &cap_status));
+          ORT_RETURN_IF_NOT(cap_status == cudaStreamCaptureStatusNone,
+                            "DynamicSparseAttention: prefill KV staging is only supported outside CUDA graph capture.");
+          locked_stage_entry = &SharedDsaPrefillStagePool::Instance().EntryForDevice(dev_id);
+          stage_lock = std::unique_lock<std::mutex>(locked_stage_entry->mu);
+          ORT_RETURN_IF_ERROR(SharedDsaPrefillStagePool::Instance().EnsureLocked(
+              *locked_stage_entry, cache_bytes, n_blocks, stream, prefill_stage_desc));
+          data.prefill_stage = &prefill_stage_desc;
+        }
+      }
+    }
+  }
+
+  Status launch_status = LaunchDynamicSparseAttention<CudaT>(
       stream, parameters, data, initialize_key_cache, initialize_value_cache, GetDeviceProp());
+  if (locked_stage_entry != nullptr) {
+    if (cudaEventRecord(locked_stage_entry->ready_event, stream) != cudaSuccess) {
+      static_cast<void>(cudaGetLastError());
+    }
+    locked_stage_entry->last_stream = stream;
+  }
+  return launch_status;
 }
 
 template class DynamicSparseAttention<float>;
