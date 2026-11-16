@@ -51,7 +51,8 @@ class TestVcpkgCache(unittest.TestCase):
             prefix = output.read_text(encoding="utf-8").strip().removeprefix("prefix=")
             if env["RUNNER_OS"] == "Windows":
                 self.assertEqual(
-                    env_file.read_text(encoding="utf-8"), f"VCPKG_DEFAULT_BINARY_CACHE={root / 'binary-cache'}\n"
+                    env_file.read_text(encoding="utf-8"),
+                    f"VCPKG_DEFAULT_BINARY_CACHE={(root / 'binary-cache').resolve()}\n",
                 )
                 self.assertTrue((root / "binary-cache").is_dir())
                 which.assert_called_once_with("cl")
