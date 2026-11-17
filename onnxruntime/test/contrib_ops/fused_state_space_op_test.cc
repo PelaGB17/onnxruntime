@@ -196,6 +196,8 @@ class MambaSession : public InferenceSession {
 
 class MambaTester : public OpTester {
  public:
+  using OpTester::FillFeedsAndOutputNames;
+
   MambaTester() : OpTester("Mamba2Verify", 1, kMSDomain) {
     SetCustomOutputVerifier([this](const std::vector<OrtValue>& actual, const std::string& provider) {
       auto& expected = GetOutputData();
@@ -756,7 +758,7 @@ void TestMambaBatchedMultiSequence(const std::vector<int>& seq_rows,
         const float dA = std::exp(decay[h] * dt);
         for (int p = 0; p < 64; ++p) {
           const float x = xbc[static_cast<size_t>(gr) * channels + h * 64 + p].ToFloat();
-          const int parts = (total_rows == batch_size && slots == 1) ? 2 : 4;
+          const int parts = (rows == 1 && slots == 1) ? 2 : 4;
           float result = skip[h] * x;
           for (int q = 0; q < parts; ++q) {
             float partial = 0.f;
@@ -849,37 +851,53 @@ void TestMambaBatchedMultiSequence(const std::vector<int>& seq_rows,
   std::unordered_map<std::string, OrtValue> cpu_feeds, gpu_feeds;
   std::vector<std::string> names;
   tester.FillFeedsAndOutputNames(cpu_feeds, names);
+  RunOptions uncaptured;
+  ASSERT_STATUS_OK(uncaptured.config_options.AddConfigEntry("gpu_graph_id", "-1"));
+  std::vector<OrtValue> baseline;
+  ASSERT_STATUS_OK(session.Run(uncaptured, cpu_feeds, names, &baseline));
   for (const auto& [name, value] : cpu_feeds) {
     const auto& tensor = value.Get<Tensor>();
     Tensor::InitOrtValue(tensor.DataType(), tensor.Shape(), gpu_allocator, gpu_feeds[name]);
+    ASSERT_STATUS_OK(transfer->CopyTensor(tensor, *gpu_feeds[name].GetMutable<Tensor>()));
   }
+  // The binding owns the non-aliased output buffers whose addresses are retained by the graph.
+  std::unique_ptr<IOBinding> binding;
+  ASSERT_STATUS_OK(session.NewIOBinding(&binding));
+  for (const auto& [name, value] : gpu_feeds) ASSERT_STATUS_OK(binding->BindInput(name, value));
+  for (const auto& name : names) {
+    if (name == "conv_snapshots") {
+      ASSERT_STATUS_OK(binding->BindOutput(name, gpu_feeds.at("conv_state")));
+    } else if (name == "ssm_snapshots") {
+      ASSERT_STATUS_OK(binding->BindOutput(name, gpu_feeds.at("ssm_state")));
+    } else {
+      ASSERT_STATUS_OK(binding->BindOutput(name, info.device));
+    }
+  }
+  ASSERT_STATUS_OK(binding->SynchronizeInputs());
+  // Initial capture can execute the node multiple times and mutate the aliased states.
+  ASSERT_STATUS_OK(session.Run(RunOptions{}, *binding));
+  ASSERT_STATUS_OK(binding->SynchronizeOutputs());
+  ASSERT_TRUE(ep->IsGraphCaptured(0));
   for (int run = 0; run < 4; ++run) {
+    SCOPED_TRACE(run);
     for (const auto& [name, value] : cpu_feeds) {
       ASSERT_STATUS_OK(transfer->CopyTensor(value.Get<Tensor>(), *gpu_feeds[name].GetMutable<Tensor>()));
-    }
-    std::unique_ptr<IOBinding> binding;
-    ASSERT_STATUS_OK(session.NewIOBinding(&binding));
-    for (const auto& [name, value] : gpu_feeds) ASSERT_STATUS_OK(binding->BindInput(name, value));
-    for (const auto& name : names) {
-      if (name == "conv_snapshots") {
-        ASSERT_STATUS_OK(binding->BindOutput(name, gpu_feeds.at("conv_state")));
-      } else if (name == "ssm_snapshots") {
-        ASSERT_STATUS_OK(binding->BindOutput(name, gpu_feeds.at("ssm_state")));
-      } else {
-        ASSERT_STATUS_OK(binding->BindOutput(name, info.device));
-      }
     }
     ASSERT_STATUS_OK(binding->SynchronizeInputs());
     ASSERT_STATUS_OK(session.Run(RunOptions{}, *binding));
     ASSERT_STATUS_OK(binding->SynchronizeOutputs());
     const auto& outputs = binding->GetOutputs();
-    OrtValue actual_conv;
-    Tensor::InitOrtValue(outputs[1].Get<Tensor>().DataType(), outputs[1].Get<Tensor>().Shape(),
-                         cpu_allocator, actual_conv);
-    ASSERT_STATUS_OK(transfer->CopyTensor(outputs[1].Get<Tensor>(), *actual_conv.GetMutable<Tensor>()));
-    EXPECT_EQ(std::memcmp(actual_conv.Get<Tensor>().DataRaw(), conv_expected.data(),
-                          conv_expected.size() * sizeof(BFloat16)),
-              0);
+    ASSERT_EQ(outputs.size(), baseline.size());
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      const auto& tensor = outputs[i].Get<Tensor>();
+      OrtValue actual;
+      Tensor::InitOrtValue(tensor.DataType(), tensor.Shape(), cpu_allocator, actual);
+      ASSERT_STATUS_OK(transfer->CopyTensor(tensor, *actual.GetMutable<Tensor>()));
+      EXPECT_EQ(std::memcmp(actual.Get<Tensor>().DataRaw(), baseline[i].Get<Tensor>().DataRaw(),
+                            tensor.SizeInBytes()),
+                0)
+          << names[i];
+    }
   }
   EXPECT_TRUE(ep->IsGraphCaptured(0));
 }
@@ -893,7 +911,26 @@ TEST(FusedStateSpaceTest, MambaBatchedUniformDecodeAndUntouchedBanks) {
 TEST(FusedStateSpaceTest, MambaBatchedMixedPrefillAndDecode) {
   if (!HasCudaEnvironment(800)) GTEST_SKIP() << "Requires CUDA SM80+";
   // Mixed ragged batch: R=8 decode + R=75 prefill chunk (>32 tile boundary, >8 slots) + R=0 empty + R=5 tail.
-  TestMambaBatchedMultiSequence({8, 75, 0, 5}, {2, 0, 1, 4}, {3, 0, 0, 6}, /*num_banks=*/5, /*slots=*/8);
+  TestMambaBatchedMultiSequence({8, 75, 0, 5}, {2, 0, 1, 4}, {3, 0, 0, 6}, /*num_banks=*/5, /*slots=*/8,
+                                /*alias_and_capture=*/true);
+}
+
+TEST(FusedStateSpaceTest, MambaBatchedSingleSlotReadoutOrder) {
+  if (!HasCudaEnvironment(800)) GTEST_SKIP() << "Requires CUDA SM80+";
+  for (const auto& rows : {std::vector<int>{1, 5}, {1, 2}, {2, 0}, {0, 2}, {1, 1}}) {
+    TestMambaBatchedMultiSequence(rows, {2, 0}, {0, 0}, /*num_banks=*/3, /*slots=*/1,
+                                  /*alias_and_capture=*/true);
+  }
+}
+
+TEST(FusedStateSpaceTest, MambaBatchedSkewedPrefill) {
+  if (!HasCudaEnvironment(800)) GTEST_SKIP() << "Requires CUDA SM80+";
+  std::vector<int> rows(64, 1);
+  rows[0] = 900;
+  std::vector<int32_t> banks(64), selected(64, 0);
+  for (int b = 0; b < 64; ++b) banks[b] = b;
+  TestMambaBatchedMultiSequence(rows, banks, selected, /*num_banks=*/65, /*slots=*/8,
+                                /*alias_and_capture=*/true);
 }
 
 TEST(FusedStateSpaceTest, MambaBatchedInvalidSelectorsAndDuplicateSlots) {

@@ -188,11 +188,15 @@ __global__ __launch_bounds__(KW * 32) void MatMulPackedBf16TcWarpKSplitKernel(
       }
 #pragma unroll
       for (int q_grp = 0; q_grp < 4; ++q_grp) {
-        const __nv_bfloat16* a_ptr = a_row + half_idx * 128 + q_grp * 32 + t * 8;
-        const uint4 b_vec = a_valid
-                                ? (a_aligned ? __ldg(reinterpret_cast<const uint4*>(a_ptr))
-                                             : gguf_cuda::LoadU4Dev(a_ptr))
-                                : make_uint4(0u, 0u, 0u, 0u);
+        uint4 b_vec[MB];
+#pragma unroll
+        for (int mb = 0; mb < MB; ++mb) {
+          const __nv_bfloat16* a_ptr = a_rows[mb] + half_idx * 128 + q_grp * 32 + t * 8;
+          b_vec[mb] = a_valid[mb]
+                          ? (a_aligned ? __ldg(reinterpret_cast<const uint4*>(a_ptr))
+                                       : gguf_cuda::LoadU4Dev(a_ptr))
+                          : make_uint4(0u, 0u, 0u, 0u);
+        }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           const uint4 e_vec = valid_lo[m]
@@ -201,8 +205,11 @@ __global__ __launch_bounds__(KW * 32) void MatMulPackedBf16TcWarpKSplitKernel(
           const uint4 o_vec = valid_hi[m]
                                   ? gguf_cuda::DecodeQ6KHalf128GroupBf16x2<kAlignedQ8Rows>(st_hi[m], q_grp, t)
                                   : make_uint4(0u, 0u, 0u, 0u);
-          gguf_cuda::MmaBf16(acc[m], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec.x, b_vec.y);
-          gguf_cuda::MmaBf16(acc[m], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec.z, b_vec.w);
+#pragma unroll
+          for (int mb = 0; mb < MB; ++mb) {
+            gguf_cuda::MmaBf16(acc[m][mb], e_vec.x, o_vec.x, e_vec.y, o_vec.y, b_vec[mb].x, b_vec[mb].y);
+            gguf_cuda::MmaBf16(acc[m][mb], e_vec.z, o_vec.z, e_vec.w, o_vec.w, b_vec[mb].z, b_vec[mb].w);
+          }
         }
       }
     }

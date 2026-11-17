@@ -4071,26 +4071,35 @@ This version of the operator has been available since version 1 of the 'com.micr
 ### <a name="com.microsoft.Mamba2Verify"></a><a name="com.microsoft.mamba2verify">**com.microsoft.Mamba2Verify**</a>
 
   Fused causal convolution, selective state-space recurrence and gated grouped RMS normalization.
-  This Bolt-specific operator processes one sequence per invocation, not a batch of independent sequences.
+  Supports both single-sequence execution (conv_state [slots, channels, 3], ssm_state [slots, heads, d_state, head_dim],
+  state_row int32[1]) and packed multi-sequence continuous batching (conv_state [num_banks, slots, channels, 3],
+  ssm_state [num_banks, slots, heads, d_state, head_dim], state_row int32[batch_size],
+  cumulative_sequence_lengths int32[batch_size+1], state_slots int32[batch_size]).
   Currently requires head_dim=64, d_state=128, R>=1.
   projection[R, 2*di+2*n_groups*d_state+heads] packs [gate, xBC, dt], di=heads*head_dim.
-  state_row is a device int32[1] selecting the starting snapshot (0<=state_row<slots).
-  conv_state and ssm_state must have the same slots dimension, with slots>=1.
+  In single-sequence mode, state_row is a device int32[1] selecting the starting snapshot (0<=state_row<slots),
+  and conv_state and ssm_state must have the same slots dimension, with slots>=1.
+  In multi-sequence mode, cumulative_sequence_lengths partitions the R packed rows across batch_size sequences
+  (0==cu[0]<=cu[1]<=...<=cu[batch_size]==R), state_slots[b] selects sequence b's bank in [0, num_banks),
+  and state_row[b] selects sequence b's starting snapshot in [0, slots); unreferenced banks retain their input values.
   Convolution has four taps, with BF16 SiLU output. The FP32 recurrence is
   dt=max(softplus(projection_dt+dt_bias),time_step_min),
   S=exp(A_negative*dt)*S+(dt*x)*B, readout=D*x+sum(C*S).
   The time-step clamp propagates NaN. Softplus uses raw directly when raw>20.
-  Readout sums four ordered FP32 partitions of d_state, except when R=1 and slots=1,
+  Readout sums four ordered FP32 partitions of d_state, except when a sequence has R_b=1 and slots=1,
   which uses two partitions. Single-row replay with slots>1 retains the multi-row readout order.
   Readout is gated by FP32 SiLU(gate), normalized per group, scaled by norm_weight and rounded to BF16.
-  When R<=slots, every processed token writes its post-token convolution and SSM snapshot to row 0..R-1
-  and slots R..slots-1 are preserved. When R>slots, only the trailing slots tokens (R-slots..R-1) write
-  their post-token snapshots to rows 0..slots-1 so row slots-1 holds the final state.
+  When R_b<=slots, every processed token writes its post-token convolution and SSM snapshot to row 0..R_b-1
+  of its bank and slots R_b..slots-1 are preserved. When R_b>slots, only the trailing slots tokens (R_b-slots..R_b-1)
+  write their post-token snapshots to rows 0..slots-1 so row slots-1 holds the final state.
   The final/accepted state is chosen by the caller through state_row on the next invocation.
   Input states may alias their corresponding outputs.
   xbc and readout are independently optional debug outputs; omitted intermediates use internal workspace.
-  If state_row is outside [0,slots), rows 0..min(R,slots)-1 of conv_snapshots and ssm_snapshots
-  and all of Y, xbc and readout are NaN; no error is raised.
+  If state_row[b] is outside [0,slots), rows 0..min(R_b,slots)-1 of sequence b's bank in conv_snapshots and
+  ssm_snapshots and sequence b's rows of Y, xbc and readout are NaN; if state_slots[b] is outside [0,num_banks)
+  or duplicated across non-empty sequences, sequence b's rows of Y, xbc and readout are NaN without modifying snapshots;
+  no error is raised.
+  Invalid cumulative_sequence_lengths makes all rows of Y, xbc and readout NaN and leaves all snapshots unchanged.
   No accepted-length truncation, hidden mutable state, host reads or synchronization is performed.
 
 #### Version
@@ -4114,15 +4123,15 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Lower bound for softplus time step.</dd>
 </dl>
 
-#### Inputs
+#### Inputs (10 - 12)
 
 <dl>
 <dt><tt>projection</tt> : T</dt>
 <dd>Packed projection [R, width].</dd>
 <dt><tt>conv_state</tt> : T</dt>
-<dd>Snapshots [slots, di+2*n_groups*d_state, 3].</dd>
+<dd>Snapshots [slots, di+2*n_groups*d_state, 3] or [num_banks, slots, di+2*n_groups*d_state, 3].</dd>
 <dt><tt>ssm_state</tt> : F</dt>
-<dd>Snapshots [slots, heads, d_state, head_dim].</dd>
+<dd>Snapshots [slots, heads, d_state, head_dim] or [num_banks, slots, heads, d_state, head_dim].</dd>
 <dt><tt>conv_weight</tt> : T</dt>
 <dd>Depthwise weights [channels,4] or [channels,1,4].</dd>
 <dt><tt>conv_bias</tt> : T</dt>
@@ -4136,7 +4145,11 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>norm_weight</tt> : F</dt>
 <dd>Normalization weight [di].</dd>
 <dt><tt>state_row</tt> : I</dt>
-<dd>Starting snapshot index int32[1], on device.</dd>
+<dd>Starting snapshot index int32[1] or int32[batch_size], on device.</dd>
+<dt><tt>cumulative_sequence_lengths</tt> (optional) : I</dt>
+<dd>Optional cumulative row offsets int32[batch_size+1], on device.</dd>
+<dt><tt>state_slots</tt> (optional) : I</dt>
+<dd>Optional bank selector int32[batch_size] into [0, num_banks), on device.</dd>
 </dl>
 
 #### Outputs (3 - 5)

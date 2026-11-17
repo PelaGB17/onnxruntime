@@ -200,7 +200,7 @@ def _model(nodes, inputs, outputs):
     )
 
 
-def _mamba2_verify_model(heads, groups, slots):
+def _mamba2_verify_model(heads, groups, slots, include_readout=False):
     di = heads * 64
     channels = di + 2 * groups * 128
     stride = di + channels + heads
@@ -213,7 +213,7 @@ def _mamba2_verify_model(heads, groups, slots):
             helper.make_node(
                 "Mamba2Verify",
                 ["proj", "conv_in", "ssm_in", "cw", "cb", "dt_bias", "A_neg", "D", "norm_w", "state_row"],
-                ["Y_bf16", "conv_out_bf16", "ssm_out"],
+                ["Y_bf16", "conv_out_bf16", "ssm_out"] + (["", "readout"] if include_readout else []),
                 domain="com.microsoft",
                 heads=heads,
                 n_groups=groups,
@@ -238,11 +238,12 @@ def _mamba2_verify_model(heads, groups, slots):
             helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["R", di]),
             helper.make_tensor_value_info("conv_out", TensorProto.FLOAT, [slots, channels, 3]),
             helper.make_tensor_value_info("ssm_out", TensorProto.FLOAT, [slots, heads, 128, 64]),
-        ],
+        ]
+        + ([helper.make_tensor_value_info("readout", TensorProto.FLOAT, ["R", di])] if include_readout else []),
     )
 
 
-def _mamba2_verify_batched_model(heads, groups, slots):
+def _mamba2_verify_batched_model(heads, groups, slots, include_readout=False):
     di = heads * 64
     channels = di + 2 * groups * 128
     stride = di + channels + heads
@@ -268,7 +269,7 @@ def _mamba2_verify_batched_model(heads, groups, slots):
                     "cu_seqlens",
                     "state_slots",
                 ],
-                ["Y_bf16", "conv_out_bf16", "ssm_out"],
+                ["Y_bf16", "conv_out_bf16", "ssm_out"] + (["", "readout"] if include_readout else []),
                 domain="com.microsoft",
                 heads=heads,
                 n_groups=groups,
@@ -295,7 +296,8 @@ def _mamba2_verify_batched_model(heads, groups, slots):
             helper.make_tensor_value_info("Y", TensorProto.FLOAT, ["R", di]),
             helper.make_tensor_value_info("conv_out", TensorProto.FLOAT, ["num_banks", slots, channels, 3]),
             helper.make_tensor_value_info("ssm_out", TensorProto.FLOAT, ["num_banks", slots, heads, 128, 64]),
-        ],
+        ]
+        + ([helper.make_tensor_value_info("readout", TensorProto.FLOAT, ["R", di])] if include_readout else []),
     )
 
 
@@ -877,7 +879,7 @@ class TestGgufPackedOps(unittest.TestCase):
             weights = _dequantize_weights(raw, k, gtype)
             for dtype in self.activation_dtypes:
                 session = _session(_matmul_model(k, n, raw.shape[1], gtype, dtype), "CUDAExecutionProvider")
-                for m in (1, 3, 7, 8, 9, 32):
+                for m in (1, 3, 7, 8, 9, 16, 17, 31, 32):
                     with self.subTest(gtype=gtype, dtype=dtype, m=m):
                         a = _round_to_dtype(rng.standard_normal((m, k), dtype=np.float32) * 0.2, dtype)
                         got = session.run(None, {"A_f32": a, "B": raw})[0]
@@ -1109,7 +1111,7 @@ class TestGgufPackedOps(unittest.TestCase):
 
     def test_moe_packed_sparse_experts_at_prefill_boundary(self):
         for dtype in self.activation_dtypes:
-            self._check_moe(512, 64, 64, dtype, ((1, 1, 2),) * 3, (16, 17, 48), True, top_k=8)
+            self._check_moe(512, 64, 64, dtype, ((1, 1, 2),) * 3, (16, 17, 48, 64, 113, 128), True, top_k=8)
 
     def test_moe_packed_fp16_large_activations(self):
         formats = ((1, 1, 2),) * 3
@@ -2668,15 +2670,34 @@ class TestGgufPackedOps(unittest.TestCase):
         np.testing.assert_array_equal(got, _round_to_dtype(pos * pos, dtype))
 
     def test_mamba2_verify_batched_continuous_batching_parity(self):
+        self._mamba2_verify_batched_parity(
+            8,
+            (
+                ([8, 8, 8], [2, 0, 4], [3, 7, 1]),
+                ([8, 53, 5], [4, 1, 2], [6, 0, 2]),
+            ),
+        )
+
+    def test_mamba2_verify_batched_single_slot_parity(self):
+        self._mamba2_verify_batched_parity(
+            1,
+            tuple((rows, [2, 0], [0, 0]) for rows in ([1, 5], [1, 2], [2, 0], [0, 2], [1, 1])),
+        )
+
+    def _mamba2_verify_batched_parity(self, slots, cases):
         if TensorProto.BFLOAT16 not in self.activation_dtypes:
             self.skipTest("Requires CUDA SM80+")
         rng = np.random.default_rng(2036)
-        heads, groups, slots, num_banks = 4, 2, 8, 5
+        heads, groups, num_banks = 4, 2, 5
         di = heads * 64
         channels = di + 2 * groups * 128
         stride = di + channels + heads
-        single_sess = _session(_mamba2_verify_model(heads, groups, slots), "CUDAExecutionProvider")
-        batched_sess = _session(_mamba2_verify_batched_model(heads, groups, slots), "CUDAExecutionProvider")
+        single_sess = _session(
+            _mamba2_verify_model(heads, groups, slots, include_readout=True), "CUDAExecutionProvider"
+        )
+        batched_sess = _session(
+            _mamba2_verify_batched_model(heads, groups, slots, include_readout=True), "CUDAExecutionProvider"
+        )
 
         cw = rng.standard_normal((channels, 4), dtype=np.float32) * 0.2
         cb = rng.standard_normal((channels,), dtype=np.float32) * 0.1
@@ -2685,11 +2706,8 @@ class TestGgufPackedOps(unittest.TestCase):
         d_skip = rng.uniform(0.1, 0.5, size=(heads,)).astype(np.float32)
         norm_w = rng.uniform(0.5, 1.5, size=(di,)).astype(np.float32)
 
-        for seq_rows, active_slots, sel_rows in (
-            ([8, 8, 8], [2, 0, 4], [3, 7, 1]),
-            ([8, 53, 5], [4, 1, 2], [6, 0, 2]),
-        ):
-            with self.subTest(seq_rows=seq_rows):
+        for seq_rows, active_slots, sel_rows in cases:
+            with self.subTest(slots=slots, seq_rows=seq_rows):
                 cu = np.array([0, *np.cumsum(seq_rows)], dtype=np.int32)
                 total_rows = int(cu[-1])
                 proj = rng.standard_normal((total_rows, stride), dtype=np.float32) * 0.25
@@ -2699,7 +2717,7 @@ class TestGgufPackedOps(unittest.TestCase):
                 )
                 ssm_banks = rng.standard_normal((num_banks, slots, heads, 128, 64), dtype=np.float32) * 0.05
 
-                y_b, conv_b, ssm_b = batched_sess.run(
+                y_b, conv_b, ssm_b, readout_b = batched_sess.run(
                     None,
                     {
                         "proj_f": proj,
@@ -2720,8 +2738,11 @@ class TestGgufPackedOps(unittest.TestCase):
                 ref_conv = conv_banks.copy()
                 ref_ssm = ssm_banks.copy()
                 ref_y = []
+                ref_readout = []
                 for idx, (slot, sel) in enumerate(zip(active_slots, sel_rows, strict=True)):
-                    yi, ci, si = single_sess.run(
+                    if seq_rows[idx] == 0:
+                        continue
+                    yi, ci, si, ri = single_sess.run(
                         None,
                         {
                             "proj_f": proj[cu[idx] : cu[idx + 1]],
@@ -2737,12 +2758,14 @@ class TestGgufPackedOps(unittest.TestCase):
                         },
                     )
                     ref_y.append(yi)
+                    ref_readout.append(ri)
                     ref_conv[slot] = ci
                     ref_ssm[slot] = si
 
                 np.testing.assert_array_equal(y_b, np.concatenate(ref_y, axis=0))
                 np.testing.assert_array_equal(conv_b, ref_conv)
                 np.testing.assert_array_equal(ssm_b, ref_ssm)
+                np.testing.assert_array_equal(readout_b, np.concatenate(ref_readout, axis=0))
 
 
 if __name__ == "__main__":

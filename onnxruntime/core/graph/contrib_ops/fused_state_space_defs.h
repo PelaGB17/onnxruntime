@@ -29,7 +29,7 @@ Convolution has four taps, with BF16 SiLU output. The FP32 recurrence is
 dt=max(softplus(projection_dt+dt_bias),time_step_min),
 S=exp(A_negative*dt)*S+(dt*x)*B, readout=D*x+sum(C*S).
 The time-step clamp propagates NaN. Softplus uses raw directly when raw>20.
-Readout sums four ordered FP32 partitions of d_state, except when R=1 and slots=1,
+Readout sums four ordered FP32 partitions of d_state, except when a sequence has R_b=1 and slots=1,
 which uses two partitions. Single-row replay with slots>1 retains the multi-row readout order.
 Readout is gated by FP32 SiLU(gate), normalized per group, scaled by norm_weight and rounded to BF16.
 When R_b<=slots, every processed token writes its post-token convolution and SSM snapshot to row 0..R_b-1
@@ -42,6 +42,7 @@ If state_row[b] is outside [0,slots), rows 0..min(R_b,slots)-1 of sequence b's b
 ssm_snapshots and sequence b's rows of Y, xbc and readout are NaN; if state_slots[b] is outside [0,num_banks)
 or duplicated across non-empty sequences, sequence b's rows of Y, xbc and readout are NaN without modifying snapshots;
 no error is raised.
+Invalid cumulative_sequence_lengths makes all rows of Y, xbc and readout NaN and leaves all snapshots unchanged.
 No accepted-length truncation, hidden mutable state, host reads or synchronization is performed.
 )DOC")
       .Attr("heads", "Number of heads.", AttributeProto::INT)

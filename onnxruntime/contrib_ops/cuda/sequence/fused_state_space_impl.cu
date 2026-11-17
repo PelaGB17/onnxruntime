@@ -363,7 +363,7 @@ __device__ __forceinline__ MambaBatchSeq ResolveMambaBatchSequence(
 
 __global__ void MambaConvBatchedSmallKernel(
     const bf16* __restrict__ proj, int total_rows, int batch_size, int proj_stride, int di, int conv_dim,
-    const bf16* __restrict__ conv_state_in, const bf16* __restrict__ conv_w,
+    const bf16* conv_state_in, const bf16* __restrict__ conv_w,
     const bf16* __restrict__ conv_b, bf16* conv_state_out, bf16* __restrict__ xbc_act,
     const int32_t* __restrict__ state_row, const int32_t* __restrict__ cu_seqlens,
     const int32_t* __restrict__ state_slots, int64_t num_banks, int64_t slots) {
@@ -513,7 +513,7 @@ __global__ void MambaConvPrefillBatchedKernel(
 
 __global__ void MambaConvWriteSnapshotsBatchedKernel(
     const bf16* __restrict__ proj, int total_rows, int batch_size, int proj_stride, int di, int conv_dim,
-    const bf16* __restrict__ conv_state_in, bf16* conv_state_out,
+    const bf16* conv_state_in, bf16* conv_state_out,
     const int32_t* __restrict__ state_row, const int32_t* __restrict__ cu_seqlens,
     const int32_t* __restrict__ state_slots, int64_t num_banks, int64_t slots) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -555,7 +555,7 @@ __global__ void MambaConvWriteSnapshotsBatchedKernel(
 template <int QP, int TILE_R = 16>
 __global__ __launch_bounds__(QP * 64) void MambaSsmBatchedKernel(
     const bf16* __restrict__ proj, int total_rows, int batch_size, int proj_stride, int di, int conv_dim,
-    int heads, int heads_per_group, const bf16* __restrict__ xbc_act, const float* __restrict__ ssm_in,
+    int heads, int heads_per_group, const bf16* __restrict__ xbc_act, const float* ssm_in,
     const float* __restrict__ dt_bias, const float* __restrict__ a_neg, const float* __restrict__ d_skip,
     float tmin, float* ssm_out, float* __restrict__ ypre,
     const int32_t* __restrict__ state_row, const int32_t* __restrict__ cu_seqlens,
@@ -572,7 +572,7 @@ __global__ __launch_bounds__(QP * 64) void MambaSsmBatchedKernel(
   __shared__ float sB[TILE_R][DS];
   __shared__ float sC[TILE_R][DS];
   __shared__ float sX[TILE_R][HD];
-  __shared__ float sPart[TILE_R][QP][HD];
+  __shared__ float sPart[TILE_R][4][HD];
   __shared__ float sDt[TILE_R];
   __shared__ float sdA[TILE_R];
 
@@ -615,6 +615,9 @@ __global__ __launch_bounds__(QP * 64) void MambaSsmBatchedKernel(
       continue;
     }
 
+    // Single-slot batches can mix one-row (two partitions) and multi-row (four partitions) sequences.
+    const bool split_partitions = QP == 2 && seq.rows > 1;
+    const int readout_parts = (QP == 2 && !split_partitions) ? 2 : 4;
     float st[NH];
     const float* sp = ssm_in + seq.slot * bank_stride + static_cast<int64_t>(seq.sel) * row_stride +
                       (static_cast<int64_t>(h) * DS + half * NH) * HD + p;
@@ -650,13 +653,23 @@ __global__ __launch_bounds__(QP * 64) void MambaSsmBatchedKernel(
         const float x = sX[tr][p];
         const float dtx = dt * x;
         float acc = 0.f;
+        float acc_hi = 0.f;
 #pragma unroll
         for (int n = 0; n < NH; ++n) {
           const int nn = half * NH + n;
           st[n] = st[n] * dA + dtx * sB[tr][nn];
-          acc += sC[tr][nn] * st[n];
+          if (split_partitions && n >= NH / 2) {
+            acc_hi += sC[tr][nn] * st[n];
+          } else {
+            acc += sC[tr][nn] * st[n];
+          }
         }
-        sPart[tr][half][p] = acc;
+        if (split_partitions) {
+          sPart[tr][2 * half][p] = acc;
+          sPart[tr][2 * half + 1][p] = acc_hi;
+        } else {
+          sPart[tr][half][p] = acc;
+        }
         const int r = r0 + tr;
         if (r >= first_snap_r) {
           float* out = bank_ssm_out + static_cast<int64_t>(r - first_snap_r) * row_stride +
@@ -671,7 +684,7 @@ __global__ __launch_bounds__(QP * 64) void MambaSsmBatchedKernel(
         const int tr = i / HD, pp = i % HD;
         float sum = D * sX[tr][pp];
 #pragma unroll
-        for (int q = 0; q < QP; ++q) sum += sPart[tr][q][pp];
+        for (int q = 0; q < readout_parts; ++q) sum += sPart[tr][q][pp];
         ypre[static_cast<int64_t>(global_r0 + tr) * di + h * HD + pp] = sum;
       }
       if (r0 + TILE_R < seq.rows) {
@@ -823,7 +836,7 @@ cudaError_t LaunchMamba2VerifyBatched(cudaStream_t stream, int total_rows, int b
   auto* conv_out = static_cast<bf16*>(conv_snapshots);
   auto* act = static_cast<bf16*>(xbc);
   const unsigned int batch_grid = static_cast<unsigned int>(std::min(batch_size, 65535));
-  if (static_cast<int64_t>(total_rows) <= static_cast<int64_t>(batch_size) * kMaxRows) {
+  if (static_cast<int64_t>(total_rows) <= static_cast<int64_t>(batch_size) * 8) {
     const unsigned int conv_threads = (total_rows == batch_size * 8 && slots >= 8) ? 64u : 128u;
     const dim3 conv_grid(static_cast<unsigned int>((channels + conv_threads - 1) / conv_threads), batch_grid);
     MambaConvBatchedSmallKernel<<<conv_grid, conv_threads, 0, stream>>>(
@@ -842,7 +855,7 @@ cudaError_t LaunchMamba2VerifyBatched(cudaStream_t stream, int total_rows, int b
   }
 
   const dim3 ssm_grid(static_cast<unsigned int>(heads), batch_grid);
-  if (slots == 1 && total_rows == batch_size) {
+  if (slots == 1) {
     MambaSsmBatchedKernel<2, 8><<<ssm_grid, 128, 0, stream>>>(
         proj, total_rows, batch_size, stride, di, channels, heads, heads / groups, act, ssm_state,
         dt_bias, a_negative, d_skip, time_step_min, ssm_snapshots, readout,
