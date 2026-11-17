@@ -81,6 +81,12 @@ struct OrtEpDeleter {
 using UniqueOrtEp = std::unique_ptr<OrtEp, OrtEpDeleter>;
 
 /// <summary>
+/// Returns the number of PluginExecutionProvider instances created from `ep_factory` that are still alive.
+/// Used to refuse unregistering an EP library whose code those instances still call into.
+/// </summary>
+size_t GetNumLivePluginExecutionProviders(const OrtEpFactory& ep_factory);
+
+/// <summary>
 /// IExecutionProvider that wraps an instance of OrtEp.
 /// </summary>
 class PluginExecutionProvider : public IExecutionProvider {
@@ -178,6 +184,16 @@ class PluginExecutionProvider : public IExecutionProvider {
     std::unordered_map<std::string, std::unique_ptr<EpValueInfo>> value_infos;
   };
 
+  // Counts this instance as a live user of ep_factory_ for GetNumLivePluginExecutionProviders(). Declared before
+  // ort_ep_ so it is destroyed after it, i.e. after OrtEpFactory::ReleaseEp has returned.
+  struct LiveInstanceToken {
+    explicit LiveInstanceToken(const OrtEpFactory& ep_factory);
+    ~LiveInstanceToken();
+    ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(LiveInstanceToken);
+    const OrtEpFactory& ep_factory;
+  };
+
+  LiveInstanceToken live_instance_token_;
   UniqueOrtEp ort_ep_;
   OrtEpFactory& ep_factory_;
   std::vector<const OrtEpDevice*> ep_devices_;

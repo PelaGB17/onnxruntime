@@ -285,6 +285,10 @@ class Environment {
                                           std::unique_ptr<EpLibrary> ep_library,
                                           const std::vector<EpFactoryInternal*>& internal_factories = {});
 
+  // If fail_if_in_use is true, fails without unloading the library while execution provider instances created from
+  // it are still alive. ~Environment passes false so the library is still cleaned up deterministically.
+  Status UnregisterExecutionProviderLibraryImpl(const std::string& registration_name, bool fail_if_in_use);
+
   struct EpInfo {
     // Calls EpLibrary::Load.
     // For each factory, gets the OrtEpDevice instances and adds to `out.execution_devices`.

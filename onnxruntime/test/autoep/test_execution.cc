@@ -532,6 +532,28 @@ TEST(OrtEpLibrary, PluginEp_AppendV2_MulInference) {
   RunMulModelWithPluginEp(session_options);
 }
 
+// Unregistering a plugin EP library while a session still holds an EP instance created from it must fail and leave the
+// library loaded, instead of unloading code that the session calls when it is destroyed.
+TEST(OrtEpLibrary, PluginEp_UnregisterFailsWhileSessionUsesEp) {
+  const std::string& registration_name = Utils::example_ep_info.registration_name;
+  RegisteredEpDeviceUniquePtr example_ep;
+  ASSERT_NO_FATAL_FAILURE(Utils::RegisterAndGetExampleEp(*ort_env, Utils::example_ep_info, example_ep));
+  Ort::ConstEpDevice plugin_ep_device(example_ep.get());
+
+  {
+    Ort::SessionOptions session_options;
+    session_options.AppendExecutionProvider_V2(*ort_env, {plugin_ep_device}, std::unordered_map<std::string, std::string>{});
+    Ort::Session session(*ort_env, ORT_TSTR("testdata/mul_1.onnx"), session_options);
+
+    Ort::Status status{Ort::GetApi().UnregisterExecutionProviderLibrary(*ort_env, registration_name.c_str())};
+    ASSERT_FALSE(status.IsOK());
+    EXPECT_NE(status.GetErrorMessage().find("is still in use"), std::string::npos) << status.GetErrorMessage();
+  }
+
+  // The library is still registered, so the session was destroyed safely and unregistering now succeeds.
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().UnregisterExecutionProviderLibrary(*ort_env, registration_name.c_str()));
+}
+
 TEST(OrtEpLibrary, PluginEp_NullSessionAllocatorUsesDefaultCpuAllocator) {
   RegisteredEpDeviceUniquePtr example_ep;
   ASSERT_NO_FATAL_FAILURE(Utils::RegisterAndGetExampleEp(*ort_env, Utils::example_ep_info, example_ep));

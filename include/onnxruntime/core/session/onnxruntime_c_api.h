@@ -5689,6 +5689,10 @@ struct OrtApi {
    * You <b>MUST</b> ensure there are no Session instances using execution providers created by the library
    * before calling this function.
    *
+   * If execution provider instances created by a plugin EP library (one implementing OrtEpFactory::CreateEp) are still
+   * alive, this function returns an error and leaves the library registered and loaded. This check does not cover
+   * other objects that may still use the library, such as allocators or OrtValues obtained from it.
+   *
    * \param[in] env The OrtEnv instance to unregister the library from.
    * \param[in] registration_name The name the execution provider library was registered under.
    *

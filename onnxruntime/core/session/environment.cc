@@ -26,6 +26,7 @@
 #include "core/session/plugin_ep/ep_library_internal.h"
 #include "core/session/plugin_ep/ep_library_plugin.h"
 #include "core/session/plugin_ep/ep_library_provider_bridge.h"
+#include "core/session/plugin_ep/ep_plugin_provider_interfaces.h"
 #include "core/session/plugin_ep/ep_static_plugins.h"
 #include "core/session/ort_apis.h"
 #include "core/session/utils.h"
@@ -492,7 +493,7 @@ Environment::~Environment() {
   // unregister any remaining EP libraries so they're cleaned up in a determistic way.
   while (!ep_libraries_.empty()) {
     auto it = ep_libraries_.begin();
-    ORT_IGNORE_RETURN_VALUE(UnregisterExecutionProviderLibrary(it->first));
+    ORT_IGNORE_RETURN_VALUE(UnregisterExecutionProviderLibraryImpl(it->first, /*fail_if_in_use*/ false));
   }
 #endif
 }
@@ -798,11 +799,30 @@ Status Environment::RegisterExecutionProviderLibrary(const std::string& registra
 }
 
 Status Environment::UnregisterExecutionProviderLibrary(const std::string& registration_name) {
+  return UnregisterExecutionProviderLibraryImpl(registration_name, /*fail_if_in_use*/ true);
+}
+
+Status Environment::UnregisterExecutionProviderLibraryImpl(const std::string& registration_name, bool fail_if_in_use) {
   std::lock_guard<std::mutex> lock{mutex_};
 
   if (ep_libraries_.count(registration_name) == 0) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Execution provider library: ", registration_name,
                            " was not registered.");
+  }
+
+  // Unloading the library while execution provider instances created from it are alive would leave those instances
+  // calling into unloaded code when they are next used or destroyed. Refuse and leave the library registered.
+  if (fail_if_in_use) {
+    size_t num_live_eps = 0;
+    for (const OrtEpFactory* factory : ep_libraries_[registration_name]->factories) {
+      num_live_eps += GetNumLivePluginExecutionProviders(*factory);
+    }
+
+    if (num_live_eps != 0) {
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Execution provider library: ", registration_name,
+                             " is still in use by ", num_live_eps,
+                             " execution provider instance(s). Release all sessions using it first.");
+    }
   }
 
   auto status = Status::OK();

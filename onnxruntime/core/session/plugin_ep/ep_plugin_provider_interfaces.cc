@@ -472,6 +472,41 @@ struct PluginEpMetaDefNameFunctor {
 // PluginExecutionProvider
 //
 
+namespace {
+struct LivePluginEpCounts {
+  std::mutex mutex;
+  std::unordered_map<const OrtEpFactory*, size_t> counts;
+};
+
+// Intentionally leaked: PluginExecutionProvider instances may be destroyed during static destruction.
+LivePluginEpCounts& GetLivePluginEpCounts() {
+  static auto* counts = new LivePluginEpCounts();
+  return *counts;
+}
+}  // namespace
+
+size_t GetNumLivePluginExecutionProviders(const OrtEpFactory& ep_factory) {
+  auto& live = GetLivePluginEpCounts();
+  std::lock_guard<std::mutex> lock{live.mutex};
+  auto it = live.counts.find(&ep_factory);
+  return it == live.counts.end() ? 0 : it->second;
+}
+
+PluginExecutionProvider::LiveInstanceToken::LiveInstanceToken(const OrtEpFactory& factory) : ep_factory(factory) {
+  auto& live = GetLivePluginEpCounts();
+  std::lock_guard<std::mutex> lock{live.mutex};
+  ++live.counts[&ep_factory];
+}
+
+PluginExecutionProvider::LiveInstanceToken::~LiveInstanceToken() {
+  auto& live = GetLivePluginEpCounts();
+  std::lock_guard<std::mutex> lock{live.mutex};
+  auto it = live.counts.find(&ep_factory);
+  if (it != live.counts.end() && --it->second == 0) {
+    live.counts.erase(it);
+  }
+}
+
 static OrtDevice GetOrtDeviceForPluginEp(const OrtEp& ep, gsl::span<const OrtEpDevice* const> ep_devices) {
   // Resolve the EP's default device. If the EP implements GetDefaultMemoryDevice, use its
   // answer directly. Otherwise fall back to the first OrtEpDevice's default memory info.
@@ -510,6 +545,7 @@ PluginExecutionProvider::PluginExecutionProvider(UniqueOrtEp ep, const OrtSessio
                                                  const logging::Logger& logger)
     : IExecutionProvider(ep->GetName(ep.get()), GetOrtDeviceForPluginEp(*ep, ep_devices),
                          std::vector<const OrtEpDevice*>(ep_devices.begin(), ep_devices.end()), logger),
+      live_instance_token_(ep_factory),
       ort_ep_(std::move(ep)),
       ep_factory_(ep_factory),
       ep_devices_(ep_devices.begin(), ep_devices.end()),
