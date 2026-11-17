@@ -3213,7 +3213,7 @@ class TestPagedAttentionXqaDecode(unittest.TestCase):
 class TestPagedAttentionXqaSpeculative(unittest.TestCase):
     """Coverage for the multi-token (speculative decoding) paged XQA specialization.
 
-    Head size 256 / group size 6 / 2..8 new tokens per sequence routes a speculative verification
+    Head size 256 / group size 6 / 2..16 new tokens per sequence routes a speculative verification
     step onto XQA with a packed lower-triangular mask instead of the ragged fallback. The mask is
     the whole point of these tests: a kernel that ignores it lets a draft token attend to its own
     future, which stays inside a loose tolerance when K and V barely vary with position.
@@ -3290,9 +3290,9 @@ class TestPagedAttentionXqaSpeculative(unittest.TestCase):
         else:
             self.assertNotIn("SdpaKernel=XQA", debug_output)
 
-    @parameterized.expand([(f"q{q}", q) for q in range(2, 9)])
+    @parameterized.expand([(f"q{q}", q) for q in range(2, 17)])
     def test_spec_dec_query_length(self, _, query_length):
-        self._check(sequence_length=query_length, new_seqlens=[query_length] * 4)
+        self._check(sequence_length=query_length, new_seqlens=[query_length] * 4, expect_xqa=True)
 
     @parameterized.expand([("int8", "int8"), ("native_fp16", "float16")])
     def test_spec_dec_dispatches_to_xqa(self, _, kv_cache_type):
@@ -3437,9 +3437,9 @@ class TestPagedAttentionXqaSpeculative(unittest.TestCase):
             self._check(kv_cache_type="float16", k_quant_type="NONE", v_quant_type="NONE", expect_xqa=True)
 
     def test_bound_above_specialization_falls_back(self):
-        # A query bound of 9 is outside the 2..8 window, so this must land on the ragged backend
+        # A query bound of 17 is outside the 2..16 window, so this must land on the ragged backend
         # and still be correct.
-        self._check(sequence_length=9, new_seqlens=[9] * 4, expect_xqa=False)
+        self._check(sequence_length=17, new_seqlens=[17] * 4, expect_xqa=False)
 
 
 @unittest.skipIf(not has_cuda_device(), reason="CUDA is not available, skipping tests.")

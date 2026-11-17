@@ -625,8 +625,10 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
        (parameters.head_size == 128 && parameters.is_causal &&
         (kIsInt8Cache || bf16_int4_spec_xqa_eligible))) &&
       max_query_len_bound > 1 && max_query_len_bound <= kMaxSpecDecQueryLen;
+  // Longer portable steps retain the FlashAttention prefill optimizations.
+  constexpr int kMaxPortableSpecDecQueryLen = 8;
   const bool portable_spec_dec_candidate =
-      has_metadata_bounds && max_query_len_bound > 1 && max_query_len_bound <= kMaxSpecDecQueryLen &&
+      has_metadata_bounds && max_query_len_bound > 1 && max_query_len_bound <= kMaxPortableSpecDecQueryLen &&
       (std::is_same_v<TCACHE, uint8_t> || (kIsQuantizedCache && per_channel_k && !enable_per_channel_xqa_));
   const bool cudnn_paged_enabled =
       enable_cudnn_paged_ || (auto_enable_cudnn_paged_ && device_prop.major >= 9);
@@ -676,7 +678,7 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
 
   const bool use_int8_paged_prefill =
       use_flash_attention && kIsInt8Cache &&
-      parameters.is_causal && has_metadata_bounds && max_query_len_bound > 8 &&
+      parameters.is_causal && has_metadata_bounds && max_query_len_bound > kMaxPortableSpecDecQueryLen &&
       parameters.local_window_size > 0 && parameters.batch_size <= 65535;
 
   // Quantized Flash and CUTLASS need dense staging. Native Flash reads the paged cache directly;

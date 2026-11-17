@@ -806,7 +806,7 @@ when reusing a directory configured with the feature disabled. INT8 kernels are 
 >
 > - **Both §8.5 read paths are implemented.** Multi-token steps normally use
 >   `GatherAndExpandPagedKVCache` to dequantize while gathering, and the Flash varlen path uses the
->   gathered grouped layout. A metadata-bounded speculative step of 2–8 query tokens uses paged XQA
+>   gathered grouped layout. A metadata-bounded speculative step of 2–16 query tokens uses paged XQA
 >   directly: H256 supports causal and non-causal attention at `group_size = 6` with matching native
 >   FP16/BF16 query and cache types, FP16 query/output with an INT8/FP8 cache, or FP16 query/output
 >   with a `PER_CHANNEL` INT4 cache, plus BF16 query/output with an INT8 cache at
@@ -814,7 +814,8 @@ when reusing a directory configured with the feature disabled. INT8 kernels are 
 >   BF16 query/output with a `PER_CHANNEL` INT4 cache at `group_size = 6`.
 >   Quantized `PER_CHANNEL` K scales reach XQA when scale folding is enabled. INT4 with `PER_TENSOR`
 >   scales, unsupported BF16-query INT4 head sizes, and disabled per-channel folding use portable paged decode for
->   metadata-bounded speculative steps. Non-causal H128 multi-token steps use a portable or gathered
+>   metadata-bounded speculative steps of 2–8 query tokens, preserving FlashAttention for longer
+>   steps when eligible. Non-causal H128 multi-token steps use a portable or gathered
 >   backend. Single-token decode reads and
 >   dequantizes the cache in place through XQA when eligible or `PagedDecodeSplitKV` otherwise.
 > - Because a quantized cache never reaches Flash's *paged* kernel, the `block_size` tiling
@@ -839,7 +840,7 @@ when reusing a directory configured with the feature disabled. INT8 kernels are 
 > types, FP16 query/output with an INT8/FP8 cache, FP16 query/output with a `PER_CHANNEL` INT4
 > cache when scale folding is enabled (all at `head_size = 256, group_size = 6`), and BF16
 > query/output with an INT8 cache at `head_size = 256, group_size ∈ {6, 16}` when
-> `attention_metadata` bounds the longest query to 2–8 tokens. Additional causal H128 specializations
+> `attention_metadata` bounds the longest query to 2–16 tokens. Additional causal H128 specializations
 > cover FP16/BF16 query/output with an INT8 cache and BF16 query/output with a `PER_CHANNEL` INT4
 > cache at `group_size = 6`. BF16 H128 INT4 also has a single-token decode specialization. These kernels
 > write packed token-major output and support ragged batches. A
@@ -903,13 +904,13 @@ when reusing a directory configured with the feature disabled. INT8 kernels are 
 > - **Multi-token XQA gating.** The speculative H256 XQA specializations (`group_size = 6`, plus
 >   `group_size ∈ {6, 16}` for BF16-query/INT8-cache), as well as the causal
 >   FP16/BF16-query INT8-cache and BF16-query INT4-cache H128/group-6 specializations, are gated on the `attention_metadata` query
->   bound being in `[2, 8]`, *not* on `token_count <= batch_size`: a zero-heavy ragged step can
+>   bound being in `[2, 16]`, *not* on `token_count <= batch_size`: a zero-heavy ragged step can
 >   satisfy the aggregate test while still carrying a multi-token
 >   sequence, and a step with more tokens than sequences is equally valid. Nothing about the gate is
 >   specific to speculative verification -- any short multi-token query shape (a prefill chunk tail,
 >   for instance) takes the same path. The packed mask supplies bottom-right causality for causal
 >   attention and a rectangular span for non-causal H256 attention. Query bounds of 1 keep the
->   single-token kernel and bounds above 8 fall back to the
+>   single-token kernel and bounds above 16 fall back to the
 >   ragged backends. Local windows and attention sinks are supported on this path: rows are
 >   flattened `(query token, query head)` pairs, so the window is derived from each row's own query
 >   position and the sink from its own head.

@@ -1693,9 +1693,9 @@ TEST_P(PagedAttentionXqaSpecDecH128Int8Test, FragmentedUnevenCausalLocalWindow) 
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    QueryWidths2Through8,
+    QueryWidths2Through16,
     PagedAttentionXqaSpecDecH128Int8Test,
-    ::testing::Values(2, 3, 4, 5, 6, 7, 8));
+    ::testing::Range(2, 17));
 
 class PagedAttentionXqaSpecDecH256Bf16Int8Group16Test
     : public ::testing::TestWithParam<int> {};
@@ -1753,9 +1753,9 @@ TEST_P(PagedAttentionXqaSpecDecH256Bf16Int8Group16Test, FragmentedUnevenCausalLo
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    QueryWidths2Through8,
+    QueryWidths2Through16,
     PagedAttentionXqaSpecDecH256Bf16Int8Group16Test,
-    ::testing::Values(2, 3, 4, 5, 6, 7, 8));
+    ::testing::Range(2, 17));
 
 TEST(PagedAttention, Cuda_XqaSpecDecBf16Int8CacheHeadSize256Group6) {
   ScopedEnvironmentVariables scoped_env_vars{
@@ -1982,12 +1982,13 @@ TEST(PagedAttention, Cuda_XqaSpecDecInt8CacheHeadSize256Group6Width16) {
   c.kv_num_heads = 1;
   c.head_size = 256;
   c.num_blocks = 8;
-  c.past_seqlen = 230;
+  // A short history keeps attention on draft positions 8..15 large enough to detect dropped mask bits.
+  c.past_seqlen = 4;
   c.int8_cache = true;
   c.per_channel_scales = true;
   c.irregular_layout = true;
   c.discriminating_attention = true;
-  c.attention_metadata = {16, 256, 256};
+  c.attention_metadata = {16, 20, 16};
 
   const bool xqa_runnable = IsSpecDecGroup6XqaRunnable(false, true, false);
 

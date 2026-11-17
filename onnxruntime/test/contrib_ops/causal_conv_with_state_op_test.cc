@@ -426,19 +426,19 @@ TEST(CausalConvWithStateTest, PackedChannelsTiledK4AndCapture) {
     for (bool state_last : {false, true}) {
       for (bool past : {false, true}) {
         for (int channels : {7, 130}) {
-          TestPackedChannelHistory<float>(length, state_last, past, true, true, 1, 0, channels);
-          TestPackedChannelHistory<MLFloat16>(length, state_last, past, false, true, 1, 7, channels);
-          TestPackedChannelHistory<BFloat16>(length, state_last, past, true, false, 1, 8, channels);
+          TestPackedChannelHistory<float>(length, state_last, past, true, true, 1, 16, channels);
+          TestPackedChannelHistory<MLFloat16>(length, state_last, past, false, true, 1, 16, channels);
+          TestPackedChannelHistory<BFloat16>(length, state_last, past, true, false, 1, 16, channels);
         }
       }
     }
   }
-  for (int length : {1, 3, 8}) {
+  for (int length : {1, 3, 8, 12}) {
     for (bool state_last : {false, true}) {
       for (bool past : {false, true}) {
-        TestPackedChannelHistory<float>(length, state_last, past, true, true, 1, 2);
-        TestPackedChannelHistory<MLFloat16>(length, state_last, past, false, true, 1, 8, 130);
-        TestPackedChannelHistory<BFloat16>(length, state_last, past, true, false, 1, 7);
+        TestPackedChannelHistory<float>(length, state_last, past, true, true, 1, 16);
+        TestPackedChannelHistory<MLFloat16>(length, state_last, past, false, true, 1, 16, 130);
+        TestPackedChannelHistory<BFloat16>(length, state_last, past, true, false, 1, 16);
       }
     }
   }

@@ -259,15 +259,14 @@ class TestQuantUtil(unittest.TestCase):
                 self.assertEqual(zero_point, expected_zp)
                 self.assertEqual(scale, expected_scale)
 
-                # Even int4 quantization generates 8-bit numpy values.
                 self.assertEqual(data_quant.dtype, np_int_type)
                 for index, actual_quant_val in enumerate(data_quant.flatten()):
                     self.assertTrue(actual_quant_val >= qmin and actual_quant_val <= qmax)
 
-                    expected_quant_val = numpy.asarray((data_float[index] / scale).round() + zero_point).astype(
-                        np_int_type
-                    )
-                    numpy.clip(expected_quant_val, qmin, qmax, out=expected_quant_val)
+                    # Saturate before casting: 4-bit casts wrap and uint4 has no in-place clip loop.
+                    expected_quant_val = numpy.clip(
+                        (data_float[index] / scale).round() + zero_point, int(qmin), int(qmax)
+                    ).astype(np_int_type)
 
                     self.assertEqual(numpy.array(actual_quant_val), expected_quant_val)
 

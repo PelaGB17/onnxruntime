@@ -1096,7 +1096,7 @@ class TestPagedAttentionInt4(unittest.TestCase):
                         width=128,
                         heads=48,
                         kv_heads=8,
-                        lengths=(9,),
+                        lengths=(17,),
                         past=(513,),
                         block_size=256,
                         activation_dtype=ml_dtypes.bfloat16,
