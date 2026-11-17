@@ -3,7 +3,10 @@
 
 "use strict";
 
-const { EOL } = require("os");
+const { spawnSync } = require("child_process");
+const fs = require("fs");
+const { EOL, tmpdir } = require("os");
+const path = require("path");
 const readline = require("readline");
 
 // This script is used to parse the raw log data and check if there are inconsistent shader.
@@ -15,6 +18,44 @@ const regexShaderStart =
   /^===\ WebGPU\ Shader\ code\ \[.+?, Configuration="(?<configuration>[^"]+)", Key="(?<key>.+)"]\ Start\ ===$/;
 const regexShaderEnd =
   /^===\ WebGPU\ Shader\ code\ \[.+?, Configuration="(?<configuration>[^"]+)", Key="(?<key>.+)"]\ End\ ===$/;
+
+function getShaderDiff(previousCode, currentCode) {
+  let directory;
+  try {
+    directory = fs.mkdtempSync(path.join(tmpdir(), "webgpu-shader-diff-"));
+    fs.writeFileSync(path.join(directory, "previous.wgsl"), previousCode);
+    fs.writeFileSync(path.join(directory, "current.wgsl"), currentCode);
+    const result = spawnSync(
+      "git",
+      [
+        "--no-pager",
+        "diff",
+        "--no-index",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--text",
+        "--",
+        "previous.wgsl",
+        "current.wgsl",
+      ],
+      { cwd: directory, encoding: "utf8", windowsHide: true }
+    );
+    return !result.error && result.status === 1 && result.stdout
+      ? result.stdout.trimEnd()
+      : null;
+  } catch {
+    return null;
+  } finally {
+    if (directory) {
+      try {
+        fs.rmSync(directory, { recursive: true, force: true });
+      } catch (error) {
+        console.error(`Failed to remove shader diff directory "${directory}": ${error.message}`);
+      }
+    }
+  }
+}
 
 async function processVerboseLog() {
   const rl = readline.createInterface({
@@ -68,19 +109,26 @@ async function processVerboseLog() {
         currentShaderKey,
       ]);
       if (shaderMap.has(comparisonKey)) {
-        if (shaderMap.get(comparisonKey) !== currentShaderCode) {
+        const previousShader = shaderMap.get(comparisonKey);
+        if (previousShader.code !== currentShaderCode) {
           inconsistentShaderCount++;
-          console.error(`Line ${lineNumber}: Found inconsistent shader code for key "${currentShaderKey}" (configuration ${JSON.stringify(currentShaderConfiguration)}, shader started at line ${currentShaderStartLineNumber}).
-=== Previous Shader Start ===
-${shaderMap.get(comparisonKey)}
+          const diff = getShaderDiff(previousShader.code, currentShaderCode);
+          const details = diff ? `=== Shader Diff ===
+${diff}` : `=== Previous Shader Start ===
+${previousShader.code}
 === Previous Shader End ===
 
 === Current Shader Start ===
 ${currentShaderCode}
-=== Current Shader End ===`);
+=== Current Shader End ===`;
+          console.error(`Line ${lineNumber}: Found inconsistent shader code for key "${currentShaderKey}" (configuration ${JSON.stringify(currentShaderConfiguration)}, previous shader started at line ${previousShader.startLineNumber}, current shader started at line ${currentShaderStartLineNumber}).
+${details}`);
         }
       } else {
-        shaderMap.set(comparisonKey, currentShaderCode);
+        shaderMap.set(comparisonKey, {
+          code: currentShaderCode,
+          startLineNumber: currentShaderStartLineNumber,
+        });
       }
 
       currentShaderKey = null;
