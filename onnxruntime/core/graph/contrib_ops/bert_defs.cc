@@ -5089,7 +5089,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "0 uses [B,C,state_length], 1 uses [B,state_length,C].",
               AttributeProto::INT, static_cast<int64_t>(-1))
         .Attr("state_update_capacity",
-              "Compact speculative state-update capture capacity (CUDA extended path only, 0..8); "
+              "Compact speculative state-update capture capacity (CUDA extended path only, 0..16); "
               "when > 0, output 2 has shape (batch_size, state_update_capacity, channels) and records "
               "the first min(sequence_length, state_update_capacity) projected input rows and any "
               "remaining rows are zero.",
@@ -5428,7 +5428,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               static_cast<int64_t>(1))
         .Attr("state_update_capacity",
               "Static number of compact contiguous-prefix transition values to expose per request. "
-              "Valid range is [0, 8]. capture_count is required exactly when this is positive.",
+              "Valid range is [0, 16]. capture_count is required exactly when this is positive.",
               AttributeProto::INT,
               static_cast<int64_t>(0))
         .Attr("group_size",
@@ -6088,7 +6088,7 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
               "default 64 retains recurrent execution. Default 64.",
               AttributeProto::INT, static_cast<int64_t>(64))
         .Attr("state_update_capacity",
-              "Capacity C for compact contiguous-prefix transition capture, in [0, 8]. "
+              "Capacity C for compact contiguous-prefix transition capture, in [0, 16]. "
               "0 (default) disables compact state-update outputs.",
               AttributeProto::INT, static_cast<int64_t>(0))
         .Input(0, "query", "Query or packed QKV, shaped as described above.", "T")

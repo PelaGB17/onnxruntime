@@ -1436,15 +1436,15 @@ TEST(PagedAttention, Cuda_XqaNativeFp16CacheMultiTokenBoundFallsBack) {
   }
   IoBindingCase c;
   c.batch_size = 2;
-  c.token_count = 9;
-  c.cumulative_seqlens_q = {0, 9, 9};
+  c.token_count = 17;
+  c.cumulative_seqlens_q = {0, 17, 17};
   c.num_heads = 6;
   c.kv_num_heads = 1;
   c.head_size = 256;
   c.num_blocks = 32;
   c.max_num_blocks_per_seq = 8;
-  c.past_seqlen = 2039;
-  c.attention_metadata = {9, 2048, 2048};
+  c.past_seqlen = 2031;
+  c.attention_metadata = {17, 2048, 2048};
 
   testing::internal::CaptureStdout();
   RunIoBindingCase(DefaultCudaExecutionProvider(), kCudaExecutionProvider, true, false, c);

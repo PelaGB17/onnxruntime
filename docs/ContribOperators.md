@@ -1048,7 +1048,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>state_length</tt> : int</dt>
 <dd>Carry history length (CUDA only); 0 uses (kernel_size-1)*dilation. An explicit length must cover the receptive field; convolution reads its trailing history.</dd>
 <dt><tt>state_update_capacity</tt> : int</dt>
-<dd>Compact speculative state-update capture capacity (CUDA extended path only, 0..8); when > 0, output 2 has shape (batch_size, state_update_capacity, channels) and records the first min(sequence_length, state_update_capacity) projected input rows and any remaining rows are zero.</dd>
+<dd>Compact speculative state-update capture capacity (CUDA extended path only, 0..16); when > 0, output 2 has shape (batch_size, state_update_capacity, channels) and records the first min(sequence_length, state_update_capacity) projected input rows and any remaining rows are zero.</dd>
 <dt><tt>state_window</tt> : int</dt>
 <dd>Number of trailing per-position carry states held by past_state and present_state. When 0 (default) the state tensors have no window axis and hold only the state after the last position, i.e. the backward-compatible (batch_size, channels, state_length) where state_length = (k_1 - 1) * dilation. When W > 0 both gain a LEADING axis of extent W, right-aligned: slot j is the state after position (seq_len - W + j), so slot W-1 is always the state after the last position (identical to the W = 0 tensor) and is the slot past_state is read from. The window axis leads the batch axis so that each slot is one contiguous (batch_size, channels, state_length) block. Slots below max(0, W - seq_len) hold no position from this call and are filled with zeros. A window lets a speculative decoder roll the state back to an accepted prefix without replaying the forward. Valid range is [0, 8].</dd>
 </dl>
@@ -2604,7 +2604,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>scale</tt> : float</dt>
 <dd>Output scaling factor. When 0.0 (default) uses 1/sqrt(head_size_qk).</dd>
 <dt><tt>state_update_capacity</tt> : int</dt>
-<dd>Capacity C for compact contiguous-prefix transition capture, in [0, 8]. 0 (default) disables compact state-update outputs.</dd>
+<dd>Capacity C for compact contiguous-prefix transition capture, in [0, 16]. 0 (default) disables compact state-update outputs.</dd>
 <dt><tt>update_rule</tt> : string</dt>
 <dd>One of: 'linear', 'gated', 'delta', 'gated_delta'. Default is 'gated_delta'.</dd>
 </dl>
@@ -9564,7 +9564,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>group_size</tt> : int</dt>
 <dd>Number of contiguous channels sharing each projected delta (CUDA dynamic mode only). Must divide channels. Default is 1.</dd>
 <dt><tt>state_update_capacity</tt> : int</dt>
-<dd>Static number of compact contiguous-prefix transition values to expose per request. Valid range is [0, 8]. capture_count is required exactly when this is positive.</dd>
+<dd>Static number of compact contiguous-prefix transition values to expose per request. Valid range is [0, 16]. capture_count is required exactly when this is positive.</dd>
 </dl>
 
 #### Inputs (5 - 8)

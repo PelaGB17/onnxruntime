@@ -3499,16 +3499,65 @@ TEST(GatedDeltaNetTest, StateUpdateCapacityIsBounded) {
 
 TEST(GatedDeltaNetTest, StateUpdateCapacity15CapturesWideBlock) {
   if (NeedSkipGatedDeltaNetTest()) return;
+  constexpr int kCapacity = 15;
   Geometry g{28, 2, 2, 4, 128, 128};
   Options options;
   options.gate_activation = "softplus";
   options.beta_activation = "sigmoid";
   options.qk_l2_norm = 1;
-  options.state_update_capacity = 15;
+  options.state_update_capacity = kCapacity;
   Inputs in = MakeInputs(g, 181);
   in.cu_seqlens = {0, 16, 28};
   in.capture_count = {15, 11};
-  RunCase(g, options, in, 3e-2f, 3e-2f, false);
+
+  Inputs ref_in = in;
+  ref_in.q = RoundToTensorType<MLFloat16>(in.q);
+  ref_in.k = RoundToTensorType<MLFloat16>(in.k);
+  ref_in.v = RoundToTensorType<MLFloat16>(in.v);
+  std::vector<float> ref_out, ref_state, ref_state_update;
+  Reference(g, options, ref_in, &ref_out, &ref_state, &ref_state_update);
+
+  std::vector<OrtValue> fetches;
+  RunCase(g, options, in, 3e-2f, 3e-2f, false, &fetches);
+  ASSERT_EQ(fetches.size(), 3u);
+
+  std::vector<OrtValue> recurrent_fetches;
+  {
+    ScopedEnvironmentVariables scoped_env_vars{EnvVarMap{{"ORT_GDN_PLAN", "recurrent"}}};
+    RunCase(g, options, in, 3e-2f, 3e-2f, false, &recurrent_fetches);
+  }
+  ASSERT_EQ(recurrent_fetches.size(), 3u);
+
+  const Tensor& actual_state_update = fetches[2].Get<Tensor>();
+  const Tensor& recurrent_state_update = recurrent_fetches[2].Get<Tensor>();
+  const int64_t decay_elements = static_cast<int64_t>(kCapacity) * g.hv;
+  const int64_t key_elements = static_cast<int64_t>(kCapacity) * g.hq * g.dk;
+  const int64_t delta_elements = static_cast<int64_t>(kCapacity) * g.hv * g.dv;
+  const int64_t width = decay_elements + key_elements + delta_elements;
+  ASSERT_EQ(actual_state_update.Shape(), TensorShape({g.batch, width}));
+  ASSERT_EQ(recurrent_state_update.Shape(), TensorShape({g.batch, width}));
+
+  const float* actual_data = actual_state_update.Data<float>();
+  const float* recurrent_data = recurrent_state_update.Data<float>();
+  for (int b = 0; b < g.batch; ++b) {
+    const int count = in.capture_count[b];
+    ASSERT_GT(count, 8) << "must exercise capture slots beyond the previous capacity ceiling";
+    auto check_range = [&](int64_t offset, int64_t elements, bool check_positive) {
+      for (int64_t i = 0; i < elements; ++i) {
+        const int64_t index = static_cast<int64_t>(b) * width + offset + i;
+        if (check_positive) {
+          EXPECT_GT(actual_data[index], 0.0f) << "batch " << b << " decay element " << i;
+        }
+        EXPECT_NEAR(actual_data[index], ref_state_update[index], 3e-2f)
+            << "batch " << b << " ref mismatch at " << index;
+        EXPECT_NEAR(actual_data[index], recurrent_data[index], 3e-2f)
+            << "batch " << b << " recurrent mismatch at " << index;
+      }
+    };
+    check_range(0, static_cast<int64_t>(count) * g.hv, true);
+    check_range(decay_elements, static_cast<int64_t>(count) * g.hq * g.dk, false);
+    check_range(decay_elements + key_elements, static_cast<int64_t>(count) * g.hv * g.dv, false);
+  }
 }
 
 // The plan decision is pure host code, so the consumer-Blackwell shared-memory budget can

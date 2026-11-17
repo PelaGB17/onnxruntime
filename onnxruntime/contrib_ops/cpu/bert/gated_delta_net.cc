@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "contrib_ops/cpu/bert/attention_common.h"
 #include "core/common/safeint.h"
 #include "core/framework/tensor.h"
 #include "core/platform/threadpool.h"
@@ -127,8 +128,9 @@ GatedDeltaNet<T>::GatedDeltaNet(const OpKernelInfo& info) : OpKernel(info) {
   chunk_size_ = static_cast<int>(chunk_size);
   const int64_t state_update_capacity =
       info.GetAttrOrDefault<int64_t>("state_update_capacity", 0);
-  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= 16,
-              "state_update_capacity must be in [0, 16], got ", state_update_capacity);
+  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= kMaxStateUpdateCapacity,
+              "state_update_capacity must be in [0, ", kMaxStateUpdateCapacity, "], got ",
+              state_update_capacity);
   state_update_capacity_ = static_cast<int>(state_update_capacity);
   qk_l2_norm_ = info.GetAttrOrDefault<int64_t>("qk_l2_norm", 0) != 0;
 }

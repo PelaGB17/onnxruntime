@@ -37,7 +37,8 @@ VarlenCausalConvWithState::VarlenCausalConvWithState(const OpKernelInfo& info)
                   info.GetAttrOrDefault<int64_t>("delta_offset", 0) == 0,
               "WebGPU VarlenCausalConvWithState does not support dynamic grouped convolution (CUDA only)");
   const int64_t capacity = info.GetAttrOrDefault<int64_t>("state_update_capacity", 0);
-  ORT_ENFORCE(capacity >= 0 && capacity <= 8, "state_update_capacity must be in [0, 8]");
+  ORT_ENFORCE(capacity >= 0 && capacity <= kMaxStateUpdateCapacity,
+              "state_update_capacity must be in [0, ", kMaxStateUpdateCapacity, "]");
   state_update_capacity_ = static_cast<int>(capacity);
 }
 

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 
+#include "contrib_ops/cpu/bert/attention_common.h"
 #include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
 #include "core/providers/webgpu/shader_helper.h"
 #include "core/providers/webgpu/webgpu_supported_types.h"
@@ -65,8 +66,9 @@ GatedDeltaNet::GatedDeltaNet(const OpKernelInfo& info) : WebGpuKernel(info) {
   chunkwise_prefill_ = info.GetAttrOrDefault<int64_t>("chunk_size", 64) == kDeltaPrefillChunkSize;
   scale_ = info.GetAttrOrDefault<float>("scale", 0.0f);
   const auto state_update_capacity = info.GetAttrOrDefault<int64_t>("state_update_capacity", 0);
-  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= 16,
-              "state_update_capacity must be in [0, 16], got ", state_update_capacity);
+  ORT_ENFORCE(state_update_capacity >= 0 && state_update_capacity <= kMaxStateUpdateCapacity,
+              "state_update_capacity must be in [0, ", kMaxStateUpdateCapacity, "], got ",
+              state_update_capacity);
   state_update_capacity_ = static_cast<int>(state_update_capacity);
 }
 
