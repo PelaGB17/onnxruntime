@@ -50,7 +50,7 @@ def _round_to_dtype(arr, dtype):
     return arr.astype(np.float16).astype(np.float32)
 
 
-def _cuda_bf16_supported():
+def _cuda_compute_capability():
     driver = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
 
     def check(status):
@@ -61,7 +61,11 @@ def _cuda_bf16_supported():
     check(driver.cuInit(0))
     check(driver.cuDeviceGet(ctypes.byref(device), 0))
     check(driver.cuDeviceComputeCapability(ctypes.byref(major), ctypes.byref(minor), device))
-    return major.value >= 8
+    return (major.value, minor.value)
+
+
+def _cuda_bf16_supported():
+    return _cuda_compute_capability()[0] >= 8
 
 
 def _activation_storage(values, dtype):
@@ -2615,6 +2619,7 @@ class TestGgufPackedOps(unittest.TestCase):
             self.skipTest("Requires CUDA SM80+")
         rng = np.random.default_rng(20261115)
         dtype = TensorProto.BFLOAT16
+        max_large_n_tc_m = 64 if _cuda_compute_capability() == (9, 0) else 32
         cases = [
             (14, 256, 210, 2560, 512),
             (14, 256, 210, 6144, 2560),
@@ -2637,8 +2642,8 @@ class TestGgufPackedOps(unittest.TestCase):
                 with self.subTest(gtype=gtype, k=k, n=n, m=m):
                     got = session.run(None, {"A_f32": a65[:m], "B": raw})[0]
                     np.testing.assert_allclose(got, ref65[:m], rtol=1e-2, atol=2e-3)
-                    if n > 16384 and (k % 128) == 0 and gtype in (8, 14) and m <= 64:
-                        # SM90 WGMMA large-N kernel uses identical K accumulation order across kMaxM in {16, 32, 64}.
+                    if n > 16384 and (k % 128) == 0 and gtype in (8, 14) and m <= max_large_n_tc_m:
+                        # SM90 WGMMA (m <= 64) and SM80+ MultiRowTc (m <= 32) each keep identical K accumulation order.
                         rows_cmp = min(m, 16)
                         np.testing.assert_array_equal(got[:rows_cmp].view(np.uint32), got16[:rows_cmp].view(np.uint32))
                     elif (
