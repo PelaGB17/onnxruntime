@@ -41,7 +41,7 @@ struct MIGraphXFuncState {
   DestroyFunc release_func = nullptr;
   AllocatorHandle allocate_handle = nullptr;
   migraphx::program prog{};
-  std::string onnx_string;
+  const std::string* onnx_string = nullptr;  // owned by the execution provider, shared by all states
   migraphx::onnx_options options;
   migraphx::target t{};
   std::unordered_map<std::string, std::size_t> input_name_indexes;

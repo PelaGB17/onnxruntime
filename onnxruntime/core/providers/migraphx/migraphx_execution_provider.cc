@@ -1354,6 +1354,9 @@ Status MIGraphXExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& 
     model_proto->set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
     std::string onnx_string_buffer;
     model_proto->SerializeToString(onnx_string_buffer);
+    // Only the serialized copy is needed from here on: free the graph and proto copies of the weights.
+    model_proto.reset();
+    model.reset();
 
     if (dump_model_ops_) {
       std::string onnx_name = fused_node.Name() + ".onnx";
@@ -1400,14 +1403,14 @@ Status MIGraphXExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& 
     // compile the program
     map_progs_[fused_node.Name()] = prog;
 
-    map_onnx_string_[fused_node.Name()] = onnx_string_buffer;
+    map_onnx_string_[fused_node.Name()] = std::move(onnx_string_buffer);
     map_input_index_[fused_node.Name()] = input_name_index;
     map_no_input_shape_[fused_node.Name()] = no_input_shape;
     NodeComputeInfo compute_info;
     compute_info.create_state_func = [=](ComputeContext* context, FunctionState* state) {
       std::unique_ptr<MIGraphXFuncState> p = std::make_unique<MIGraphXFuncState>();
       *p = {context->allocate_func, context->release_func, context->allocator_handle, map_progs_[context->node_name],
-            map_onnx_string_[context->node_name], options, t_, map_input_index_[context->node_name], &mgx_mu_,
+            &map_onnx_string_[context->node_name], options, t_, map_input_index_[context->node_name], &mgx_mu_,
             map_no_input_shape_[context->node_name], fp16_enable_, bf16_enable_, fp8_enable_, int8_enable_,
             int8_calibration_cache_available_, dynamic_range_map_,
             model_cache_path_.string(), dump_model_ops_};
@@ -1428,7 +1431,7 @@ Status MIGraphXExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& 
       std::unordered_map<std::string, float>& map_dynamic_range = mgx_state->dynamic_range_map;
       migraphx::target t = mgx_state->t;
       migraphx::program& prog = mgx_state->prog;
-      std::string& onnx_string = mgx_state->onnx_string;
+      const std::string& onnx_string = *mgx_state->onnx_string;
       migraphx::onnx_options& cmp_options = mgx_state->options;
       bool& no_input_shape = mgx_state->no_input_shape;
       bool fp16_enable = mgx_state->fp16_enable;
